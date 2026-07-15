@@ -931,6 +931,13 @@ class TrainingConfig(BaseConfig):
     vlm_intent_ckpt = None
     vlm_cache_dir = "data/p5/vlm_cache"
     vlm_manifest = "data/p4/manifest.jsonl"
+    # P5b closed-loop: at eval time there is no offline cache, so the frozen Qwen-VL must
+    # run live. Qwen3-VL cannot load in the lead env (old transformers), so it runs as a
+    # separate service (qwenvl env) and the agent talks to it over this Unix socket.
+    # prompt mode ("drivable" for P5 / "command" for P4) is set on the SERVICE side; the
+    # front-camera crop fraction within the 3-camera strip matches extract_vlm_features.py.
+    vlm_service_socket = "/tmp/vlm_service.sock"
+    vlm_front_frac = (1.0 / 3.0, 2.0 / 3.0)
     # Loss weight of the visual-intent heatmap term.
     visual_intent_loss_weight = 1.0
     # P5: extra Tversky (recall-weighted soft-Dice) term on the intent field to force

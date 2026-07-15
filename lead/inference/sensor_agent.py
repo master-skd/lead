@@ -90,6 +90,19 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             prefix="model",
         )
 
+        # P5b: the model consumes a frozen VLM intent whose input (vlm_hidden) is
+        # produced offline during training. In closed loop there is no cache, so
+        # vlm_hidden must be produced live by Qwen-VL. Qwen3-VL cannot load in the lead
+        # env (old transformers), so it runs as a separate service in the qwenvl env and
+        # we talk to it over a Unix socket (see vlm_service.py / vlm_client.py).
+        self.vlm_client = None
+        if self.training_config.use_vlm_intent:
+            from lead.inference.vlm_client import VLMServiceClient
+
+            self.vlm_client = VLMServiceClient(
+                socket_path=self.training_config.vlm_service_socket
+            )
+
         # Post-processing heuristics
         self.bb_buffer = deque(maxlen=1)
         self.stop_sign_post_processor = StopSignPostProcessor(
@@ -483,6 +496,21 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 self.device,
                 dtype=torch.float32,
             )[None]
+
+        # P5b: get vlm_hidden from the Qwen-VL service (qwenvl env) over the socket. The
+        # front crop is done here (numpy) to match the offline extractor exactly; only
+        # the Qwen forward runs remotely. original_rgb is the (H, W, C) multi-camera
+        # strip, still BGR (copied before the BGR->RGB conversion in tick), so flip
+        # channels to the RGB the extractor expects.
+        if self.vlm_client is not None:
+            strip_rgb = input_data["original_rgb"].astype(np.uint8)[..., ::-1]
+            h, w = strip_rgb.shape[:2]
+            f0, f1 = self.training_config.vlm_front_frac
+            front_rgb = strip_rgb[:, int(w * f0):int(w * f1)]
+            vlm_hidden = self.vlm_client.extract(front_rgb)  # (h', w', D) fp16
+            input_data_tensors["vlm_hidden"] = torch.from_numpy(
+                vlm_hidden.astype(np.float32)
+            ).to(self.device)[None]
 
         # Save input log if need
         if (
