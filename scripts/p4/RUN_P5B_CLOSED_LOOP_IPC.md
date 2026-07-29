@@ -58,21 +58,81 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 \
 
 ## 步骤 2：跑闭环评测（lead 环境，非 root 用户）
 
-和普通闭环评测完全一样（见 `RUN_CLOSED_LOOP_AS_NONROOT.md`），只是 checkpoint 换成 p5b：
-
+### 2.0 前置：确认冻结 VLM 头权重已就位（易漏！）
+P5b 模型加载时会加载它依赖的**冻结 VLM intent 头**（config 里 `vlm_intent_ckpt`）。这个文件**不跟 git 走**，必须单独传到 5090 的对应相对路径，否则 `FileNotFoundError`：
 ```bash
-# 单条 route 先验证
+# M 依赖（多模）:
+ls outputs/local_training/vlm_intent_p5a_tversky/model_0014.pth
+# S 依赖（单模）:
+ls outputs/local_training/vlm_intent_p4a/model_0014.pth
+```
+缺哪个从训练机传哪个（~160MB，放到同样的相对路径下）。
+
+### 2.1 单条 route 验证（手动起 CARLA）
+`python -m lead --routes 单条` 只**连**已在跑的 CARLA、不自己起。所以要**两个终端**：
+
+**终端 A — 非 root 起 CARLA（常驻，2000 端口）：**
+```bash
+runuser -u carla -- bash -c '
+  export HOME=/home/carla CARLA_ROOT=/root/autodl-tmp/lead/3rd_party/CARLA_0915
+  cd /root/autodl-tmp/lead
+  $CARLA_ROOT/CarlaUE4.sh -RenderOffScreen -nosound -carla-rpc-port=2000 -graphicsadapter=0
+'
+# 等端口起来：另开终端 ss -ltn | grep :2000 有输出即可
+# 注意：CARLA 启动 flag 若本机需要特殊设置（画质/opengl 等），按 scripts/start_carla.sh 那套来
+```
+
+**终端 B — 跑 agent（连 2000）：**
+```bash
+runuser -u carla -- bash -c '
+  export HOME=/home/carla
+  export CARLA_ROOT=/root/autodl-tmp/lead/3rd_party/CARLA_0915
+  export LEAD_PROJECT_ROOT=/root/autodl-tmp/lead
+  source /root/autodl-tmp/miniconda3/etc/profile.d/conda.sh && conda activate lead
+  cd /root/autodl-tmp/lead
+  python -m lead --checkpoint outputs/local_training/p5b_M \
+    --routes data/benchmark_routes/bench2drive/23687.xml --bench2drive --port 2000
+'
+```
+验证通过的信号：agent setup 不报 `ConnectionRefused` / `KeyError: vlm_hidden` / `FileNotFoundError`；
+`tail -f /tmp/vlm_service.log` 车开动后出现 `client connected`；route 正常跑完出 `checkpoint_endpoint.json`。
+
+### 2.2 全量 220（批量脚本，自己起/杀 CARLA，不用手动起）
+单条通过后，用批量脚本跑全集（它内部每条 route 自起一个 CARLA）：
+```bash
 runuser -u carla -- bash -c '
   export HOME=/home/carla CARLA_ROOT=/root/autodl-tmp/lead/3rd_party/CARLA_0915 LEAD_PROJECT_ROOT=/root/autodl-tmp/lead
   source /root/autodl-tmp/miniconda3/etc/profile.d/conda.sh && conda activate lead
   cd /root/autodl-tmp/lead
-  python -m lead --checkpoint outputs/local_training/p5b_M \
-    --routes data/benchmark_routes/bench2drive/23687.xml --bench2drive
+  bash scripts/eval_bench2drive_local.sh outputs/local_training/p5b_M "0" p5b_M
 '
 ```
-agent 会自动连 `/tmp/vlm_service.sock`（config 里的 `vlm_service_socket`），每帧发前视图取 vlm_hidden。
+> IPC 版建议**单卡 `"0"`**：Qwen 服务只在卡 0 的 socket 上，多卡的 agent 连不到。
 
-单条通了再跑全量 220（`bash scripts/eval_bench2drive_local.sh outputs/local_training/p5b_M "0" p5b_M`）。
+### 2.3 合并出分
+```bash
+mkdir -p outputs/b2d_p5b_M
+for f in outputs/local_evaluation_p5b_M/*/checkpoint_endpoint.json; do
+  cp "$f" outputs/b2d_p5b_M/$(basename $(dirname "$f")).json
+done
+EVALUATION_DATASET=bench2drive python slurm/evaluation/merge_route_json.py -f outputs/b2d_p5b_M
+```
+看 `outputs/b2d_p5b_M/merged.json` 的 `driving score` / `success rate`。
+
+### 2.4 评 S（单模基线）
+1. 重启 Qwen 服务，`--prompt-mode command`（S 对应 P4a 命令条件特征）：
+   ```bash
+   pkill -f vlm_service
+   conda activate qwenvl && cd /root/autodl-tmp/lead
+   HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 \
+     python -m lead.inference.vlm_service \
+       --model /root/autodl-tmp/models/Qwen3-VL-4B-Instruct \
+       --socket /tmp/vlm_service.sock --prompt-mode command \
+       > /tmp/vlm_service.log 2>&1 &
+   ```
+2. checkpoint / tag 换成 `p5b_S`，其余同 2.1–2.3。
+
+**S vs M 的 merged.json 对比就是 P5 的最终判据。**
 
 ---
 
@@ -92,6 +152,8 @@ Qwen 服务(~9G)和 CARLA+TFv6 都在同一张 5090（32G）。显存够，但�
 | 现象 | 原因 / 处理 |
 | :-- | :-- |
 | agent 启动即 `ConnectionRefusedError` / socket 不存在 | 服务没起或 socket 路径不符。先确认服务日志 `listening`，且 `--socket` == config `vlm_service_socket`。 |
+| `FileNotFoundError: vlm_intent_*.pth` | 冻结 VLM 头权重没传到 5090。传 `vlm_intent_p5a_tversky/model_0014.pth`(M) / `vlm_intent_p4a/model_0014.pth`(S) 到对应相对路径。 |
+| `RuntimeError: Failed to connect to CARLA` / `localhost:2000` timeout | CARLA 没起或端口不符。单条模式要先手动起 CARLA（见 2.1 终端 A），`--port` 对齐；或用批量脚本（自己起）。 |
 | `KeyError: 'vlm_hidden'` | agent 没走 IPC 分支 → config `use_vlm_intent` 没 true（检查 p5b config.json）。 |
 | 服务 `KeyError: 'qwen3_vl'` | 服务跑在了 lead 环境（老 transformers）。必须 qwenvl 环境。 |
 | 每帧太慢 → watchdog 超时 | 单帧 ~85ms 一般 OK。若超时，考虑降频（隔 N 帧抽一次、中间复用上次 intent）—— 需改 sensor_agent，先看实测。 |
