@@ -119,6 +119,64 @@ def initialize_torch(config: TrainingConfig) -> int:
 
 
 @beartype
+def _migrate_planner_query(
+    loaded_state: dict,
+    model: torch.nn.Module,
+    config: TrainingConfig,
+) -> dict:
+    """Reconcile a checkpoint's planner `query` Parameter with a resized route head.
+
+    The planning decoder concatenates its learnable queries as
+    ``[route (num_route_points_prediction), waypoints (num_way_points_prediction),
+    target_speed (1)]`` in that fixed order (see PlanningDecoder.forward). P5 Step A
+    grows only the route segment (10 -> 30). A plain ``strict=False`` load would drop
+    the whole `query` tensor on the shape mismatch, re-initializing EVERY query from
+    scratch -- exactly the "random planner" collapse that sank P5b.
+
+    Instead we copy the checkpoint's queries segment-by-segment into a fresh tensor
+    pre-seeded with the current model's initialization, so the freshly-added far-range
+    route queries keep their init while route[:old]/waypoint/speed inherit P2 verbatim.
+    Only the route segment is assumed to differ in length; waypoint/speed counts must
+    match (asserted). No-op when shapes already agree or the key is absent.
+    """
+    key = "planning_decoder.query"
+    if key not in loaded_state:
+        return loaded_state
+    core = model.module if hasattr(model, "module") else model
+    cur = core.state_dict()[key]  # (1, new_total, D)
+    old = loaded_state[key]       # (1, old_total, D)
+    if tuple(cur.shape) == tuple(old.shape):
+        return loaded_state  # nothing to migrate
+
+    n_wp = config.num_way_points_prediction if config.predict_temporal_spatial_waypoints else 0
+    n_sp = 1 if config.predict_target_speed else 0
+    new_route = config.num_route_points_prediction if config.predict_spatial_path else 0
+    old_route = old.shape[1] - n_wp - n_sp
+    # Sanity: only the route segment may resize; tail (wp+speed) length is invariant.
+    assert new_route == cur.shape[1] - n_wp - n_sp, (
+        f"query tail mismatch: cur={cur.shape[1]} new_route={new_route} n_wp={n_wp} n_sp={n_sp}"
+    )
+    assert old_route > 0 and new_route >= old_route, (
+        f"unexpected route resize old_route={old_route} new_route={new_route}"
+    )
+
+    migrated = cur.clone()  # keep current init for the new far-range route queries
+    # route[:old_route] <- checkpoint route queries (near segment inherits P2)
+    migrated[:, :old_route] = old[:, :old_route]
+    # waypoint + speed queries: copy the checkpoint tail onto the new tail
+    if n_wp + n_sp > 0:
+        migrated[:, new_route:] = old[:, old_route:]
+    loaded_state = dict(loaded_state)
+    loaded_state[key] = migrated
+    LOG.info(
+        f"Migrated planner query: route {old_route}->{new_route} "
+        f"(inherited near {old_route}, fresh far {new_route - old_route}), "
+        f"wp+speed {n_wp + n_sp} inherited.",
+    )
+    return loaded_state
+
+
+@beartype
 def initialize_model(
     config: TrainingConfig,
 ) -> tuple[typing.Any | torch.nn.parallel.distributed.DistributedDataParallel, int]:
@@ -140,10 +198,36 @@ def initialize_model(
         if config.continue_failed_training:
             start_epoch = int("".join(filter(str.isdigit, load_name))) + 1
             LOG.info(f"Continuing training from epoch {start_epoch}")
+        loaded_state = torch.load(
+            config.load_file, map_location=config.device, weights_only=True,
+        )
+        # P5 Step A: route head extended from 10 to 30 points. The planner's `query`
+        # Parameter (route|waypoint|speed queries, in that order) changes shape, so a
+        # naive strict=False load would silently DROP it -> all queries re-init from
+        # scratch (the P5b failure mode). Instead migrate per-segment: inherit P2's
+        # route/waypoint/speed queries verbatim; only the newly-added far-range route
+        # queries stay fresh. See planning_decoder query layout.
+        loaded_state = _migrate_planner_query(loaded_state, model, config)
         model.load_state_dict(
-            torch.load(config.load_file, map_location=config.device, weights_only=True),
+            loaded_state,
             strict=config.continue_failed_training,
         )
+        # B1: the frozen VLM intent head must stay whatever config.vlm_intent_ckpt says
+        # (e.g. the P5a multimodal head), but load_file (e.g. a Step A checkpoint) carries
+        # its OWN vlm_intent_decoder weights (the P4a single-mode head) and load_state_dict
+        # just overwrote the head TFv6.__init__ loaded. Re-load + re-freeze from the config
+        # ckpt so the intent source is unambiguous regardless of load_file's contents.
+        if config.use_vlm_intent and config.vlm_intent_ckpt is not None:
+            core = model.module if hasattr(model, "module") else model
+            vlm_ckpt = torch.load(
+                config.vlm_intent_ckpt, map_location=config.device, weights_only=True,
+            )
+            core.vlm_intent_decoder.load_state_dict(vlm_ckpt["model"])
+            core.vlm_intent_decoder.eval().requires_grad_(False)
+            LOG.info(
+                f"Re-loaded frozen VLM intent head from {config.vlm_intent_ckpt} "
+                f"(overrides any vlm_intent_decoder weights in load_file).",
+            )
 
     model.backbone.requires_grad_(not config.freeze_backbone)
     LOG.info(

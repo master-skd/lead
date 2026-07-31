@@ -708,6 +708,14 @@ class TrainingConfig(BaseConfig):
     # Assume maximum distance between two future waypoints in meters.
     max_distance_future_waypoint = 10.0
 
+    # P5 Step A: near/far split for the extended (30m) route loss. route_near_points is
+    # the count of near "control" points kept at full weight (PID only uses route[:~8m]);
+    # points beyond it are the "intent" segment weighted by route_far_weight. Defaults
+    # (None / 1.0) reproduce the original unweighted mean-L1, so P2 and all existing
+    # models are unaffected -- Step A sets e.g. route_near_points=10, route_far_weight=0.3.
+    route_near_points = None
+    route_far_weight = 1.0
+
     @property
     def num_way_points_prediction(self):
         """Number of waypoints to predict."""

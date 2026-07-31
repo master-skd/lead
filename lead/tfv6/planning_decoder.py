@@ -237,10 +237,30 @@ class PlanningDecoder(nn.Module):
                     dtype=self.config.torch_float_type,
                     non_blocking=True,
                 )
-                loss["loss_spatial_route"] = F.l1_loss(
-                    predictions.pred_route.float(),
-                    route_label.float(),
-                )  # ADE
+                # P5 Step A: with the route head extended to 30m, a plain mean-L1 lets
+                # the far points (large displacement) dominate and starve the near
+                # segment -- but closed-loop steering only consumes route[:~8m] (PID
+                # n_lookahead in [0,8]). Down-weight the far "intent" segment so the
+                # near "control" segment keeps its precision. route_near_points and
+                # route_far_weight default to the whole route at weight 1.0 (== the old
+                # unweighted behaviour) unless Step A sets them.
+                near = self.config.route_near_points
+                far_w = self.config.route_far_weight
+                if near is not None and far_w != 1.0:
+                    n_pts = route_label.shape[1]
+                    w = torch.ones(n_pts, device=self.device, dtype=torch.float32)
+                    w[near:] = far_w
+                    per_pt = F.l1_loss(
+                        predictions.pred_route.float(),
+                        route_label.float(),
+                        reduction="none",
+                    ).mean(dim=-1)  # (B, n_pts): mean over (x, y)
+                    loss["loss_spatial_route"] = (per_pt * w).sum(dim=1).mean() / w.sum()
+                else:
+                    loss["loss_spatial_route"] = F.l1_loss(
+                        predictions.pred_route.float(),
+                        route_label.float(),
+                    )  # ADE
                 loss["loss_spatial_route"] += F.l1_loss(
                     predictions.pred_route[:, -1, :].float(),
                     route_label[:, -1, :].float(),
