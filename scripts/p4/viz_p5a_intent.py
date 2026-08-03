@@ -64,8 +64,10 @@ def main() -> None:
         raise_error_on_missing_key=False,
     )
 
-    # pick junction-ish frames from the manifest (command != LANEFOLLOW)
-    entries = [json.loads(l) for l in open(args.manifest)]
+    # pick junction-ish frames (command != LANEFOLLOW). Command lookup always uses the
+    # fixed p4 manifest (independent of which cache we filter frames by).
+    cmd_manifest = "data/p4/manifest.jsonl"
+    entries = [json.loads(l) for l in open(cmd_manifest)]
     junction_srf = {
         (e["scenario"], e["route"], e["frame"])
         for e in entries if e.get("command") not in (None, "LANEFOLLOW")
@@ -78,7 +80,9 @@ def main() -> None:
     decoder.eval().requires_grad_(False)
 
     carla_ds = CARLAData(root=cfg.carla_data, config=cfg)
-    vlm_ds = VLMIntentDataset(carla_ds, vlm_cache_dir=args.cache, manifest_path=args.manifest)
+    # manifest="none" -> filter frames by actual .npy existence (P6 4000-frame subset).
+    mpath = None if args.manifest.lower() == "none" else args.manifest
+    vlm_ds = VLMIntentDataset(carla_ds, vlm_cache_dir=args.cache, manifest_path=mpath)
 
     def _srf(carla_idx):
         p = str(carla_ds.images[carla_idx], encoding="utf-8").split("/")
