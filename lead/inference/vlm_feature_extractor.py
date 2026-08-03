@@ -31,6 +31,15 @@ PROMPT_DRIVABLE = (
     "drivable ahead, without committing to a single one."
 )
 
+# P6 3-camera prompt. MUST match scripts/p4/extract_vlm_p6_3cam.py verbatim so live
+# closed-loop features are identical to the training cache (train/eval consistency).
+PROMPT_3CAM_DRIVABLE = (
+    "You are the motion planner of a car. The image is a panorama stitched from three "
+    "front-facing cameras: front-left, front, and front-right. Look across the whole "
+    "panorama and identify every direction the car could drive from here -- all lanes and "
+    "turns that are drivable ahead, including to the sides, without committing to one."
+)
+
 
 def load_qwen_vl(model_path: str, device: str = "cuda:0"):
     """Load a frozen Qwen-VL model + processor for feature extraction.
@@ -85,7 +94,8 @@ def extract_vlm_hidden(
         ValueError: if the recovered token grid does not match the number of image tokens.
     """
     prompt = (
-        PROMPT_DRIVABLE if prompt_mode == "drivable"
+        PROMPT_3CAM_DRIVABLE if prompt_mode == "3cam_drivable"
+        else PROMPT_DRIVABLE if prompt_mode == "drivable"
         else PROMPT_COMMAND.format(cmd=command)
     )
     messages = [

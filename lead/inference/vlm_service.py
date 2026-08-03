@@ -43,7 +43,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="Qwen-VL model dir")
     ap.add_argument("--socket", default="/tmp/vlm_service.sock")
-    ap.add_argument("--prompt-mode", choices=["drivable", "command"], default="drivable")
+    ap.add_argument("--prompt-mode", choices=["drivable", "command", "3cam_drivable"], default="drivable")
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
 

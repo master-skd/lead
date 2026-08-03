@@ -946,6 +946,9 @@ class TrainingConfig(BaseConfig):
     # front-camera crop fraction within the 3-camera strip matches extract_vlm_features.py.
     vlm_service_socket = "/tmp/vlm_service.sock"
     vlm_front_frac = (1.0 / 3.0, 2.0 / 3.0)
+    # P6: if true the VLM intent consumes the FULL 3-camera strip (no front crop) and the
+    # service must run --prompt-mode 3cam_drivable. False = front-only (P4/P5/B1).
+    vlm_3cam = False
     # Loss weight of the visual-intent heatmap term.
     visual_intent_loss_weight = 1.0
     # P5: extra Tversky (recall-weighted soft-Dice) term on the intent field to force

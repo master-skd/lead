@@ -505,9 +505,13 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         if self.vlm_client is not None:
             strip_rgb = input_data["original_rgb"].astype(np.uint8)[..., ::-1]
             h, w = strip_rgb.shape[:2]
-            f0, f1 = self.training_config.vlm_front_frac
-            front_rgb = strip_rgb[:, int(w * f0):int(w * f1)]
-            vlm_hidden = self.vlm_client.extract(front_rgb)  # (h', w', D) fp16
+            if getattr(self.training_config, "vlm_3cam", False):
+                # P6: feed the full 3-camera strip (service uses 3cam_drivable prompt).
+                cam_rgb = strip_rgb
+            else:
+                f0, f1 = self.training_config.vlm_front_frac
+                cam_rgb = strip_rgb[:, int(w * f0):int(w * f1)]
+            vlm_hidden = self.vlm_client.extract(cam_rgb)  # (h', w', D) fp16
             input_data_tensors["vlm_hidden"] = torch.from_numpy(
                 vlm_hidden.astype(np.float32)
             ).to(self.device)[None]
