@@ -193,6 +193,7 @@ class TFv6(nn.Module):
             planner_intent = (
                 pred_visual_intent if self.config.use_control_conditioning else None
             )
+            planner_anchor = data.get("anchor") if self.config.multimodal_planner else None
             (
                 pred_route,
                 pred_future_waypoints,
@@ -206,6 +207,7 @@ class TFv6(nn.Module):
                 data,
                 log=self.log,
                 intent=planner_intent,
+                anchor=planner_anchor,
             )
 
         # Semantic segmentation forward pass

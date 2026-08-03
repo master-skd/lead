@@ -464,6 +464,21 @@ class CARLAData(Dataset):
                 )
                 data["vlm_hidden"] = np.load(npy_path).astype(np.float32)
 
+                # B2: attach precomputed skeleton anchors for the multimodal planner.
+                # Cache is (K_MAX,5)=[valid,angle,reach,tip_row,tip_col]; convert to the
+                # planner's embedding input (K_MAX,4)=[sin a, cos a, reach/30, valid].
+                if self.config.multimodal_planner:
+                    a_path = os.path.join(
+                        self.config.anchor_cache_dir, scenario, route, frame + ".npy"
+                    )
+                    a = np.load(a_path).astype(np.float32)  # (K_MAX,5)
+                    valid, ang, reach = a[:, 0], a[:, 1], a[:, 2]
+                    feat = np.stack(
+                        [np.sin(ang), np.cos(ang), reach / 30.0, valid], axis=1
+                    ).astype(np.float32)
+                    feat[valid < 0.5] = 0.0
+                    data["anchor"] = feat  # (K_MAX,4)
+
         # Velocity
         if self.config.use_velocity:
             data["speed"] = meta["speed"]

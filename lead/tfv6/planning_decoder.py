@@ -33,9 +33,13 @@ class PlanningDecoder(nn.Module):
         )
 
         # Number of queries: route + waypoints + target_speed (flexible based on config)
+        # B2: in multimodal mode the route segment is replicated K times (K arms), each
+        # route query gets an anchor embedding added to break symmetry.
+        self.mm = self.config.multimodal_planner
+        self.K = self.config.multimodal_planner_k if self.mm else 1
         num_queries = 0
         if self.config.predict_spatial_path:
-            num_queries += self.config.num_route_points_prediction
+            num_queries += self.config.num_route_points_prediction * self.K
         if self.config.predict_temporal_spatial_waypoints:
             num_queries += self.config.num_way_points_prediction
         if self.config.predict_target_speed:
@@ -63,6 +67,14 @@ class PlanningDecoder(nn.Module):
         # Only create decoders if needed
         if self.config.predict_spatial_path:
             self.route_decoder = nn.Linear(config.transfuser_token_dim, 2)
+            if self.mm:
+                # B2: anchor embedding [sin a, cos a, reach/30, valid] -> D, added to each
+                # mode's route queries to break symmetry; per-mode confidence head.
+                D = self.config.transfuser_token_dim
+                self.anchor_embed = nn.Sequential(
+                    nn.Linear(4, D), nn.GELU(), nn.Linear(D, D),
+                )
+                self.conf_decoder = nn.Linear(D, 1)
         if self.config.predict_temporal_spatial_waypoints:
             self.wp_decoder = nn.Linear(config.transfuser_token_dim, 2)
             if self.config.use_navsim_data:
@@ -100,6 +112,7 @@ class PlanningDecoder(nn.Module):
         data: dict,
         log: dict,
         intent: jt.Float[torch.Tensor, "bs 1 ih iw"] | None = None,
+        anchor: jt.Float[torch.Tensor, "bs kmax 4"] | None = None,
     ) -> tuple[
         jt.Float[torch.Tensor, "B n_checkpoints 2"] | None,
         jt.Float[torch.Tensor, "B n_waypoints 2"],
@@ -132,7 +145,22 @@ class PlanningDecoder(nn.Module):
 
         bs = context_tokens.shape[0]
 
-        queries = self.transformer_decoder(self.query.repeat(bs, 1, 1), context_tokens)
+        # Build the decoder input queries. In multimodal mode, add a per-mode anchor
+        # embedding to each mode's route queries (before cross-attention) to break the
+        # symmetry between the K route arms; otherwise K identical query blocks would
+        # collapse to one under WTA. Waypoint/speed queries are untouched.
+        query_in = self.query.repeat(bs, 1, 1)  # (B, K*route + wp + speed, D)
+        if self.mm and self.config.predict_spatial_path:
+            n_route = self.config.num_route_points_prediction
+            if anchor is None:
+                anchor = torch.zeros(bs, self.K, 4, device=query_in.device, dtype=query_in.dtype)
+            # anchor cols already [sin a, cos a, reach/30, valid] (packed in dataset)
+            a_embed = self.anchor_embed(anchor.to(query_in.device, query_in.dtype))  # (B, K, D)
+            # add each mode's embedding to its n_route query rows
+            a_rep = a_embed.unsqueeze(2).expand(bs, self.K, n_route, -1).reshape(bs, self.K * n_route, -1)
+            query_in[:, : self.K * n_route] = query_in[:, : self.K * n_route] + a_rep
+
+        queries = self.transformer_decoder(query_in, context_tokens)
 
         # Split the queries flexibly based on what we're predicting
         query_idx = 0
@@ -143,12 +171,27 @@ class PlanningDecoder(nn.Module):
         target_speed_scalar = None
 
         if self.config.predict_spatial_path:
-            route_queries = queries[
-                :,
-                query_idx : query_idx + self.config.num_route_points_prediction,
-            ]
-            route = torch.cumsum(self.route_decoder(route_queries), 1)
-            query_idx += self.config.num_route_points_prediction
+            n_route = self.config.num_route_points_prediction
+            if self.mm:
+                # K modes: decode all K*n_route route queries, reshape to (B,K,n_route,D),
+                # cumsum PER MODE along the point axis -> (B,K,n_route,2). Confidence from
+                # each mode's mean query. Multimodal outputs go out via `log` (bypass) so
+                # the return signature / beartype stay single-route compatible; the main
+                # `route` slot holds a placeholder (mode 0) for downstream single-route code.
+                route_q = queries[:, query_idx : query_idx + self.K * n_route]
+                route_q = route_q.reshape(bs, self.K, n_route, -1)  # (B,K,n_route,D)
+                route_all = torch.cumsum(self.route_decoder(route_q), dim=2)  # (B,K,n_route,2)
+                conf = self.conf_decoder(route_q.mean(dim=2)).squeeze(-1)  # (B,K)
+                # Bypass via `data` (NOT `log`: logger scalar-reduces every log entry and
+                # would choke on these tensors). compute_loss reads them from data.
+                data["route_multimodal"] = route_all
+                data["route_conf"] = conf
+                route = route_all[:, 0]  # placeholder single route
+                query_idx += self.K * n_route
+            else:
+                route_queries = queries[:, query_idx : query_idx + n_route]
+                route = torch.cumsum(self.route_decoder(route_queries), 1)
+                query_idx += n_route
 
         if self.config.predict_temporal_spatial_waypoints:
             waypoints_queries = queries[
@@ -179,6 +222,41 @@ class PlanningDecoder(nn.Module):
             target_speed_scalar,
             headings.squeeze(-1) if headings is not None else None,
         )
+
+    def _multimodal_route_loss(self, route_label, data, loss, log):
+        """B2 winner-take-all route loss + confidence BCE over K arms.
+
+        log["route_multimodal"]: unused. data["route_multimodal"]: (B,K,n_route,2) ;
+        data["route_conf"]: (B,K) logits. data["anchor"]: (B,K,4) with valid flag in col 3.
+        Only valid arms compete; the arm closest (mean-L2 to GT) is the winner and gets the
+        near-weighted L1. Confidence target: winner=1, other valid=0, padding=0.
+        """
+        route_all = data["route_multimodal"].float()  # (B,K,n,2)
+        conf = data["route_conf"].float()             # (B,K)
+        B, K, n, _ = route_all.shape
+        gt = route_label.float()                     # (B,n,2)
+        valid = data["anchor"].to(self.device).float()[:, :, 3]  # (B,K)
+
+        # per-arm mean-L2 to GT; invalid arms get +inf so they never win
+        d = torch.linalg.norm(route_all - gt[:, None], dim=-1).mean(dim=2)  # (B,K)
+        d_masked = d + (1.0 - valid) * 1e9
+        winner = d_masked.argmin(dim=1)              # (B,)
+
+        # near-weighted L1 on the winner arm
+        near = self.config.route_near_points or n
+        far_w = self.config.route_far_weight
+        w = torch.ones(n, device=self.device)
+        w[near:] = far_w
+        win_route = route_all[torch.arange(B), winner]  # (B,n,2)
+        per_pt = F.l1_loss(win_route, gt, reduction="none").mean(dim=-1)  # (B,n)
+        loss["loss_spatial_route"] = (per_pt * w).sum(dim=1).mean() / w.sum()
+        loss["loss_spatial_route"] += F.l1_loss(win_route[:, -1], gt[:, -1])  # FDE
+
+        # confidence BCE: winner=1, others 0; mask padding out of the mean
+        conf_tgt = torch.zeros_like(conf)
+        conf_tgt[torch.arange(B), winner] = 1.0
+        bce = F.binary_cross_entropy_with_logits(conf, conf_tgt, reduction="none")  # (B,K)
+        loss["loss_route_conf"] = (bce * valid).sum() / valid.sum().clamp(min=1.0)
 
     @beartype
     def compute_loss(self, predictions, data: dict, loss: dict, log: dict):
@@ -237,34 +315,39 @@ class PlanningDecoder(nn.Module):
                     dtype=self.config.torch_float_type,
                     non_blocking=True,
                 )
-                # P5 Step A: with the route head extended to 30m, a plain mean-L1 lets
-                # the far points (large displacement) dominate and starve the near
-                # segment -- but closed-loop steering only consumes route[:~8m] (PID
-                # n_lookahead in [0,8]). Down-weight the far "intent" segment so the
-                # near "control" segment keeps its precision. route_near_points and
-                # route_far_weight default to the whole route at weight 1.0 (== the old
-                # unweighted behaviour) unless Step A sets them.
-                near = self.config.route_near_points
-                far_w = self.config.route_far_weight
-                if near is not None and far_w != 1.0:
-                    n_pts = route_label.shape[1]
-                    w = torch.ones(n_pts, device=self.device, dtype=torch.float32)
-                    w[near:] = far_w
-                    per_pt = F.l1_loss(
-                        predictions.pred_route.float(),
-                        route_label.float(),
-                        reduction="none",
-                    ).mean(dim=-1)  # (B, n_pts): mean over (x, y)
-                    loss["loss_spatial_route"] = (per_pt * w).sum(dim=1).mean() / w.sum()
+                if self.mm and "route_multimodal" in data:
+                    # B2 WTA: pick, among VALID arms, the one closest to the expert route;
+                    # only the winner gets the (near-weighted) regression gradient so the
+                    # other modes aren't dragged toward the single expert path (anti-
+                    # collapse). Confidence BCE: winner=1, other valid=0, padding=0.
+                    self._multimodal_route_loss(route_label, data, loss, log)
+                    continue_single = False
                 else:
-                    loss["loss_spatial_route"] = F.l1_loss(
-                        predictions.pred_route.float(),
-                        route_label.float(),
-                    )  # ADE
-                loss["loss_spatial_route"] += F.l1_loss(
-                    predictions.pred_route[:, -1, :].float(),
-                    route_label[:, -1, :].float(),
-                )  # FDE
+                    continue_single = True
+
+                if continue_single:
+                    # P5 Step A near-weighted single-route loss.
+                    near = self.config.route_near_points
+                    far_w = self.config.route_far_weight
+                    if near is not None and far_w != 1.0:
+                        n_pts = route_label.shape[1]
+                        w = torch.ones(n_pts, device=self.device, dtype=torch.float32)
+                        w[near:] = far_w
+                        per_pt = F.l1_loss(
+                            predictions.pred_route.float(),
+                            route_label.float(),
+                            reduction="none",
+                        ).mean(dim=-1)
+                        loss["loss_spatial_route"] = (per_pt * w).sum(dim=1).mean() / w.sum()
+                    else:
+                        loss["loss_spatial_route"] = F.l1_loss(
+                            predictions.pred_route.float(),
+                            route_label.float(),
+                        )
+                    loss["loss_spatial_route"] += F.l1_loss(
+                        predictions.pred_route[:, -1, :].float(),
+                        route_label[:, -1, :].float(),
+                    )
 
             # Differentiable collision cost on predicted waypoints (P2.2)
             if self.config.use_collision_cost and (

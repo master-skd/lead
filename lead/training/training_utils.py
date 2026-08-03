@@ -150,6 +150,37 @@ def _migrate_planner_query(
 
     n_wp = config.num_way_points_prediction if config.predict_temporal_spatial_waypoints else 0
     n_sp = 1 if config.predict_target_speed else 0
+
+    # B2: multimodal planner. Current route segment is K * num_route_points_prediction;
+    # the checkpoint (B1') is single-mode (num_route_points_prediction). Replicate the
+    # single-mode route queries K times so all K arms start identical -- the anchor
+    # embedding differentiates them; wp/speed inherited verbatim.
+    if getattr(config, "multimodal_planner", False):
+        K = config.multimodal_planner_k
+        n_route = config.num_route_points_prediction
+        old_route = old.shape[1] - n_wp - n_sp
+        assert cur.shape[1] == K * n_route + n_wp + n_sp, (
+            f"mm query size mismatch: cur={cur.shape[1]} K*route+tail={K*n_route+n_wp+n_sp}"
+        )
+        migrated = cur.clone()
+        if old_route == n_route:
+            for k in range(K):
+                migrated[:, k * n_route:(k + 1) * n_route] = old[:, :n_route]
+            if n_wp + n_sp > 0:
+                migrated[:, K * n_route:] = old[:, n_route:]
+            LOG.info(
+                f"Migrated planner query (multimodal): replicated single-mode route "
+                f"{n_route} x K={K}; wp+speed {n_wp + n_sp} inherited.",
+            )
+        else:
+            LOG.warning(
+                f"mm migrate: unexpected old_route={old_route} (expected {n_route}); "
+                f"keeping fresh init for route queries.",
+            )
+        loaded_state = dict(loaded_state)
+        loaded_state[key] = migrated
+        return loaded_state
+
     new_route = config.num_route_points_prediction if config.predict_spatial_path else 0
     old_route = old.shape[1] - n_wp - n_sp
     # Sanity: only the route segment may resize; tail (wp+speed) length is invariant.

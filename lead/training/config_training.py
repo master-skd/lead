@@ -964,6 +964,13 @@ class TrainingConfig(BaseConfig):
     use_multimodal_intent = False
     # P5: forward horizon (metres) for the drivable-support flood fill.
     multimodal_intent_horizon_m = 30.0
+    # B2: if true the planner emits K route arms (route query -> K*route queries, each
+    # conditioned on a skeleton anchor), plus a per-mode confidence. False = single route
+    # (StepA/B1/B1'). K_max slots; per-frame valid arms come from the anchor cache.
+    multimodal_planner = False
+    multimodal_planner_k = 6  # K_MAX, must match anchor_extraction.K_MAX
+    # B2: anchor cache dir (precomputed skeleton anchors, (K_MAX,5) per frame).
+    anchor_cache_dir = "data/p6/anchor_cache"
     # P2.2: if true, add a differentiable collision cost on predicted waypoints.
     use_collision_cost = False
     collision_loss_weight = 1.0
@@ -1032,6 +1039,8 @@ class TrainingConfig(BaseConfig):
                 "loss_spatial_route": 1.0,
             },
         )
+        # B2: per-mode confidence BCE (only active in multimodal planner mode).
+        weights["loss_route_conf"] = 1.0 if self.multimodal_planner else 0.0
 
         # Disable planning losses during pretraining
         if not self.use_planning_decoder:

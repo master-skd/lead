@@ -24,6 +24,7 @@ class VLMIntentDataset(Dataset):
         carla_dataset,
         vlm_cache_dir: str = "data/p4/vlm_cache",
         manifest_path: str | None = None,
+        anchor_cache_dir: str | None = None,
     ):
         """
         Args:
@@ -34,9 +35,14 @@ class VLMIntentDataset(Dataset):
                 is tested against the manifest in memory instead of one
                 ``os.path.exists`` per frame -- this avoids a metadata storm when the
                 CARLA index is the full (non-strided) dataset on shared storage.
+            anchor_cache_dir: optional root dir of precomputed anchor .npy files
+                ((K_MAX,5)=[valid,angle,reach,tip_row,tip_col]). When given, __getitem__
+                adds data["anchor"] = (K_MAX,4)=[sin a, cos a, reach/30, valid] ready for
+                the multimodal planner's anchor embedding (B2).
         """
         self.carla_ds = carla_dataset
         self.vlm_cache_dir = vlm_cache_dir
+        self.anchor_cache_dir = anchor_cache_dir
         self.config = carla_dataset.config
 
         cached_keys = None
@@ -80,6 +86,15 @@ class VLMIntentDataset(Dataset):
         npy_path = os.path.join(self.vlm_cache_dir, scenario, route, frame + ".npy")
         vlm_hidden = np.load(npy_path)  # (h', w', D_vlm), fp16
         data["vlm_hidden"] = torch.from_numpy(vlm_hidden).to(torch.float32)
+
+        # B2: load precomputed anchors -> (K_MAX,4)=[sin a, cos a, reach/30, valid]
+        if self.anchor_cache_dir is not None:
+            a_path = os.path.join(self.anchor_cache_dir, scenario, route, frame + ".npy")
+            a = np.load(a_path).astype(np.float32)  # (K_MAX,5)=[valid,angle,reach,tr,tc]
+            valid, ang, reach = a[:, 0], a[:, 1], a[:, 2]
+            feat = np.stack([np.sin(ang), np.cos(ang), reach / 30.0, valid], axis=1)
+            feat[valid < 0.5] = 0.0  # zero padding slots
+            data["anchor"] = torch.from_numpy(feat)  # (K_MAX,4)
 
         return data
 
