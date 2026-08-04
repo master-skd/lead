@@ -32,6 +32,45 @@ _MODE_COLORS = [
     (255, 100, 255), (60, 255, 255),
 ]
 
+# ChaffeurNet BEV semantic class -> RGB (road grey, sidewalk brown, lane markers yellow)
+_SEM_RGB = {
+    0: (0, 0, 0),        # unlabeled
+    1: (70, 70, 70),     # road
+    2: (110, 80, 50),    # sidewalk
+    3: (200, 200, 0),    # lane markers
+    4: (140, 140, 0),    # lane markers broken
+    5: (200, 0, 0),      # stop signs
+    6: (0, 150, 0),      # traffic green
+    7: (180, 180, 0),    # traffic yellow
+    8: (150, 0, 0),      # traffic red
+}
+
+
+def _hdmap_bev(hdmap_path, config):
+    """Colorized raw hdmap semantics resampled to the ego BEV grid (same transform as
+    rasterize_reachable_support), so trajectories can be judged against the actual road."""
+    import cv2
+    import numpy as np
+    hdmap = cv2.imread(hdmap_path, cv2.IMREAD_UNCHANGED)
+    if hdmap is not None and hdmap.ndim == 3:
+        hdmap = hdmap[..., 0]
+    h_px, w_px = config.lidar_height_pixel, config.lidar_width_pixel
+    ppm, ppm_c = config.pixels_per_meter, config.pixels_per_meter_collection
+    canvas = np.zeros((h_px, w_px, 3), dtype=np.uint8)
+    if hdmap is None:
+        return canvas
+    rows, cols = np.meshgrid(np.arange(h_px), np.arange(w_px), indexing="ij")
+    x_m = cols / ppm + config.min_x_meter
+    y_m = rows / ppm + config.min_y_meter
+    hx = np.round(hdmap.shape[1] / 2 + x_m * ppm_c).astype(np.int64)
+    hy = np.round(hdmap.shape[0] / 2 + y_m * ppm_c).astype(np.int64)
+    inside = (hx >= 0) & (hx < hdmap.shape[1]) & (hy >= 0) & (hy < hdmap.shape[0])
+    sem = np.zeros((h_px, w_px), dtype=np.uint8)
+    sem[inside] = hdmap[hy[inside], hx[inside]]
+    for cls, rgb in _SEM_RGB.items():
+        canvas[sem == cls] = rgb
+    return canvas
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -106,10 +145,10 @@ def main() -> None:
         anchor = np.asarray(data["anchor"])  # (K,4) [sin,cos,reach/30,valid]
         valid = anchor[:, 3] > 0.5
 
-        # canvas: GT blob (grey) as background
-        gt = data.get("visual_intent_label")
-        gt = np.asarray(gt)[0] if gt is not None else np.zeros((config.lidar_height_pixel, config.lidar_width_pixel))
-        canvas = (np.clip(gt, 0, 1)[..., None] * np.array([90, 90, 90])).astype(np.uint8)
+        # canvas: colorized hdmap semantics (road / sidewalk / lane markers) resampled to
+        # the ego BEV grid, so we can see if each arm stays ON THE ROAD (a divergent arm is
+        # only useful if it follows a real drivable branch, not grass/oncoming/curb).
+        canvas = _hdmap_bev(str(carla_ds.bev_semantics[ci], encoding="utf-8"), config)
         cv2.circle(canvas, (col_ego, row_ego), 3, (255, 255, 255), -1)
 
         nvalid = int(valid.sum())

@@ -971,6 +971,9 @@ class TrainingConfig(BaseConfig):
     multimodal_planner_k = 6  # K_MAX, must match anchor_extraction.K_MAX
     # B2: anchor cache dir (precomputed skeleton anchors, (K_MAX,5) per frame).
     anchor_cache_dir = "data/p6/anchor_cache"
+    # P5+: if set, use_multimodal_intent reads the clean lane-graph corridor label from this
+    # cache instead of the mushy flood-fill blob. None = old blob behaviour.
+    lanegraph_label_dir = None
     # B2 anti-collapse: weight of the non-winner-arm anchor-endpoint regression.
     route_anchor_loss_weight = 1.0
     # P2.2: if true, add a differentiable collision cost on predicted waypoints.

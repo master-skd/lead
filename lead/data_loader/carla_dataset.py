@@ -432,19 +432,28 @@ class CARLAData(Dataset):
                 and not self.build_buckets
             ):
                 if self.config.use_multimodal_intent:
-                    # P5: multimodal drivable-support label from the raw hdmap ROAD
-                    # mask (all forward-reachable arms), replacing the expert route.
-                    from lead.tfv6.intent_decoder import rasterize_reachable_support
+                    # P5+: multimodal drivable-support label. If a lane-graph label cache is
+                    # configured, read the clean multi-arm corridor label (lane-graph L/S/R
+                    # arms, lane-width + gaussian). Otherwise fall back to the flood-fill
+                    # blob from the raw hdmap ROAD mask (mushy, kept for back-compat).
+                    lg_dir = getattr(self.config, "lanegraph_label_dir", None)
+                    if lg_dir:
+                        p = str(self.images[index], encoding="utf-8").split("/")
+                        scenario, route, frame = p[-4], p[-3], p[-1].split(".")[0]
+                        lg_path = os.path.join(lg_dir, scenario, route, frame + ".npy")
+                        data["visual_intent_label"] = np.load(lg_path).astype(np.float32)  # (1,H,W)
+                    else:
+                        from lead.tfv6.intent_decoder import rasterize_reachable_support
 
-                    raw_hdmap = cv2.imread(
-                        str(self.bev_semantics[index], encoding="utf-8"),
-                        cv2.IMREAD_UNCHANGED,
-                    )
-                    data["visual_intent_label"] = rasterize_reachable_support(
-                        raw_hdmap,
-                        self.config,
-                        horizon_m=self.config.multimodal_intent_horizon_m,
-                    )  # (1, H, W)
+                        raw_hdmap = cv2.imread(
+                            str(self.bev_semantics[index], encoding="utf-8"),
+                            cv2.IMREAD_UNCHANGED,
+                        )
+                        data["visual_intent_label"] = rasterize_reachable_support(
+                            raw_hdmap,
+                            self.config,
+                            horizon_m=self.config.multimodal_intent_horizon_m,
+                        )  # (1, H, W)
                 else:
                     from lead.tfv6.intent_decoder import rasterize_waypoints_to_bev
 

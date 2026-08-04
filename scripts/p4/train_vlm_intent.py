@@ -41,6 +41,9 @@ def main() -> None:
                          "reachable arms) instead of the single expert route")
     ap.add_argument("--tversky-weight", type=float, default=0.0,
                     help="P5: weight of the recall-weighted Tversky term (0 = BCE only)")
+    ap.add_argument("--lanegraph-label-dir", type=str, default=None,
+                    help="P5+: read clean lane-graph corridor labels from this cache "
+                         "instead of the mushy flood-fill blob")
     args = ap.parse_args()
 
     # --- DDP setup ---
@@ -73,6 +76,7 @@ def main() -> None:
     # P5a: distill the multimodal drivable-support field instead of the expert route.
     config.use_multimodal_intent = args.multimodal_intent
     config.intent_tversky_weight = args.tversky_weight
+    config.lanegraph_label_dir = args.lanegraph_label_dir
     # "plant" model_type makes CARLAData.__getitem__ return right after building the
     # visual_intent_label, skipping the heavy sensor path (lidar .laz). P4a only needs
     # the label, so this makes the dataloader fast.
