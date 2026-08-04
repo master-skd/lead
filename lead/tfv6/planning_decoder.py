@@ -258,6 +258,23 @@ class PlanningDecoder(nn.Module):
         bce = F.binary_cross_entropy_with_logits(conf, conf_tgt, reduction="none")  # (B,K)
         loss["loss_route_conf"] = (bce * valid).sum() / valid.sum().clamp(min=1.0)
 
+        # B2 anti-collapse (term 3): pull each NON-winner valid arm's endpoint toward its
+        # OWN anchor target, so the K arms diverge to different feasible branches instead
+        # of collapsing onto the winner (pure WTA collapses -- cf. DiffusionDrive). We can
+        # do this because our anchors are per-scene, multimodal, and each points at a
+        # distinct blob branch (unlike DiffusionDrive's scene-agnostic kmeans anchors).
+        # winner regresses expert (term 1); non-winners regress their anchor endpoint.
+        anchor = data["anchor"].to(self.device).float()  # (B,K,4)=[sin,cos,reach/30,valid]
+        sin_a, cos_a, reach_n = anchor[:, :, 0], anchor[:, :, 1], anchor[:, :, 2]
+        reach_m = reach_n * 30.0
+        # anchor target endpoint in ego metres: x=forward=reach*cos, y=lateral=reach*sin
+        tgt = torch.stack([reach_m * cos_a, reach_m * sin_a], dim=-1)  # (B,K,2)
+        pred_end = route_all[:, :, -1, :]  # (B,K,2) each arm's endpoint
+        arm_l1 = F.l1_loss(pred_end, tgt, reduction="none").mean(dim=-1)  # (B,K)
+        nonwin = valid.clone()
+        nonwin[torch.arange(B), winner] = 0.0  # exclude winner (it regresses expert)
+        loss["loss_route_anchor"] = (arm_l1 * nonwin).sum() / nonwin.sum().clamp(min=1.0)
+
     @beartype
     def compute_loss(self, predictions, data: dict, loss: dict, log: dict):
         # Prepare loss dictionary

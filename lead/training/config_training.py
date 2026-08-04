@@ -971,6 +971,8 @@ class TrainingConfig(BaseConfig):
     multimodal_planner_k = 6  # K_MAX, must match anchor_extraction.K_MAX
     # B2: anchor cache dir (precomputed skeleton anchors, (K_MAX,5) per frame).
     anchor_cache_dir = "data/p6/anchor_cache"
+    # B2 anti-collapse: weight of the non-winner-arm anchor-endpoint regression.
+    route_anchor_loss_weight = 1.0
     # P2.2: if true, add a differentiable collision cost on predicted waypoints.
     use_collision_cost = False
     collision_loss_weight = 1.0
@@ -1041,6 +1043,11 @@ class TrainingConfig(BaseConfig):
         )
         # B2: per-mode confidence BCE (only active in multimodal planner mode).
         weights["loss_route_conf"] = 1.0 if self.multimodal_planner else 0.0
+        # B2 anti-collapse: non-winner arms regress their own anchor endpoint so the K arms
+        # diverge. Weight tunable; too high overrides winner-vs-expert fidelity.
+        weights["loss_route_anchor"] = (
+            self.route_anchor_loss_weight if self.multimodal_planner else 0.0
+        )
 
         # Disable planning losses during pretraining
         if not self.use_planning_decoder:
