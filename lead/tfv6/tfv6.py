@@ -129,6 +129,29 @@ class TFv6(nn.Module):
             self.vlm_intent_decoder.eval()
             self.vlm_intent_decoder.requires_grad_(False)
 
+    def _anchors_from_blob(self, intent_logits):
+        """Closed-loop anchor: extract skeleton anchors from the pred blob and pack to the
+        planner's (B, K, 4) = [sin a, cos a, reach/30, valid] embedding input. Matches
+        precompute_anchors.py / the dataset packing so train and eval anchors are identical.
+        """
+        import numpy as np
+        from lead.tfv6.anchor_extraction import extract_anchors_from_blob, K_MAX
+
+        cfg = self.config
+        ppm = cfg.pixels_per_meter
+        row_ego = int((0 - cfg.min_y_meter) * ppm)
+        col_ego = int((0 - cfg.min_x_meter) * ppm)
+        blob = torch.sigmoid(intent_logits.float()).detach().cpu().numpy()  # (B,1,H,W)
+        B = blob.shape[0]
+        out = np.zeros((B, K_MAX, 4), dtype=np.float32)
+        for b in range(B):
+            anchors, _ = extract_anchors_from_blob(blob[b, 0], ppm, row_ego, col_ego)
+            valid, ang, reach = anchors[:, 0], anchors[:, 1], anchors[:, 2]
+            feat = np.stack([np.sin(ang), np.cos(ang), reach / 30.0, valid], axis=1)
+            feat[valid < 0.5] = 0.0
+            out[b] = feat
+        return torch.from_numpy(out).to(self.device)
+
     @beartype
     def forward(
         self,
@@ -193,7 +216,14 @@ class TFv6(nn.Module):
             planner_intent = (
                 pred_visual_intent if self.config.use_control_conditioning else None
             )
-            planner_anchor = data.get("anchor") if self.config.multimodal_planner else None
+            planner_anchor = None
+            if self.config.multimodal_planner:
+                planner_anchor = data.get("anchor")
+                if planner_anchor is None and pred_visual_intent is not None:
+                    # Closed-loop: no cached anchor -> compute from the (frozen, hence
+                    # deterministic) pred blob with the SAME extractor used to build the
+                    # training cache, so train/eval anchors are identical.
+                    planner_anchor = self._anchors_from_blob(pred_visual_intent)
             (
                 pred_route,
                 pred_future_waypoints,
