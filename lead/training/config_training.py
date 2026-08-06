@@ -974,8 +974,24 @@ class TrainingConfig(BaseConfig):
     # P5+: if set, use_multimodal_intent reads the clean lane-graph corridor label from this
     # cache instead of the mushy flood-fill blob. None = old blob behaviour.
     lanegraph_label_dir = None
-    # B2 anti-collapse: weight of the non-winner-arm anchor-endpoint regression.
+    # B2 anti-collapse: weight of the non-winner-arm anchor-consistency penalty. The
+    # penalty is deliberately LOOSE (angular hinge + one-sided reach hinge, see
+    # PlanningDecoder._multimodal_route_loss) so the anchor stays a fuzzy "which branch"
+    # cue rather than a trajectory label -- binding the arm to the anchor endpoint would
+    # collapse the intent/control separation the whole design rests on.
     route_anchor_loss_weight = 1.0
+    # Half-angle (degrees) of the free cone around the anchor bearing: a non-winner arm
+    # inside it pays nothing, so it may curve as it likes as long as it commits to that
+    # branch. Wider = looser control coupling, but weaker anti-collapse pressure.
+    route_anchor_tol_deg = 25.0
+    # A non-winner arm is only penalised for being SHORTER than this fraction of its
+    # anchor's reach (a near-zero-length arm has no meaningful bearing). Going further
+    # than the anchor is free -- reach is intent, not a target.
+    route_anchor_min_reach_frac = 0.5
+    # B2 term 4: weight of the collision cost applied to ALL valid route arms (not just
+    # the winner), which is what makes closed-loop late resolution by collision cost
+    # meaningful. Requires use_collision_cost.
+    route_collision_loss_weight = 1.0
     # P2.2: if true, add a differentiable collision cost on predicted waypoints.
     use_collision_cost = False
     collision_loss_weight = 1.0
@@ -1046,10 +1062,17 @@ class TrainingConfig(BaseConfig):
         )
         # B2: per-mode confidence BCE (only active in multimodal planner mode).
         weights["loss_route_conf"] = 1.0 if self.multimodal_planner else 0.0
-        # B2 anti-collapse: non-winner arms regress their own anchor endpoint so the K arms
-        # diverge. Weight tunable; too high overrides winner-vs-expert fidelity.
+        # B2 anti-collapse: non-winner arms are pushed toward their own anchor BRANCH
+        # (loose hinges, not endpoint L1) so the K arms diverge. Weight tunable; too high
+        # overrides winner-vs-expert fidelity.
         weights["loss_route_anchor"] = (
             self.route_anchor_loss_weight if self.multimodal_planner else 0.0
+        )
+        # B2 term 4: collision cost over all valid arms (needs both flags).
+        weights["loss_route_collision"] = (
+            self.route_collision_loss_weight
+            if (self.multimodal_planner and self.use_collision_cost)
+            else 0.0
         )
 
         # Disable planning losses during pretraining

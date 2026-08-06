@@ -258,22 +258,54 @@ class PlanningDecoder(nn.Module):
         bce = F.binary_cross_entropy_with_logits(conf, conf_tgt, reduction="none")  # (B,K)
         loss["loss_route_conf"] = (bce * valid).sum() / valid.sum().clamp(min=1.0)
 
-        # B2 anti-collapse (term 3): pull each NON-winner valid arm's endpoint toward its
-        # OWN anchor target, so the K arms diverge to different feasible branches instead
-        # of collapsing onto the winner (pure WTA collapses -- cf. DiffusionDrive). We can
-        # do this because our anchors are per-scene, multimodal, and each points at a
-        # distinct blob branch (unlike DiffusionDrive's scene-agnostic kmeans anchors).
-        # winner regresses expert (term 1); non-winners regress their anchor endpoint.
+        # B2 anti-collapse (term 3): push each NON-winner valid arm toward its OWN anchor
+        # BRANCH, so the K arms diverge instead of collapsing onto the winner (pure WTA
+        # collapses -- cf. DiffusionDrive). We can do this because our anchors are
+        # per-scene and multimodal, each pointing at a distinct lane-graph branch (unlike
+        # DiffusionDrive's scene-agnostic kmeans anchors, which is why they needed RL).
+        #
+        # Deliberately LOOSE: an L1 to the anchor endpoint would make the anchor a
+        # trajectory label and bind control to intent (the red line -- intent must stay a
+        # fuzzy "which way", the planner resolves the actual path late). Instead:
+        #   (a) angular hinge -- free inside +-tol_deg of the anchor bearing, so the arm
+        #       may curve however it likes as long as it commits to that branch;
+        #   (b) reach hinge -- only penalise arms far SHORTER than the anchor's reach
+        #       (a near-zero-length arm has no meaningful direction); going further is free.
         anchor = data["anchor"].to(self.device).float()  # (B,K,4)=[sin,cos,reach/30,valid]
-        sin_a, cos_a, reach_n = anchor[:, :, 0], anchor[:, :, 1], anchor[:, :, 2]
-        reach_m = reach_n * 30.0
-        # anchor target endpoint in ego metres: x=forward=reach*cos, y=lateral=reach*sin
-        tgt = torch.stack([reach_m * cos_a, reach_m * sin_a], dim=-1)  # (B,K,2)
-        pred_end = route_all[:, :, -1, :]  # (B,K,2) each arm's endpoint
-        arm_l1 = F.l1_loss(pred_end, tgt, reduction="none").mean(dim=-1)  # (B,K)
+        sin_a, cos_a, reach_m = anchor[:, :, 0], anchor[:, :, 1], anchor[:, :, 2] * 30.0
+        pred_end = route_all[:, :, -1, :]  # (B,K,2) each arm's endpoint, (x=fwd, y=lat)
+        pred_norm = torch.linalg.norm(pred_end, dim=-1)  # (B,K)
+
+        # (a) cosine between the arm's bearing and the anchor's; hinge at cos(tol).
+        cos_sim = (pred_end[..., 0] * cos_a + pred_end[..., 1] * sin_a) / pred_norm.clamp(min=1e-3)
+        cos_tol = math.cos(math.radians(self.config.route_anchor_tol_deg))
+        angle_hinge = F.relu(cos_tol - cos_sim)  # (B,K), 0 when within tolerance
+
+        # (b) one-sided reach hinge, normalised by 30 m so it is scale-comparable to (a).
+        min_reach = reach_m * self.config.route_anchor_min_reach_frac
+        reach_hinge = F.relu(min_reach - pred_norm) / 30.0  # (B,K)
+
         nonwin = valid.clone()
         nonwin[torch.arange(B), winner] = 0.0  # exclude winner (it regresses expert)
-        loss["loss_route_anchor"] = (arm_l1 * nonwin).sum() / nonwin.sum().clamp(min=1.0)
+        arm_pen = angle_hinge + reach_hinge
+        loss["loss_route_anchor"] = (arm_pen * nonwin).sum() / nonwin.sum().clamp(min=1.0)
+
+        # B2 term 4: collision cost on ALL valid arms, not just the winner. This is what
+        # makes late resolution meaningful in closed loop -- the arm the controller picks
+        # is chosen by collision cost, so every arm has to be physically drivable, and an
+        # arm that the angular hinge sends into an obstacle must route around it.
+        if self.config.use_collision_cost and "bev_semantic" in data:
+            from lead.tfv6.collision_cost import collision_cost_per_mode
+
+            per_mode = collision_cost_per_mode(
+                route_all,
+                data["bev_semantic"].to(self.device, non_blocking=True),
+                self.config,
+                sigma_m=self.config.collision_sigma_m,
+            )  # (B,K)
+            loss["loss_route_collision"] = (
+                per_mode * valid
+            ).sum() / valid.sum().clamp(min=1.0)
 
     @beartype
     def compute_loss(self, predictions, data: dict, loss: dict, log: dict):

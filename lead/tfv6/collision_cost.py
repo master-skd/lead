@@ -106,6 +106,32 @@ def differentiable_collision(
     return sampled.mean()
 
 
+@beartype
+def collision_cost_per_mode(
+    routes: torch.Tensor,  # (B, K, N, 2) ego metres -- K route arms per sample
+    bev_semantic: torch.Tensor,  # (B, H, W) or (B,1,H,W) class ids
+    config: TrainingConfig,
+    sigma_m: float = 2.0,
+) -> torch.Tensor:
+    """Per-arm mean danger value -> ``(B, K)``, differentiable w.r.t. ``routes``.
+
+    Same danger field as :func:`differentiable_collision` but WITHOUT reducing over the
+    mode axis, so the caller can mask out padded arms before averaging (B2: only valid
+    arms should contribute) and can rank arms by cost at inference for late resolution.
+    The danger field is built once per sample and shared across that sample's K arms.
+    """
+    b, k, n, _ = routes.shape
+    occ = occupancy_from_bev_semantic(bev_semantic)
+    danger = soft_danger_field(occ, config, sigma_m=sigma_m).to(routes.dtype)  # (B,1,H,W)
+    # flatten the mode axis into the batch axis, repeating each sample's field K times
+    grid = waypoints_to_grid(routes.reshape(b * k, n, 2), config).to(routes.dtype)
+    danger_rep = danger.repeat_interleave(k, dim=0)  # (B*K,1,H,W)
+    sampled = F.grid_sample(
+        danger_rep, grid, mode="bilinear", padding_mode="zeros", align_corners=True,
+    )  # (B*K, 1, N, 1)
+    return sampled.reshape(b, k, n).mean(dim=2)  # (B,K)
+
+
 def _smoke_test() -> None:
     torch.manual_seed(0)
     config = TrainingConfig()
@@ -126,6 +152,20 @@ def _smoke_test() -> None:
     print("occ obstacle cells:", int(occupancy_from_bev_semantic(sem).sum()))
     assert wp.grad is not None and wp.grad.norm() > 0, "no gradient to waypoints!"
     print("COLLISION COST OK (gradient flows to waypoints)")
+
+    # per-mode (B2): arm 0 drives through the block, arm 1 detours around it -> arm 1
+    # must score strictly lower, and each arm must get its own gradient.
+    routes = torch.zeros(b, 2, 8, 2)
+    routes[:, :, :, 0] = torch.linspace(2.0, 12.0, 8)
+    routes[:, 1, :, 1] = 8.0  # arm 1 offset laterally, clear of the block
+    routes.requires_grad_(True)
+    per_mode = collision_cost_per_mode(routes, sem, config)
+    per_mode.sum().backward()
+    print("per-mode cost:", per_mode[0].tolist())
+    assert per_mode.shape == (b, 2), f"expected (B,K), got {tuple(per_mode.shape)}"
+    assert per_mode[0, 1] < per_mode[0, 0], "detour arm should be cheaper!"
+    assert routes.grad[0, 0].norm() > 0, "no gradient to the colliding arm!"
+    print("PER-MODE COLLISION OK (arms scored independently, gradient per arm)")
 
 
 if __name__ == "__main__":
