@@ -78,6 +78,13 @@ def main() -> None:
     ap.add_argument("--ckpt-name", default="model_0019.pth")
     ap.add_argument("--n", type=int, default=12)
     ap.add_argument("--out", default="outputs/viz_b2_arms")
+    ap.add_argument("--show-padding", action="store_true",
+                    help="also draw the INVALID (padding) arms in dim grey. They get no "
+                         "gradient from any loss, so they drift freely -- worth seeing "
+                         "because closed-loop arm selection must mask them out.")
+    ap.add_argument("--min-arms", type=int, default=1,
+                    help="only save frames with at least this many valid arms (use 2 to "
+                         "see actual forks rather than the 80%% single-arm majority)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -144,6 +151,9 @@ def main() -> None:
         conf = torch.sigmoid(batch["route_conf"][0].float()).cpu().numpy()  # (K,)
         anchor = np.asarray(data["anchor"])  # (K,4) [sin,cos,reach/30,valid]
         valid = anchor[:, 3] > 0.5
+        if int(valid.sum()) < args.min_arms:
+            continue
+        gt = np.asarray(data["route"], dtype=np.float32)[:, :2]  # (n,2) expert route
 
         # canvas: colorized hdmap semantics (road / sidewalk / lane markers) resampled to
         # the ego BEV grid, so we can see if each arm stays ON THE ROAD (a divergent arm is
@@ -151,25 +161,50 @@ def main() -> None:
         canvas = _hdmap_bev(str(carla_ds.bev_semantics[ci], encoding="utf-8"), config)
         cv2.circle(canvas, (col_ego, row_ego), 3, (255, 255, 255), -1)
 
+        # GT expert route first (thick white), so arms are judged against it
+        r, c = m2px(gt)
+        cv2.polylines(canvas, [np.stack([c, r], 1).astype(np.int32)], False, (255, 255, 255), 3)
+
         nvalid = int(valid.sum())
+        # padding arms underneath (dim grey, thin) -- they are unconstrained by every loss
+        if args.show_padding:
+            for k in range(arms.shape[0]):
+                if valid[k]:
+                    continue
+                r, c = m2px(arms[k])
+                cv2.polylines(canvas, [np.stack([c, r], 1).astype(np.int32)], False,
+                              (90, 90, 90), 1)
+
+        # winner = valid arm closest to GT, marked so WTA behaviour is visible
+        d_gt = np.linalg.norm(arms - gt[None], axis=-1).mean(axis=1)
+        d_gt[~valid] = np.inf
+        winner = int(np.argmin(d_gt))
+
         for k in range(arms.shape[0]):
             if not valid[k]:
                 continue
             r, c = m2px(arms[k])
             pts = np.stack([c, r], axis=1).astype(np.int32)
             col_k = _MODE_COLORS[k % len(_MODE_COLORS)]
-            cv2.polylines(canvas, [pts], False, col_k, 2)
-            cv2.putText(canvas, f"{conf[k]:.2f}", (int(c[-1]), int(r[-1])),
+            cv2.polylines(canvas, [pts], False, col_k, 3 if k == winner else 2)
+            tag = f"{conf[k]:.2f}" + ("*" if k == winner else "")
+            cv2.putText(canvas, tag, (int(c[-1]), int(r[-1])),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, col_k, 1)
 
         # forward = +col = image right; rotate 90 CCW so forward is UP
         canvas = cv2.rotate(canvas, cv2.ROTATE_90_COUNTERCLOCKWISE)
         cv2.putText(canvas, f"K={nvalid} {srf[0][:18]} cmd={cmds.get(srf)}",
                     (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        cv2.putText(canvas, "white=GT  thick=winner  grey=padding(unconstrained)",
+                    (5, canvas.shape[0] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
         outp = os.path.join(args.out, f"{saved:02d}_K{nvalid}_idx{idx}.png")
         cv2.imwrite(outp, canvas[..., ::-1])
         saved += 1
-        print(f"saved {outp}  {srf}  K={nvalid}  conf={conf[valid].round(2)}")
+        spread = float(np.linalg.norm(
+            arms[valid][:, -1][:, None] - arms[valid][:, -1][None], axis=-1,
+        ).max()) if nvalid > 1 else 0.0
+        print(f"saved {outp}  {srf[0][:22]}  K={nvalid}  conf={conf[valid].round(2)}  "
+              f"max_endpoint_spread={spread:.1f}m")
 
     print(f"\n✓ {saved} panels in {args.out}")
 

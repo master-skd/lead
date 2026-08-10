@@ -307,6 +307,41 @@ class PlanningDecoder(nn.Module):
                 per_mode * valid
             ).sum() / valid.sum().clamp(min=1.0)
 
+        # B2 term 5: keep every valid arm ON a drivable branch. Terms 3-4 cannot do this --
+        # the hinges only constrain bearing/reach, and term 4's danger field is built from
+        # vehicles/walkers, so an arm crossing onto grass or oncoming lanes costs nothing.
+        # Visualising B2-final showed exactly that failure: winner arms tracked the road while
+        # every non-winner arm drove off-road, with all four losses still falling.
+        # The lane-graph corridor (union of L/S/R arms at lane width) supplies the missing
+        # shape while staying weak enough that intent is still "which way", not a path.
+        if self.config.use_route_corridor_loss and "visual_intent_label" in data:
+            from lead.tfv6.collision_cost import corridor_cost_per_mode
+
+            corr = corridor_cost_per_mode(
+                route_all,
+                data["visual_intent_label"].to(self.device, non_blocking=True).float(),
+                self.config,
+                reach_m=self.config.route_corridor_reach_m,
+            )  # (B,K)
+            loss["loss_route_corridor"] = (
+                corr * valid
+            ).sum() / valid.sum().clamp(min=1.0)
+
+        # B2 term 6: drive the PADDING arms' confidence to zero. Padding arms get no gradient
+        # from terms 1/3/4/5 (all masked by `valid`), so their route output is unconstrained
+        # drift -- yet B2-final left them with conf logits ~6.4, indistinguishable from the
+        # real arm's 6.375. Any closed-loop selector that ranks by confidence without also
+        # checking the valid flag would happily steer down one. Supervising them here makes
+        # confidence self-sufficient instead of relying on every consumer to mask correctly.
+        pad = 1.0 - valid  # (B,K)
+        if self.config.route_pad_conf_loss_weight > 0:
+            pad_bce = F.binary_cross_entropy_with_logits(
+                conf, torch.zeros_like(conf), reduction="none",
+            )  # (B,K)
+            loss["loss_route_pad_conf"] = (
+                pad_bce * pad
+            ).sum() / pad.sum().clamp(min=1.0)
+
     @beartype
     def compute_loss(self, predictions, data: dict, loss: dict, log: dict):
         # Prepare loss dictionary

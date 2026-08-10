@@ -426,8 +426,11 @@ class CARLAData(Dataset):
 
             # Precompute the soft BEV visual-intent label on the CPU worker so the
             # heavy (B,N,H,W) rasterization stays off the GPU critical path.
+            # B2 also needs the lane-graph corridor as a route-arm label (not just as an
+            # intent-distillation target), so the multimodal planner's corridor penalty
+            # keeps its arms on the road -- hence use_route_corridor_loss also opens this.
             if (
-                self.config.use_intent_decoder
+                (self.config.use_intent_decoder or self.config.use_route_corridor_loss)
                 and not self.build_cache
                 and not self.build_buckets
             ):

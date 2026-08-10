@@ -992,6 +992,27 @@ class TrainingConfig(BaseConfig):
     # the winner), which is what makes closed-loop late resolution by collision cost
     # meaningful. Requires use_collision_cost.
     route_collision_loss_weight = 1.0
+    # B2 term 5: if true, penalise every valid route arm for leaving the lane-graph
+    # corridor. Needed because term 4's danger field only knows vehicles/walkers, so an
+    # arm driving onto grass or into oncoming lanes costs nothing there -- which is how
+    # B2-final's non-winner arms went off-road with all losses still falling. Requires
+    # lanegraph_label_dir (the corridor label is loaded from it even when the intent
+    # decoder is off; see CARLAData).
+    use_route_corridor_loss = False
+    route_corridor_loss_weight = 1.0
+    # Length (metres) of the off-corridor distance ramp: cost is 0 anywhere on a drivable
+    # branch and climbs linearly to 1 this far off-road. Must stay long enough to still be
+    # ramping where the bad arms are -- B2-final's non-winner arms sit >10 m off-road, and a
+    # short ramp saturates there, leaving them on a zero-gradient plateau (the same failure a
+    # gaussian blur has). Note a blur was tried first and rejected: it charged the GT expert
+    # route 0.349, i.e. it fought expert fidelity. See _clipped_distance_field.
+    route_corridor_reach_m = 20.0
+    # B2 term 6: weight of the padding-arm confidence penalty. Padding (invalid) arms are
+    # masked out of every other loss, so their route is unconstrained drift -- yet
+    # B2-final gave them conf logits ~6.4, level with the real arm. Driving their
+    # confidence to 0 makes conf self-sufficient instead of trusting each consumer to
+    # mask by the valid flag. Set 0 to disable.
+    route_pad_conf_loss_weight = 1.0
     # P2.2: if true, add a differentiable collision cost on predicted waypoints.
     use_collision_cost = False
     collision_loss_weight = 1.0
@@ -1073,6 +1094,16 @@ class TrainingConfig(BaseConfig):
             self.route_collision_loss_weight
             if (self.multimodal_planner and self.use_collision_cost)
             else 0.0
+        )
+        # B2 term 5: off-corridor penalty over all valid arms (needs both flags).
+        weights["loss_route_corridor"] = (
+            self.route_corridor_loss_weight
+            if (self.multimodal_planner and self.use_route_corridor_loss)
+            else 0.0
+        )
+        # B2 term 6: push padding arms' confidence to 0.
+        weights["loss_route_pad_conf"] = (
+            self.route_pad_conf_loss_weight if self.multimodal_planner else 0.0
         )
 
         # Disable planning losses during pretraining
