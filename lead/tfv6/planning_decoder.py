@@ -186,7 +186,46 @@ class PlanningDecoder(nn.Module):
                 # would choke on these tensors). compute_loss reads them from data.
                 data["route_multimodal"] = route_all
                 data["route_conf"] = conf
-                route = route_all[:, 0]  # placeholder single route
+                # Which arm goes to the single-route consumers (closed-loop control reads
+                # exactly this tensor via Prediction.pred_route).
+                #
+                # Slot 0 is NOT a safe default in closed loop. The slot order comes from the
+                # anchor list, which anchor_extraction sorts by REACH. Training reads
+                # carla.Map lane-graph anchors from disk; closed loop re-derives them from the
+                # predicted blob, where reach carries ~1.25 m of error -- enough to reorder
+                # near-equal-length arms. Measured over 2500 multi-arm frames by comparing the
+                # two cached anchor sets: slot 0 points at a DIFFERENT branch (>25 deg, i.e.
+                # outside the anchor hinge tolerance) on 74.7% of them, mean angular
+                # difference 55.8 deg, p90 108 deg. Where the top-2 arms are within 3 m of
+                # each other (20.7% of frames) slot 0 flips on 88.8%. Open-loop eval cannot
+                # see any of this: it reads the GT anchors, so the slot order it measures is
+                # the training order by construction, which is why ade_arm0 there equals
+                # ade_conf to 16 decimals and why that agreement says nothing about closed
+                # loop.
+                #
+                # Selecting by confidence removes the dependence on slot order. It MUST mask
+                # padding arms first: they get no gradient from any per-arm loss (all are
+                # masked by `valid`), so their route is unconstrained drift, and without
+                # route_pad_conf_loss_weight they still score high -- B2-final leaves them at
+                # 0.989 against the real arms' 0.414, so a bare argmax steers down one. Use
+                # this with a checkpoint trained with term 6 (p5_stepB2_corridor).
+                if self.config.route_select_by_conf:
+                    valid = (
+                        anchor[..., 3] > 0.5
+                        if anchor is not None
+                        else torch.ones_like(conf, dtype=torch.bool)
+                    )  # (B,K)
+                    # -inf on padding so argmax can never land there; all-padding rows (no
+                    # anchor extracted at all) fall back to slot 0 rather than picking noise.
+                    masked = conf.masked_fill(~valid, float("-inf"))
+                    pick = torch.where(
+                        valid.any(dim=1), masked.argmax(dim=1), torch.zeros_like(conf[:, 0], dtype=torch.long),
+                    )  # (B,)
+                    route = route_all[torch.arange(bs, device=route_all.device), pick]
+                    log["route_arm_picked"] = pick.float().mean()
+                    log["route_n_valid_arms"] = valid.float().sum(dim=1).mean()
+                else:
+                    route = route_all[:, 0]  # placeholder single route
                 query_idx += self.K * n_route
             else:
                 route_queries = queries[:, query_idx : query_idx + n_route]

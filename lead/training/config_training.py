@@ -1013,6 +1013,23 @@ class TrainingConfig(BaseConfig):
     # confidence to 0 makes conf self-sufficient instead of trusting each consumer to
     # mask by the valid flag. Set 0 to disable.
     route_pad_conf_loss_weight = 1.0
+    # If true, the single `route` handed to downstream consumers (crucially closed-loop
+    # control, via Prediction.pred_route) is the highest-confidence VALID arm rather than
+    # slot 0. Inference-only -- it changes no loss, so it can be switched on for an existing
+    # checkpoint. Off by default to keep the historical single-route behaviour bit-identical.
+    #
+    # Slot 0 is unsafe in closed loop because slot order follows the anchor list's REACH
+    # sort, and closed-loop anchors are re-derived from the predicted blob (~1.25 m reach
+    # error) instead of read from the carla.Map lane graph. Comparing the two cached anchor
+    # sets over 2500 multi-arm frames: slot 0 points at a different branch (>25 deg) on
+    # 74.7%, mean 55.8 deg, p90 108 deg; among frames whose top-2 arms are within 3 m
+    # (20.7%), it flips on 88.8%. Open-loop eval reads GT anchors so it cannot observe this.
+    #
+    # Pair this with route_pad_conf_loss_weight > 0. Selection masks padding arms by the
+    # anchor valid flag, but a checkpoint trained without term 6 leaves padding confidence
+    # at 0.989 vs 0.414 for real arms, so its confidence ordering is not trustworthy even
+    # among valid arms.
+    route_select_by_conf = False
     # P2.2: if true, add a differentiable collision cost on predicted waypoints.
     use_collision_cost = False
     collision_loss_weight = 1.0
