@@ -17,6 +17,12 @@ from lead.tfv6.center_net_decoder import (
 from lead.tfv6.perspective_decoder import PerspectiveDecoder
 from lead.tfv6.planning_decoder import PlanningDecoder
 from lead.tfv6.radar_detector import RadarDetector
+from lead.tfv6.route_safety_rescorer import (
+    highest_confidence_valid,
+    rescore_routes_for_safety,
+    resolve_route_selection_mode,
+)
+from lead.tfv6.route_speed_gate import selected_route_collision_risk
 from lead.tfv6.transfuser_backbone import TransfuserBackbone
 from lead.training.config_training import TrainingConfig
 
@@ -135,7 +141,8 @@ class TFv6(nn.Module):
         precompute_anchors.py / the dataset packing so train and eval anchors are identical.
         """
         import numpy as np
-        from lead.tfv6.anchor_extraction import extract_anchors_from_blob, K_MAX
+
+        from lead.tfv6.anchor_extraction import K_MAX, extract_anchors_from_blob
 
         cfg = self.config
         ppm = cfg.pixels_per_meter
@@ -178,6 +185,12 @@ class TFv6(nn.Module):
         pred_semantic = pred_depth = pred_bounding_box = pred_bev_semantic = None
         pred_bounding_box_navsim = pred_bev_semantic_navsim = None
         pred_visual_intent = None
+        pred_route_multimodal = pred_route_conf = pred_route_anchor = None
+        pred_route_features = None
+        pred_route_selected_idx = pred_route_collision_cost = None
+        pred_route_off_corridor_cost = pred_route_safe_mask = None
+        pred_route_collision_risk = None
+        planner_anchor = None
 
         # Backbone
         bev_features, image_features = self.backbone(data)
@@ -216,7 +229,6 @@ class TFv6(nn.Module):
             planner_intent = (
                 pred_visual_intent if self.config.use_control_conditioning else None
             )
-            planner_anchor = None
             if self.config.multimodal_planner:
                 planner_anchor = data.get("anchor")
                 if planner_anchor is None and pred_visual_intent is not None:
@@ -276,6 +288,82 @@ class TFv6(nn.Module):
                     self.log,
                 )
 
+        # B2c late route resolution. It is inference-only and intentionally runs after
+        # BEV semantics: collision comes from the predicted current-scene occupancy and
+        # corridor support comes from the predicted intent blob, matching closed loop.
+        if self.config.multimodal_planner and not self.training:
+            pred_route_multimodal = data.get("route_multimodal")
+            pred_route_conf = data.get("route_conf")
+            pred_route_features = data.get("route_features")
+            pred_route_anchor = (
+                planner_anchor.to(pred_route_conf.device)
+                if planner_anchor is not None and pred_route_conf is not None
+                else planner_anchor
+            )
+            if pred_route_multimodal is not None and pred_route_conf is not None:
+                mode = resolve_route_selection_mode(self.config)
+                valid = (
+                    planner_anchor[..., 3].to(pred_route_conf.device) > 0.5
+                    if planner_anchor is not None
+                    else torch.ones_like(pred_route_conf, dtype=torch.bool)
+                )
+                if mode == "slot0":
+                    pred_route_selected_idx = torch.zeros_like(
+                        pred_route_conf[:, 0], dtype=torch.long,
+                    )
+                    pred_route = pred_route_multimodal[:, 0]
+                elif mode == "confidence":
+                    pred_route_selected_idx = highest_confidence_valid(
+                        pred_route_conf, valid,
+                    )
+                    ar = torch.arange(pred_route_conf.shape[0], device=pred_route_conf.device)
+                    pred_route = pred_route_multimodal[ar, pred_route_selected_idx]
+                else:
+                    if pred_bev_semantic is None or pred_visual_intent is None:
+                        raise RuntimeError(
+                            "route_selection_mode='safety_rescore' requires CARLA BEV "
+                            "semantic logits and visual-intent logits"
+                        )
+                    safety = rescore_routes_for_safety(
+                        pred_route_multimodal,
+                        pred_route_conf,
+                        planner_anchor,
+                        pred_bev_semantic,
+                        pred_visual_intent,
+                        self.config,
+                    )
+                    pred_route = safety.route
+                    pred_route_selected_idx = safety.selection.selected_idx
+                    pred_route_collision_cost = safety.collision_cost
+                    pred_route_off_corridor_cost = safety.off_corridor_cost
+                    pred_route_safe_mask = safety.selection.safe_mask
+                    ar = torch.arange(pred_route_conf.shape[0], device=pred_route_conf.device)
+                    base = safety.selection.baseline_idx
+                    picked = safety.selection.selected_idx
+                    self.log["route_safety_switched_rate"] = safety.selection.switched.float().mean()
+                    self.log["route_safety_fallback_rate"] = safety.selection.fallback.float().mean()
+                    self.log["route_safety_n_safe"] = safety.selection.safe_mask.float().sum(1).mean()
+                    self.log["route_safety_collision_before"] = safety.collision_cost[ar, base].mean()
+                    self.log["route_safety_collision_after"] = safety.collision_cost[ar, picked].mean()
+                    self.log["route_safety_off_corridor_before"] = safety.off_corridor_cost[ar, base].mean()
+                    self.log["route_safety_off_corridor_after"] = safety.off_corridor_cost[ar, picked].mean()
+
+        # B2c': route geometry/branch is already resolved above and is never changed here.
+        # Only expose its current-scene collision risk; OpenLoopInference applies the speed
+        # factor after model ensembling, which is the scalar consumed by the closed-loop PID.
+        if self.config.route_speed_safety_gate and not self.training:
+            if pred_route is None or pred_bev_semantic is None:
+                raise RuntimeError(
+                    "route_speed_safety_gate requires a predicted route and CARLA BEV "
+                    "semantic logits"
+                )
+            pred_route_collision_risk = selected_route_collision_risk(
+                pred_route,
+                pred_bev_semantic,
+                self.config,
+            )
+            self.log["route_speed_collision_risk"] = pred_route_collision_risk.mean()
+
         # Collect predictions
         return Prediction(
             # Planning prediction
@@ -295,6 +383,15 @@ class TFv6(nn.Module):
             pred_bev_semantic_navsim=pred_bev_semantic_navsim,
             pred_headings=pred_headings,
             pred_visual_intent=pred_visual_intent,
+            pred_route_multimodal=pred_route_multimodal,
+            pred_route_conf=pred_route_conf,
+            pred_route_anchor=pred_route_anchor,
+            pred_route_features=pred_route_features,
+            pred_route_selected_idx=pred_route_selected_idx,
+            pred_route_collision_cost=pred_route_collision_cost,
+            pred_route_off_corridor_cost=pred_route_off_corridor_cost,
+            pred_route_safe_mask=pred_route_safe_mask,
+            pred_route_collision_risk=pred_route_collision_risk,
         )
 
     @beartype
@@ -420,3 +517,13 @@ class Prediction:
     pred_visual_intent: (
         jt.Float[torch.Tensor, "bs 1 bev_height bev_width"] | None
     ) = None
+    # B2c inference diagnostics (kept optional for all single-route callers).
+    pred_route_multimodal: torch.Tensor | None = None
+    pred_route_conf: torch.Tensor | None = None
+    pred_route_anchor: torch.Tensor | None = None
+    pred_route_features: torch.Tensor | None = None
+    pred_route_selected_idx: torch.Tensor | None = None
+    pred_route_collision_cost: torch.Tensor | None = None
+    pred_route_off_corridor_cost: torch.Tensor | None = None
+    pred_route_safe_mask: torch.Tensor | None = None
+    pred_route_collision_risk: torch.Tensor | None = None

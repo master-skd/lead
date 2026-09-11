@@ -181,11 +181,18 @@ class PlanningDecoder(nn.Module):
                 route_q = queries[:, query_idx : query_idx + self.K * n_route]
                 route_q = route_q.reshape(bs, self.K, n_route, -1)  # (B,K,n_route,D)
                 route_all = torch.cumsum(self.route_decoder(route_q), dim=2)  # (B,K,n_route,2)
-                conf = self.conf_decoder(route_q.mean(dim=2)).squeeze(-1)  # (B,K)
+                # Keep the pooled, scene-conditioned route token for B2d.  It has already
+                # cross-attended to the BEV/radar/intent context and is therefore the right
+                # frozen representation for a per-arm dynamic-risk head.  Storing it in the
+                # transient batch dict adds no checkpoint parameters and changes no B2 loss.
+                route_features = route_q.mean(dim=2)  # (B,K,D)
+                conf = self.conf_decoder(route_features).squeeze(-1)  # (B,K)
                 # Bypass via `data` (NOT `log`: logger scalar-reduces every log entry and
                 # would choke on these tensors). compute_loss reads them from data.
                 data["route_multimodal"] = route_all
                 data["route_conf"] = conf
+                if not self.training:
+                    data["route_features"] = route_features
                 # Which arm goes to the single-route consumers (closed-loop control reads
                 # exactly this tensor via Prediction.pred_route).
                 #

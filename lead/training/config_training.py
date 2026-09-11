@@ -1030,6 +1030,40 @@ class TrainingConfig(BaseConfig):
     # at 0.989 vs 0.414 for real arms, so its confidence ordering is not trustworthy even
     # among valid arms.
     route_select_by_conf = False
+    # B2c inference-only route selector. ``legacy`` maps to route_select_by_conf so old
+    # configs remain bit-compatible; explicit choices are slot0, confidence, and
+    # safety_rescore. Safety rescoring treats confidence as preference and collision /
+    # off-corridor scores as veto gates -- it does not blend them into a fragile reward.
+    route_selection_mode = "legacy"
+    # Collision is max danger over the near control horizon; off-corridor is the mean
+    # clipped distance over the complete route. These thresholds are intentionally eval
+    # knobs and should be selected with eval_b2c_safety_rescore.py, not assumed calibrated.
+    route_safety_collision_threshold = 0.1
+    route_safety_corridor_threshold = 0.1
+    route_safety_near_points = 10
+    # B2c': keep the confidence-selected navigation branch fixed and use collision risk
+    # only to reduce target speed. The factor is 1 below the low threshold, interpolates
+    # linearly, and reaches route_speed_gate_minimum_factor at the high threshold. This is
+    # applied after model ensembling so it reaches the closed-loop target-speed PID.
+    route_speed_safety_gate = False
+    route_speed_gate_low_threshold = 0.5
+    route_speed_gate_high_threshold = 0.9
+    route_speed_gate_minimum_factor = 0.0
+    route_speed_gate_near_points = 10
+    # B2d': learned future dynamic-collision risk on the confidence-selected arm.  The
+    # head is a separate checkpoint trained on frozen corridor route tokens, so enabling
+    # it does not change the base model state dict.  Its speed cap is combined with the
+    # B2c' current-scene cap by taking the more conservative (smaller) factor.
+    route_future_safety_gate = False
+    route_future_safety_head = (
+        "outputs/local_training/p5_stepB2d_safety_head/safety_head_best.pth"
+    )
+    # Conservative held-out operating point from the B2d' audit: it intervenes on
+    # 0.7% of frames while retaining 14.2% collision recall.  The gate stays disabled
+    # by default until this candidate is compared in closed loop.
+    route_future_gate_low_threshold = 0.95
+    route_future_gate_high_threshold = 0.995
+    route_future_gate_minimum_factor = 0.0
     # P2.2: if true, add a differentiable collision cost on predicted waypoints.
     use_collision_cost = False
     collision_loss_weight = 1.0

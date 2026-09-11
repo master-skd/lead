@@ -16,6 +16,10 @@ from lead.inference import inference_utils
 from lead.inference.config_open_loop import OpenLoopConfig
 from lead.tfv6.center_net_decoder import PredictedBoundingBox
 from lead.tfv6.planning_decoder import decode_two_hot
+from lead.tfv6.route_speed_gate import (
+    apply_collision_speed_gate,
+    collision_risk_to_speed_factor,
+)
 from lead.tfv6.tfv6 import Prediction
 from lead.training.config_training import TrainingConfig
 from lead.training.training_utils import create_model
@@ -51,6 +55,7 @@ class OpenLoopInference:
 
         # Loading models
         self.nets: list[torch.nn.Module] = []
+        self.model_weight_paths: list[str] = []
         for file in sorted(os.listdir(model_path)):
             if file.startswith(prefix) and file.endswith(".pth"):
                 LOG.info(f"Loading model weight from {os.path.join(model_path, file)}")
@@ -68,18 +73,43 @@ class OpenLoopInference:
                 )
                 net.cuda(device=self.device).eval()
                 self.nets.append(net)
+                self.model_weight_paths.append(os.path.abspath(os.path.join(model_path, file)))
+        self.route_safety_head = None
+        if self.config_training.route_future_safety_gate:
+            from lead.tfv6.route_safety_head import load_route_safety_head
+
+            head_path = self.config_training.route_future_safety_head
+            checkpoint = torch.load(head_path, map_location=self.device, weights_only=True)
+            source = checkpoint.get("source_checkpoint")
+            if source is not None and os.path.exists(source):
+                source = os.path.abspath(source)
+                if not any(os.path.samefile(source, path) for path in self.model_weight_paths):
+                    raise ValueError(
+                        f"B2d safety head was trained from {source}, but inference loaded "
+                        f"{self.model_weight_paths}"
+                    )
+            self.route_safety_head = load_route_safety_head(checkpoint, self.device).eval()
+            self.route_safety_head.requires_grad_(False)
+            LOG.info(f"Loaded B2d route safety head from {head_path}")
         self.step = 4  # Constant so produced images start with 5, not really important
 
     @beartype
     def ensemble_planning_decoder(
         self,
         predictions: list[Prediction],
+        data: dict[str, torch.Tensor] | None = None,
     ) -> tuple[
         jt.Float[torch.Tensor, "1 num_waypoints 2"] | None,
         jt.Float[torch.Tensor, "1 num_checkpoints 2"] | None,
         jt.Float[torch.Tensor, " 1 1"] | None,
         jt.Float[torch.Tensor, "1 num_speed_classes"] | None,
         jt.Float[torch.Tensor, "1 num_waypoints"] | None,
+        jt.Float[torch.Tensor, " 1"] | None,
+        jt.Float[torch.Tensor, "1 1"] | None,
+        jt.Float[torch.Tensor, " 1"] | None,
+        jt.Float[torch.Tensor, " 1"] | None,
+        jt.Float[torch.Tensor, " 1"] | None,
+        jt.Float[torch.Tensor, " 1"] | None,
     ]:
         """Ensemble the outputs of the planning decoder from multiple models.
 
@@ -94,6 +124,8 @@ class OpenLoopInference:
         pred_routes = pred_future_waypoints = pred_target_speed_scalar = (
             pred_target_speed_distribution
         ) = pred_future_headings = None
+        route_collision_risk = raw_target_speed_scalar = target_speed_factor = None
+        route_future_collision_risk = current_speed_factor = future_speed_factor = None
 
         if self.config_training.use_planning_decoder:
             if self.config_training.predict_target_speed:
@@ -114,12 +146,89 @@ class OpenLoopInference:
                     pred_target_speed_distribution[0, 0]
                     > self.config_open_loop.brake_threshold
                 ):  # Brake if we are confident enough.
-                    pred_target_speed_scalar = torch.Tensor([0.0]).reshape(1, -1)
+                    pred_target_speed_scalar = pred_target_speed_scalar.new_zeros((1, 1))
                 if (
                     self.config_open_loop.lower_target_speed
                 ):  # Optionally lower the target speed.
                     pred_target_speed_scalar *= (
                         self.config_open_loop.lower_target_speed_factor
+                    )
+
+                if self.config_training.route_speed_safety_gate:
+                    risks = [pred.pred_route_collision_risk for pred in predictions]
+                    if any(risk is None for risk in risks):
+                        raise RuntimeError(
+                            "route_speed_safety_gate is enabled but a model did not "
+                            "produce pred_route_collision_risk"
+                        )
+                    # Conservative ensemble: one model seeing danger is sufficient to slow.
+                    route_collision_risk = torch.stack(
+                        [risk[0].float() for risk in risks],
+                    ).amax().reshape(1).to(pred_target_speed_scalar.device)
+                    _, current_speed_factor = apply_collision_speed_gate(
+                        pred_target_speed_scalar,
+                        route_collision_risk,
+                        self.config_training,
+                    )
+
+                if self.config_training.route_future_safety_gate:
+                    if self.route_safety_head is None or data is None or "speed" not in data:
+                        raise RuntimeError(
+                            "route_future_safety_gate requires a loaded B2d head and input speed"
+                        )
+                    future_risks = []
+                    for prediction in predictions:
+                        if (
+                            prediction.pred_route_features is None
+                            or prediction.pred_route_selected_idx is None
+                        ):
+                            raise RuntimeError(
+                                "route_future_safety_gate requires multimodal route features "
+                                "and a selected route index"
+                            )
+                        features = prediction.pred_route_features[0].float()
+                        current_speed = data["speed"].to(features.device).float().reshape(-1)[0]
+                        model_target_speed = (
+                            prediction.pred_target_speed_scalar.float().reshape(-1)[0]
+                        )
+                        brake_probability = (
+                            prediction.pred_target_speed_distribution.float().softmax(dim=-1)[0, 0]
+                        )
+                        model_target_speed = torch.where(
+                            # Feature extraction used 0.9, so keep the head input exactly
+                            # matched to its frozen-feature training distribution.
+                            brake_probability > 0.9,
+                            torch.zeros_like(model_target_speed),
+                            model_target_speed,
+                        )
+                        arm_risk = torch.sigmoid(
+                            self.route_safety_head(features, current_speed, model_target_speed)
+                        )
+                        selected = prediction.pred_route_selected_idx.reshape(-1)[0].long()
+                        future_risks.append(arm_risk[selected])
+                    # Same conservative ensemble rule as B2c': one member seeing future
+                    # dynamic danger is enough to request a speed cap.
+                    route_future_collision_risk = (
+                        torch.stack(future_risks).amax().reshape(1)
+                    )
+                    future_speed_factor = collision_risk_to_speed_factor(
+                        route_future_collision_risk,
+                        float(self.config_training.route_future_gate_low_threshold),
+                        float(self.config_training.route_future_gate_high_threshold),
+                        float(self.config_training.route_future_gate_minimum_factor),
+                    )
+
+                factors = [
+                    factor for factor in (current_speed_factor, future_speed_factor)
+                    if factor is not None
+                ]
+                if factors:
+                    raw_target_speed_scalar = pred_target_speed_scalar.clone()
+                    target_speed_factor = torch.stack(
+                        [factor.reshape(-1)[0] for factor in factors]
+                    ).amin().reshape(1).to(pred_target_speed_scalar.device)
+                    pred_target_speed_scalar = pred_target_speed_scalar * (
+                        target_speed_factor.reshape_as(pred_target_speed_scalar)
                     )
 
             if self.config_training.predict_temporal_spatial_waypoints:
@@ -146,6 +255,12 @@ class OpenLoopInference:
             pred_target_speed_scalar,
             pred_target_speed_distribution,
             pred_future_headings,
+            route_collision_risk,
+            raw_target_speed_scalar,
+            target_speed_factor,
+            route_future_collision_risk,
+            current_speed_factor,
+            future_speed_factor,
         )
 
     @beartype
@@ -334,7 +449,13 @@ class OpenLoopInference:
             pred_target_speed_scalar,
             pred_target_speed_distribution,
             pred_future_headings,
-        ) = self.ensemble_planning_decoder(predictions)
+            route_collision_risk,
+            raw_target_speed_scalar,
+            target_speed_factor,
+            route_future_collision_risk,
+            current_speed_factor,
+            future_speed_factor,
+        ) = self.ensemble_planning_decoder(predictions, _)
 
         return OpenLoopPrediction(
             pred_future_waypoints=pred_future_waypoints,
@@ -348,6 +469,12 @@ class OpenLoopInference:
             pred_bounding_box_vehicle_system=pred_bounding_boxes_vehicle_system,
             pred_bounding_box_image_system=pred_bounding_boxes_image_system,
             pred_radar_predictions=None,
+            route_collision_risk=route_collision_risk,
+            raw_target_speed_scalar=raw_target_speed_scalar,
+            target_speed_factor=target_speed_factor,
+            route_future_collision_risk=route_future_collision_risk,
+            current_speed_factor=current_speed_factor,
+            future_speed_factor=future_speed_factor,
         )
 
     @beartype
@@ -395,3 +522,12 @@ class OpenLoopPrediction:
     pred_bounding_box_vehicle_system: list[PredictedBoundingBox] | None
     pred_bounding_box_image_system: list[PredictedBoundingBox] | None
     pred_radar_predictions: None
+    # B2c' post-ensemble speed-gate diagnostics.
+    route_collision_risk: torch.Tensor | None
+    raw_target_speed_scalar: torch.Tensor | None
+    target_speed_factor: torch.Tensor | None
+    # B2d' learned future-risk diagnostics; target_speed_factor is the minimum of
+    # current_speed_factor and future_speed_factor when both gates are enabled.
+    route_future_collision_risk: torch.Tensor | None
+    current_speed_factor: torch.Tensor | None
+    future_speed_factor: torch.Tensor | None

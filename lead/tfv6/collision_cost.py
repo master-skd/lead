@@ -107,18 +107,18 @@ def differentiable_collision(
 
 
 @beartype
-def collision_cost_per_mode(
+def collision_cost_per_point(
     routes: torch.Tensor,  # (B, K, N, 2) ego metres -- K route arms per sample
     bev_semantic: torch.Tensor,  # (B, H, W) or (B,1,H,W) class ids
     config: TrainingConfig,
     sigma_m: float = 2.0,
 ) -> torch.Tensor:
-    """Per-arm mean danger value -> ``(B, K)``, differentiable w.r.t. ``routes``.
+    """Danger sampled at every route point -> ``(B, K, N)``.
 
-    Same danger field as :func:`differentiable_collision` but WITHOUT reducing over the
-    mode axis, so the caller can mask out padded arms before averaging (B2: only valid
-    arms should contribute) and can rank arms by cost at inference for late resolution.
-    The danger field is built once per sample and shared across that sample's K arms.
+    The field is built once per sample and shared across its K arms. Keeping the point
+    axis is useful for conservative inference-time checks (for example max danger over
+    the near-control horizon); training callers normally use
+    :func:`collision_cost_per_mode`, which preserves the historical mean reduction.
     """
     b, k, n, _ = routes.shape
     occ = occupancy_from_bev_semantic(bev_semantic)
@@ -129,7 +129,18 @@ def collision_cost_per_mode(
     sampled = F.grid_sample(
         danger_rep, grid, mode="bilinear", padding_mode="zeros", align_corners=True,
     )  # (B*K, 1, N, 1)
-    return sampled.reshape(b, k, n).mean(dim=2)  # (B,K)
+    return sampled.reshape(b, k, n)
+
+
+@beartype
+def collision_cost_per_mode(
+    routes: torch.Tensor,
+    bev_semantic: torch.Tensor,
+    config: TrainingConfig,
+    sigma_m: float = 2.0,
+) -> torch.Tensor:
+    """Per-arm mean danger value -> ``(B, K)``, differentiable w.r.t. routes."""
+    return collision_cost_per_point(routes, bev_semantic, config, sigma_m).mean(dim=2)
 
 
 @beartype
@@ -178,13 +189,13 @@ def _clipped_distance_field(
 
 
 @beartype
-def corridor_cost_per_mode(
+def corridor_cost_per_point(
     routes: torch.Tensor,  # (B, K, N, 2) ego metres -- K route arms per sample
     corridor: torch.Tensor,  # (B, 1, H, W) or (B, H, W) lane-graph corridor in [0,1]
     config: TrainingConfig,
     reach_m: float = 20.0,
 ) -> torch.Tensor:
-    """Per-arm mean OFF-corridor distance -> ``(B, K)``, differentiable w.r.t. ``routes``.
+    """OFF-corridor distance sampled at every route point -> ``(B, K, N)``.
 
     Complements :func:`collision_cost_per_mode`, which cannot express this: its danger
     field is built from ``OBSTACLE_CLASSES`` (vehicles / walkers / ...) only, so an arm that
@@ -200,7 +211,7 @@ def corridor_cost_per_mode(
     That keeps intent a fuzzy "which way" and leaves the actual path for the planner to resolve
     late, which an L1-to-centreline would destroy.
 
-    Cost is the clipped distance outside the corridor, averaged along each arm: exactly 0 while
+    Cost is the clipped distance outside the corridor: exactly 0 while
     the arm stays on any branch, ramping to 1 at ``reach_m`` metres off-road. See
     :func:`_clipped_distance_field` for why this is a ramp and not a blur.
     """
@@ -216,7 +227,18 @@ def corridor_cost_per_mode(
         field.repeat_interleave(k, dim=0), grid,
         mode="bilinear", padding_mode="border", align_corners=True,
     )  # (B*K, 1, N, 1)
-    return sampled.reshape(b, k, n).mean(dim=2)  # (B,K)
+    return sampled.reshape(b, k, n)
+
+
+@beartype
+def corridor_cost_per_mode(
+    routes: torch.Tensor,
+    corridor: torch.Tensor,
+    config: TrainingConfig,
+    reach_m: float = 20.0,
+) -> torch.Tensor:
+    """Per-arm mean OFF-corridor distance -> ``(B, K)``."""
+    return corridor_cost_per_point(routes, corridor, config, reach_m).mean(dim=2)
 
 
 def _smoke_test() -> None:
