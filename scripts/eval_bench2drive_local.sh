@@ -11,6 +11,14 @@ set -u
 CKPT="${1:?checkpoint dir, e.g. outputs/checkpoints/my_p2}"
 GPUS="${2:-0}"
 TAG="${3:-run}"
+# Per-route wallclock cap. Overridable because 1500 s is NOT enough on a loaded machine:
+# measured ratio was 0.133x real time (7.5x slower), so 1500 s buys only ~200 s of game
+# time and any longer route gets SIGTERMed mid-drive. That looks like a silent model
+# failure in the log -- `timeout` sends SIGTERM, Python has no handler, so there is no
+# traceback, just a log that stops. The route then has no checkpoint_endpoint.json and
+# scores ZERO, since merge_route_json.py divides by a hardcoded 220 rather than by the
+# number of routes actually completed (~0.43 DS per lost route).
+ROUTE_TIMEOUT="${ROUTE_TIMEOUT:-1500}"
 ROUTES_DIR="data/benchmark_routes/bench2drive"
 LOGDIR="/tmp/b2d_${TAG}"
 # Per-model output root so two models can eval the SAME 220 route ids simultaneously
@@ -74,12 +82,24 @@ worker() {
       fi
     fi
     echo "[gpu$gpu] route $id (carla up on $port) ..."
-    if CUDA_VISIBLE_DEVICES=$gpu timeout 1500 python -m lead \
+    if CUDA_VISIBLE_DEVICES=$gpu timeout "$ROUTE_TIMEOUT" python -m lead \
         --checkpoint "$CKPT" --routes "$xml" --bench2drive \
         --output-dir "$OUTROOT/$id" \
         --port $port --traffic-manager-port $tm \
         >"$LOGDIR/route_${id}.log" 2>&1; then ok=$((ok+1))
-    else echo "[gpu$gpu] $id FAILED (see $LOGDIR/route_${id}.log)"; fail=$((fail+1)); fi
+    else
+      # Distinguish "ran out of time" from "crashed": `timeout` exits 124 on SIGTERM, and a
+      # timed-out run leaves NO traceback (Python installs no SIGTERM handler), so the log
+      # just stops mid-line and reads exactly like a silent model failure. Say which it was.
+      rc=$?
+      if [ "$rc" -eq 124 ]; then
+        echo "[gpu$gpu] $id TIMEOUT after ${ROUTE_TIMEOUT}s -- route unfinished, will score 0." \
+             "Raise ROUTE_TIMEOUT and re-run with the SAME tag to fill it in."
+      else
+        echo "[gpu$gpu] $id FAILED rc=$rc (see $LOGDIR/route_${id}.log)"
+      fi
+      fail=$((fail+1))
+    fi
     kill_carla "$carla_pid" "$port" "$gpu"
   done
   echo "[gpu$gpu] finished: ok=$ok fail=$fail"
