@@ -33,7 +33,9 @@ def speed_profile_distances(
     target = max(0.0, float(target_speed_mps))
     delta = target - v0
     accel = np.clip(
-        delta / max(float(times_s[-1]), 1e-6), -max_decel_mps2, max_accel_mps2,
+        delta / max(float(times_s[-1]), 1e-6),
+        -max_decel_mps2,
+        max_accel_mps2,
     )
     if abs(accel) < 1e-8:
         return (v0 * times_s).astype(np.float32)
@@ -45,9 +47,20 @@ def speed_profile_distances(
 
 
 def interpolate_route_by_distance(
-    route: np.ndarray, distances_m: np.ndarray,
+    route: np.ndarray,
+    distances_m: np.ndarray,
+    *,
+    extrapolate: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Interpolate route centers and tangent yaws at requested arc lengths."""
+    """Interpolate route centers and tangent yaws at requested arc lengths.
+
+    ``extrapolate=False`` preserves the original endpoint-clamping behaviour used by
+    the B2d audits.  A velocity lattice can travel beyond the finite spatial-route
+    horizon, where clamping would make the ego box appear to stop at the final route
+    point and can create a false collision.  ``extrapolate=True`` continues along the
+    final non-degenerate route tangent instead, matching SparseDriveV2's vocabulary
+    interpolation policy.
+    """
 
     route = np.asarray(route, dtype=np.float32).reshape(-1, 2)
     distances_m = np.asarray(distances_m, dtype=np.float32).reshape(-1)
@@ -60,16 +73,28 @@ def interpolate_route_by_distance(
     keep = np.concatenate([[True], segment_length > 1e-5])
     route = route[keep]
     if len(route) == 1:
-        return np.repeat(route, len(distances_m), axis=0), np.zeros(len(distances_m), dtype=np.float32)
+        return np.repeat(route, len(distances_m), axis=0), np.zeros(
+            len(distances_m), dtype=np.float32
+        )
     segment = np.diff(route, axis=0)
     segment_length = np.linalg.norm(segment, axis=1)
     arc = np.concatenate([[0.0], np.cumsum(segment_length)])
     clipped = np.clip(distances_m, 0.0, arc[-1])
     x = np.interp(clipped, arc, route[:, 0])
     y = np.interp(clipped, arc, route[:, 1])
-    segment_index = np.clip(np.searchsorted(arc, clipped, side="right") - 1, 0, len(segment) - 1)
+    segment_index = np.clip(
+        np.searchsorted(arc, clipped, side="right") - 1, 0, len(segment) - 1
+    )
     tangent = segment[segment_index]
     yaw = np.arctan2(tangent[:, 1], tangent[:, 0])
+    if extrapolate:
+        beyond = distances_m > arc[-1]
+        if beyond.any():
+            final_tangent = segment[-1] / max(float(segment_length[-1]), 1e-6)
+            overflow = distances_m[beyond] - arc[-1]
+            x[beyond] = route[-1, 0] + overflow * final_tangent[0]
+            y[beyond] = route[-1, 1] + overflow * final_tangent[1]
+            yaw[beyond] = np.arctan2(final_tangent[1], final_tangent[0])
     return np.stack([x, y], axis=1).astype(np.float32), yaw.astype(np.float32)
 
 
@@ -123,7 +148,12 @@ def future_collision_label(
 
     steps = len(times_s)
     no_collision = FutureCollisionLabel(
-        False, float("inf"), -1, -1, 0, np.zeros(steps, dtype=bool),
+        False,
+        float("inf"),
+        -1,
+        -1,
+        0,
+        np.zeros(steps, dtype=bool),
     )
     if actors.num_actors == 0:
         return no_collision
@@ -132,7 +162,12 @@ def future_collision_label(
     ego_extent = actors.ego_extent.copy()
     ego_extent[:2] += safety_margin_m
     overlap = _obb_overlap(
-        ego_positions, ego_yaws, ego_extent, actors.positions, actors.yaws, actors.extents,
+        ego_positions,
+        ego_yaws,
+        ego_extent,
+        actors.positions,
+        actors.yaws,
+        actors.extents,
     )
     vertical = np.abs(actors.z) <= (
         float(actors.ego_extent[2]) + actors.extents[:, 2] + vertical_margin_m
@@ -160,8 +195,14 @@ def route_future_collision_label(
     current_speed_mps: float,
     target_speed_mps: float,
     actors: FutureActorFrame,
+    *,
+    extrapolate_route: bool = False,
     **kwargs,
 ) -> FutureCollisionLabel:
     distances = speed_profile_distances(current_speed_mps, target_speed_mps)
-    positions, yaws = interpolate_route_by_distance(route, distances)
+    positions, yaws = interpolate_route_by_distance(
+        route,
+        distances,
+        extrapolate=extrapolate_route,
+    )
     return future_collision_label(positions, yaws, actors, **kwargs)

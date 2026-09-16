@@ -21,6 +21,7 @@ from lead.tfv6.route_speed_gate import (
     collision_risk_to_speed_factor,
 )
 from lead.tfv6.tfv6 import Prediction
+from lead.tfv6.velocity_scorer import apply_velocity_scorer_gate
 from lead.training.config_training import TrainingConfig
 from lead.training.training_utils import create_model
 
@@ -73,24 +74,97 @@ class OpenLoopInference:
                 )
                 net.cuda(device=self.device).eval()
                 self.nets.append(net)
-                self.model_weight_paths.append(os.path.abspath(os.path.join(model_path, file)))
+                self.model_weight_paths.append(
+                    os.path.abspath(os.path.join(model_path, file))
+                )
         self.route_safety_head = None
         if self.config_training.route_future_safety_gate:
             from lead.tfv6.route_safety_head import load_route_safety_head
 
             head_path = self.config_training.route_future_safety_head
-            checkpoint = torch.load(head_path, map_location=self.device, weights_only=True)
+            checkpoint = torch.load(
+                head_path, map_location=self.device, weights_only=True
+            )
             source = checkpoint.get("source_checkpoint")
             if source is not None and os.path.exists(source):
                 source = os.path.abspath(source)
-                if not any(os.path.samefile(source, path) for path in self.model_weight_paths):
+                if not any(
+                    os.path.samefile(source, path) for path in self.model_weight_paths
+                ):
                     raise ValueError(
                         f"B2d safety head was trained from {source}, but inference loaded "
                         f"{self.model_weight_paths}"
                     )
-            self.route_safety_head = load_route_safety_head(checkpoint, self.device).eval()
+            self.route_safety_head = load_route_safety_head(
+                checkpoint, self.device
+            ).eval()
             self.route_safety_head.requires_grad_(False)
             LOG.info(f"Loaded B2d route safety head from {head_path}")
+        self.velocity_scorer = None
+        self.velocity_vocabulary = None
+        if self.config_training.route_velocity_scorer_gate:
+            if (
+                self.config_training.route_speed_safety_gate
+                or self.config_training.route_future_safety_gate
+            ):
+                raise ValueError(
+                    "route_velocity_scorer_gate must be evaluated without the B2c/B2d "
+                    "speed gates"
+                )
+            if len(self.nets) != 1:
+                raise ValueError(
+                    "B3a velocity scorer was trained on one frozen corridor model and "
+                    "requires exactly one model weight at inference"
+                )
+            from lead.tfv6.velocity_scorer import load_velocity_scorer
+
+            scorer_path = self.config_training.route_velocity_scorer_head
+            vocabulary_path = self.config_training.route_velocity_vocabulary
+            checkpoint = torch.load(
+                scorer_path, map_location=self.device, weights_only=True
+            )
+            source = checkpoint.get("source_checkpoint")
+            if source is not None and os.path.exists(source):
+                source = os.path.abspath(source)
+                if not os.path.samefile(source, self.model_weight_paths[0]):
+                    raise ValueError(
+                        f"B3a scorer was trained from {source}, but inference loaded "
+                        f"{self.model_weight_paths[0]}"
+                    )
+            source_vocabulary = checkpoint.get("source_vocabulary")
+            if source_vocabulary is not None and os.path.exists(source_vocabulary):
+                if not os.path.samefile(
+                    os.path.abspath(source_vocabulary),
+                    os.path.abspath(vocabulary_path),
+                ):
+                    raise ValueError(
+                        "B3a scorer and inference configuration use different velocity "
+                        "vocabularies"
+                    )
+            vocabulary = np.load(vocabulary_path, allow_pickle=False)
+            if vocabulary.ndim != 2 or not np.isfinite(vocabulary).all():
+                raise ValueError(
+                    f"invalid B3a velocity vocabulary shape/content: {vocabulary.shape}"
+                )
+            profile_steps = int(checkpoint["scorer_config"]["profile_steps"])
+            if vocabulary.shape[1] != profile_steps:
+                raise ValueError(
+                    f"B3a vocabulary has {vocabulary.shape[1]} steps but scorer expects "
+                    f"{profile_steps}"
+                )
+            self.velocity_scorer = (
+                load_velocity_scorer(checkpoint, self.device)
+                .eval()
+                .requires_grad_(False)
+            )
+            self.velocity_vocabulary = torch.from_numpy(
+                vocabulary.astype(np.float32, copy=False)
+            ).to(self.device)
+            LOG.info(
+                "Loaded B3a velocity scorer from %s with vocabulary %s",
+                scorer_path,
+                vocabulary_path,
+            )
         self.step = 4  # Constant so produced images start with 5, not really important
 
     @beartype
@@ -110,6 +184,11 @@ class OpenLoopInference:
         jt.Float[torch.Tensor, " 1"] | None,
         jt.Float[torch.Tensor, " 1"] | None,
         jt.Float[torch.Tensor, " 1"] | None,
+        jt.Float[torch.Tensor, " 1"] | None,
+        jt.Float[torch.Tensor, " 1"] | None,
+        jt.Int[torch.Tensor, " 1"] | None,
+        jt.Bool[torch.Tensor, " 1"] | None,
+        jt.Bool[torch.Tensor, " 1"] | None,
     ]:
         """Ensemble the outputs of the planning decoder from multiple models.
 
@@ -126,6 +205,8 @@ class OpenLoopInference:
         ) = pred_future_headings = None
         route_collision_risk = raw_target_speed_scalar = target_speed_factor = None
         route_future_collision_risk = current_speed_factor = future_speed_factor = None
+        velocity_raw_risk = velocity_selected_risk = velocity_selected_index = None
+        velocity_switched = velocity_fallback = None
 
         if self.config_training.use_planning_decoder:
             if self.config_training.predict_target_speed:
@@ -146,13 +227,78 @@ class OpenLoopInference:
                     pred_target_speed_distribution[0, 0]
                     > self.config_open_loop.brake_threshold
                 ):  # Brake if we are confident enough.
-                    pred_target_speed_scalar = pred_target_speed_scalar.new_zeros((1, 1))
+                    pred_target_speed_scalar = pred_target_speed_scalar.new_zeros(
+                        (1, 1)
+                    )
                 if (
                     self.config_open_loop.lower_target_speed
                 ):  # Optionally lower the target speed.
                     pred_target_speed_scalar *= (
                         self.config_open_loop.lower_target_speed_factor
                     )
+
+                if self.config_training.route_velocity_scorer_gate:
+                    if (
+                        self.velocity_scorer is None
+                        or self.velocity_vocabulary is None
+                        or data is None
+                        or "speed" not in data
+                    ):
+                        raise RuntimeError(
+                            "route_velocity_scorer_gate requires its scorer, vocabulary, "
+                            "and input speed"
+                        )
+                    prediction = predictions[0]
+                    if (
+                        prediction.pred_route_features is None
+                        or prediction.pred_route_selected_idx is None
+                    ):
+                        raise RuntimeError(
+                            "route_velocity_scorer_gate requires multimodal route features "
+                            "and a selected route index"
+                        )
+                    selected_arm = prediction.pred_route_selected_idx.reshape(-1)[
+                        0
+                    ].long()
+                    route_feature = prediction.pred_route_features[0, selected_arm][
+                        None
+                    ]
+                    current_speed = (
+                        data["speed"]
+                        .to(route_feature.device, dtype=torch.float32)
+                        .reshape(-1)[:1]
+                    )
+                    raw_target_speed_scalar = pred_target_speed_scalar.clone()
+                    velocity_gate = apply_velocity_scorer_gate(
+                        self.velocity_scorer,
+                        route_feature,
+                        current_speed,
+                        raw_target_speed_scalar,
+                        self.velocity_vocabulary,
+                        safe_threshold=float(
+                            self.config_training.route_velocity_safe_threshold
+                        ),
+                        unsafe_threshold=float(
+                            self.config_training.route_velocity_unsafe_threshold
+                        ),
+                        interval_s=float(
+                            self.config_training.route_velocity_profile_interval_s
+                        ),
+                        max_accel_mps2=float(
+                            self.config_training.route_velocity_max_accel_mps2
+                        ),
+                        max_decel_mps2=float(
+                            self.config_training.route_velocity_max_decel_mps2
+                        ),
+                    )
+                    pred_target_speed_scalar = velocity_gate.target_speed.reshape_as(
+                        pred_target_speed_scalar
+                    )
+                    velocity_raw_risk = velocity_gate.raw_risk
+                    velocity_selected_risk = velocity_gate.selected_risk
+                    velocity_selected_index = velocity_gate.selected_index
+                    velocity_switched = velocity_gate.switched
+                    velocity_fallback = velocity_gate.fallback
 
                 if self.config_training.route_speed_safety_gate:
                     risks = [pred.pred_route_collision_risk for pred in predictions]
@@ -162,9 +308,14 @@ class OpenLoopInference:
                             "produce pred_route_collision_risk"
                         )
                     # Conservative ensemble: one model seeing danger is sufficient to slow.
-                    route_collision_risk = torch.stack(
-                        [risk[0].float() for risk in risks],
-                    ).amax().reshape(1).to(pred_target_speed_scalar.device)
+                    route_collision_risk = (
+                        torch.stack(
+                            [risk[0].float() for risk in risks],
+                        )
+                        .amax()
+                        .reshape(1)
+                        .to(pred_target_speed_scalar.device)
+                    )
                     _, current_speed_factor = apply_collision_speed_gate(
                         pred_target_speed_scalar,
                         route_collision_risk,
@@ -172,7 +323,11 @@ class OpenLoopInference:
                     )
 
                 if self.config_training.route_future_safety_gate:
-                    if self.route_safety_head is None or data is None or "speed" not in data:
+                    if (
+                        self.route_safety_head is None
+                        or data is None
+                        or "speed" not in data
+                    ):
                         raise RuntimeError(
                             "route_future_safety_gate requires a loaded B2d head and input speed"
                         )
@@ -187,12 +342,16 @@ class OpenLoopInference:
                                 "and a selected route index"
                             )
                         features = prediction.pred_route_features[0].float()
-                        current_speed = data["speed"].to(features.device).float().reshape(-1)[0]
+                        current_speed = (
+                            data["speed"].to(features.device).float().reshape(-1)[0]
+                        )
                         model_target_speed = (
                             prediction.pred_target_speed_scalar.float().reshape(-1)[0]
                         )
                         brake_probability = (
-                            prediction.pred_target_speed_distribution.float().softmax(dim=-1)[0, 0]
+                            prediction.pred_target_speed_distribution.float().softmax(
+                                dim=-1
+                            )[0, 0]
                         )
                         model_target_speed = torch.where(
                             # Feature extraction used 0.9, so keep the head input exactly
@@ -202,9 +361,13 @@ class OpenLoopInference:
                             model_target_speed,
                         )
                         arm_risk = torch.sigmoid(
-                            self.route_safety_head(features, current_speed, model_target_speed)
+                            self.route_safety_head(
+                                features, current_speed, model_target_speed
+                            )
                         )
-                        selected = prediction.pred_route_selected_idx.reshape(-1)[0].long()
+                        selected = prediction.pred_route_selected_idx.reshape(-1)[
+                            0
+                        ].long()
                         future_risks.append(arm_risk[selected])
                     # Same conservative ensemble rule as B2c': one member seeing future
                     # dynamic danger is enough to request a speed cap.
@@ -219,14 +382,18 @@ class OpenLoopInference:
                     )
 
                 factors = [
-                    factor for factor in (current_speed_factor, future_speed_factor)
+                    factor
+                    for factor in (current_speed_factor, future_speed_factor)
                     if factor is not None
                 ]
                 if factors:
                     raw_target_speed_scalar = pred_target_speed_scalar.clone()
-                    target_speed_factor = torch.stack(
-                        [factor.reshape(-1)[0] for factor in factors]
-                    ).amin().reshape(1).to(pred_target_speed_scalar.device)
+                    target_speed_factor = (
+                        torch.stack([factor.reshape(-1)[0] for factor in factors])
+                        .amin()
+                        .reshape(1)
+                        .to(pred_target_speed_scalar.device)
+                    )
                     pred_target_speed_scalar = pred_target_speed_scalar * (
                         target_speed_factor.reshape_as(pred_target_speed_scalar)
                     )
@@ -261,6 +428,11 @@ class OpenLoopInference:
             route_future_collision_risk,
             current_speed_factor,
             future_speed_factor,
+            velocity_raw_risk,
+            velocity_selected_risk,
+            velocity_selected_index,
+            velocity_switched,
+            velocity_fallback,
         )
 
     @beartype
@@ -455,6 +627,11 @@ class OpenLoopInference:
             route_future_collision_risk,
             current_speed_factor,
             future_speed_factor,
+            velocity_raw_risk,
+            velocity_selected_risk,
+            velocity_selected_index,
+            velocity_switched,
+            velocity_fallback,
         ) = self.ensemble_planning_decoder(predictions, _)
 
         return OpenLoopPrediction(
@@ -475,6 +652,11 @@ class OpenLoopInference:
             route_future_collision_risk=route_future_collision_risk,
             current_speed_factor=current_speed_factor,
             future_speed_factor=future_speed_factor,
+            velocity_raw_risk=velocity_raw_risk,
+            velocity_selected_risk=velocity_selected_risk,
+            velocity_selected_index=velocity_selected_index,
+            velocity_switched=velocity_switched,
+            velocity_fallback=velocity_fallback,
         )
 
     @beartype
@@ -531,3 +713,9 @@ class OpenLoopPrediction:
     route_future_collision_risk: torch.Tensor | None
     current_speed_factor: torch.Tensor | None
     future_speed_factor: torch.Tensor | None
+    # B3a frozen-route velocity-profile diagnostics.
+    velocity_raw_risk: torch.Tensor | None
+    velocity_selected_risk: torch.Tensor | None
+    velocity_selected_index: torch.Tensor | None
+    velocity_switched: torch.Tensor | None
+    velocity_fallback: torch.Tensor | None

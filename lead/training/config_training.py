@@ -212,7 +212,9 @@ class TrainingConfig(BaseConfig):
         """Path to SSD cache directory."""
         tmp_folder = "/scratch/" + str(os.environ.get("SLURM_JOB_ID"))
         if not self.is_on_tcml:
-            tmp_folder = str(os.environ.get("SCRATCH", f"/tmp/{os.environ.get('USER', 'lead')}"))
+            tmp_folder = str(
+                os.environ.get("SCRATCH", f"/tmp/{os.environ.get('USER', 'lead')}")
+            )
         return tmp_folder
 
     # Root directory for CARLA sensor data.
@@ -1064,6 +1066,26 @@ class TrainingConfig(BaseConfig):
     route_future_gate_low_threshold = 0.95
     route_future_gate_high_threshold = 0.995
     route_future_gate_minimum_factor = 0.0
+    # B3a: keep the confidence-selected spatial route fixed, expand raw + K residual
+    # velocity profiles, and use a separately trained preference/collision scorer.  The
+    # raw profile is retained unless its learned collision probability reaches the
+    # unsafe threshold; only reachable alternatives below the safe threshold may replace
+    # it.  Disabled by default so historical checkpoints remain bit-identical.
+    route_velocity_scorer_gate = False
+    route_velocity_scorer_head = (
+        "outputs/local_training/p5_stepB3a_velocity_scorer/velocity_scorer_best.pth"
+    )
+    route_velocity_vocabulary = (
+        "outputs/local_training/p5_stepB3a_relative_velocity_vocab/"
+        "relative_velocity_vocab_k64.npy"
+    )
+    # Held-out operating point: 2.53% -> 1.57% counterfactual collision rate,
+    # 1.95% switches, 0.97% false switches, and no introduced GT collision.
+    route_velocity_safe_threshold = 0.5
+    route_velocity_unsafe_threshold = 0.8
+    route_velocity_profile_interval_s = 0.25
+    route_velocity_max_accel_mps2 = 1.89
+    route_velocity_max_decel_mps2 = 4.95
     # P2.2: if true, add a differentiable collision cost on predicted waypoints.
     use_collision_cost = False
     collision_loss_weight = 1.0
