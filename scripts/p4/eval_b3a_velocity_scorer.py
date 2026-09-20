@@ -93,6 +93,52 @@ def evaluate_gate(
     }
 
 
+def evaluate_profile_selection(
+    arrays,
+    preference: np.ndarray,
+    risk: np.ndarray,
+    safe_threshold: float,
+    mask: np.ndarray | None = None,
+) -> dict:
+    """Audit the direct-selection policy used by the closed-loop profile mode."""
+
+    if mask is None:
+        mask = np.ones(len(arrays.keys), dtype=bool)
+    valid = arrays.candidate_valid[mask]
+    collision = arrays.collision[mask]
+    profile = arrays.candidate_velocity[mask].astype(np.float32)
+    current = arrays.current_speed[mask].astype(np.float32)
+    error = arrays.imitation_error[mask].astype(np.float32)
+    preference = preference[mask]
+    risk = risk[mask]
+    safe = valid & (risk < safe_threshold)
+    has_safe = safe.any(axis=1)
+    preferred = np.where(safe, preference, -np.inf).argmax(axis=1)
+    least_risk = np.where(valid, risk, np.inf).argmin(axis=1)
+    selected = np.where(has_safe, preferred, least_risk)
+    rows = np.arange(len(selected))
+    raw_collision = collision[:, 0]
+    chosen_collision = collision[rows, selected]
+    near_target = np.maximum(2 * profile[rows, selected, 0] - current, 0.0)
+    raw_near_target = np.maximum(2 * profile[:, 0, 0] - current, 0.0)
+    return {
+        "n": int(len(selected)),
+        "safe_threshold": float(safe_threshold),
+        "switch_rate": float((selected != 0).mean()),
+        "fallback_rate": float((~has_safe).mean()),
+        "collision_before": float(raw_collision.mean()),
+        "collision_after": float(chosen_collision.mean()),
+        "rescued_count": int((raw_collision & ~chosen_collision).sum()),
+        "introduced_collision_count": int((~raw_collision & chosen_collision).sum()),
+        "profile_mae_before": float(error[:, 0].mean()),
+        "profile_mae_after": float(error[rows, selected].mean()),
+        "near_target_mean_mps": float(near_target.mean()),
+        "near_target_stop_rate": float((near_target < 0.01).mean()),
+        "raw_near_target_mean_mps": float(raw_near_target.mean()),
+        "raw_near_target_stop_rate": float((raw_near_target < 0.01).mean()),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--feature-cache-dir", required=True)
@@ -183,6 +229,14 @@ def main() -> None:
             "max_profile_mae_delta": args.max_profile_mae_delta,
         },
         "recommended": recommended,
+        "profile_selection": {
+            "all": evaluate_profile_selection(arrays, preference, risk, 0.5),
+            "multi": evaluate_profile_selection(
+                arrays, preference, risk, 0.5, arrays.multi
+            )
+            if arrays.multi.any()
+            else None,
+        },
         "threshold_grid": grid,
     }
     output = Path(args.out)
@@ -209,6 +263,17 @@ def main() -> None:
             f"false={chosen['false_switch_rate']:.2%} "
             f"MAE delta={chosen['profile_mae_delta']:.3f}"
         )
+    direct = payload["profile_selection"]["all"]
+    print(
+        "direct profile selection: "
+        f"switch={direct['switch_rate']:.1%} "
+        f"fallback={direct['fallback_rate']:.1%} "
+        f"collision={direct['collision_before']:.2%}->{direct['collision_after']:.2%} "
+        f"introduced={direct['introduced_collision_count']} "
+        f"near-stop={direct['raw_near_target_stop_rate']:.1%}->"
+        f"{direct['near_target_stop_rate']:.1%} "
+        f"MAE={direct['profile_mae_before']:.3f}->{direct['profile_mae_after']:.3f}"
+    )
     print(f"wrote {output}")
 
 

@@ -101,6 +101,21 @@ class _VelocityGateHead(nn.Module):
         return preference, torch.logit(risk)
 
 
+class _VelocitySelectHead(nn.Module):
+    def __init__(self, raw_risk: float = 0.1, alternative_risk: float = 0.1):
+        super().__init__()
+        self.raw_risk = raw_risk
+        self.alternative_risk = alternative_risk
+
+    def forward(self, route_features, current_speed, raw_target_speed, candidates):
+        del route_features, current_speed, raw_target_speed
+        preference = torch.zeros(candidates.shape[:2], device=candidates.device)
+        preference[:, 1] = 1.0
+        risk = torch.full_like(preference, self.alternative_risk)
+        risk[:, 0] = self.raw_risk
+        return preference, torch.logit(risk)
+
+
 def test_future_gate_uses_selected_arm_and_never_changes_route():
     from lead.inference.config_open_loop import OpenLoopConfig
     from lead.inference.open_loop_inference import OpenLoopInference
@@ -255,3 +270,75 @@ def test_velocity_scorer_gate_changes_only_target_speed():
     torch.testing.assert_close(result[13], torch.tensor([1]))
     torch.testing.assert_close(result[14], torch.tensor([True]))
     torch.testing.assert_close(result[15], torch.tensor([False]))
+
+
+def test_velocity_profile_select_picks_alternative_even_when_raw_is_safe():
+    from lead.inference.config_open_loop import OpenLoopConfig
+    from lead.inference.open_loop_inference import OpenLoopInference
+    from lead.tfv6.tfv6 import Prediction
+
+    config = TrainingConfig()
+    config.use_planning_decoder = True
+    config.predict_temporal_spatial_waypoints = False
+    config.use_navsim_data = False
+    config.route_velocity_scorer_gate = True
+    config.route_velocity_selection_mode = "profile_select"
+    config.route_selection_mode = "confidence"
+    inference = OpenLoopInference.__new__(OpenLoopInference)
+    inference.config_training = config
+    inference.config_open_loop = OpenLoopConfig(raise_error_on_missing_key=False)
+    inference.device = torch.device("cpu")
+    inference.velocity_scorer = _VelocitySelectHead()
+    inference.velocity_vocabulary = torch.full((1, 8), 0.2)
+
+    logits = torch.full((1, len(config.target_speed_classes)), -10.0)
+    logits[:, 2] = 10.0
+    route = torch.stack(
+        (torch.arange(1, 11, dtype=torch.float32), torch.zeros(10)), dim=-1
+    )[None]
+    prediction = Prediction(
+        pred_future_waypoints=None,
+        pred_target_speed_distribution=logits,
+        pred_target_speed_scalar=torch.tensor([8.0]),
+        pred_route=route,
+        pred_semantic=None,
+        pred_bev_semantic=None,
+        pred_depth=None,
+        pred_bounding_box=None,
+        pred_radar_features=None,
+        pred_radar_predictions=None,
+        pred_bounding_box_navsim=None,
+        pred_bev_semantic_navsim=None,
+        pred_headings=None,
+        pred_route_features=torch.zeros(1, 2, 256),
+        pred_route_selected_idx=torch.tensor([1]),
+    )
+    result = inference.ensemble_planning_decoder(
+        [prediction], {"speed": torch.tensor([3.0])}
+    )
+    torch.testing.assert_close(result[0], route)
+    torch.testing.assert_close(result[13], torch.tensor([1]))
+    torch.testing.assert_close(result[14], torch.tensor([True]))
+    torch.testing.assert_close(result[15], torch.tensor([False]))
+    torch.testing.assert_close(result[16], torch.full((1, 8), 3.2))
+    # The target is the end of the first 0.25 s interval, not the 2 s terminal
+    # speed or the raw 8 m/s target.
+    torch.testing.assert_close(result[2], torch.tensor([[3.4]]))
+    torch.testing.assert_close(result[17][0, 0], torch.tensor([0.8, 0.0]))
+    torch.testing.assert_close(result[17][0, -1], torch.tensor([6.4, 0.0]))
+
+
+def test_velocity_profile_select_falls_back_to_least_risk_valid_candidate():
+    from lead.tfv6.velocity_scorer import select_velocity_profile
+
+    scorer = _VelocitySelectHead(raw_risk=0.9, alternative_risk=0.7)
+    result = select_velocity_profile(
+        scorer,
+        torch.zeros(1, 256),
+        torch.tensor([3.0]),
+        torch.tensor([8.0]),
+        torch.full((1, 8), 0.2),
+    )
+    torch.testing.assert_close(result.selected_index, torch.tensor([1]))
+    torch.testing.assert_close(result.fallback, torch.tensor([True]))
+    torch.testing.assert_close(result.target_speed, torch.tensor([3.4]))

@@ -1072,6 +1072,11 @@ class TrainingConfig(BaseConfig):
     # unsafe threshold; only reachable alternatives below the safe threshold may replace
     # it.  Disabled by default so historical checkpoints remain bit-identical.
     route_velocity_scorer_gate = False
+    # "gate" preserves the B3a intervention-only policy.  "profile_select" scores
+    # every valid velocity candidate on the confidence-selected path at every
+    # planning step, including the raw model candidate, and tracks the selected
+    # profile's first interval instead of sending its terminal speed to PID.
+    route_velocity_selection_mode = "gate"
     route_velocity_scorer_head = (
         "outputs/local_training/p5_stepB3a_velocity_scorer/velocity_scorer_best.pth"
     )

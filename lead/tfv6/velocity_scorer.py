@@ -9,6 +9,8 @@ import numpy as np
 import torch
 from torch import nn
 
+from lead.tfv6.future_collision import interpolate_route_by_distance
+
 
 class VelocityScorer(nn.Module):
     """Score imitation preference and collision risk for velocity candidates."""
@@ -113,6 +115,102 @@ class VelocityGateResult:
     candidate_valid: torch.Tensor
     preference: torch.Tensor
     risk: torch.Tensor
+
+
+def compose_route_velocity_trajectory(
+    route: torch.Tensor,
+    velocity_profile: torch.Tensor,
+    interval_s: float,
+) -> torch.Tensor:
+    """Sample a fixed spatial route at distances from interval-average speeds.
+
+    Use the same route interpolation/extrapolation as the counterfactual collision
+    labels.  This trajectory is an inference diagnostic; the existing lateral
+    controller still follows the spatial route, not these time-sampled points.
+    """
+
+    if route.ndim != 3 or route.shape[-1] != 2:
+        raise ValueError("route must have shape [B,P,2]")
+    if velocity_profile.ndim != 2 or route.shape[0] != velocity_profile.shape[0]:
+        raise ValueError("velocity_profile must have shape [B,T]")
+    if interval_s <= 0:
+        raise ValueError("interval_s must be positive")
+    distances = velocity_profile.clamp_min(0).cumsum(dim=-1) * float(interval_s)
+    positions = [
+        interpolate_route_by_distance(
+            path.detach().float().cpu().numpy(),
+            distance.detach().float().cpu().numpy(),
+            extrapolate=True,
+        )[0]
+        for path, distance in zip(route, distances, strict=True)
+    ]
+    return torch.as_tensor(np.stack(positions), device=route.device, dtype=route.dtype)
+
+
+@torch.inference_mode()
+def select_velocity_profile(
+    scorer: VelocityScorer,
+    route_features: torch.Tensor,
+    current_speed: torch.Tensor,
+    raw_target_speed: torch.Tensor,
+    residual_vocabulary: torch.Tensor,
+    *,
+    safe_threshold: float = 0.5,
+    interval_s: float = 0.25,
+    max_accel_mps2: float = 1.89,
+    max_decel_mps2: float = 4.95,
+) -> VelocityGateResult:
+    """Always select the preferred safe profile on the confidence-selected path.
+
+    Candidate zero (the raw model target) competes on equal terms.  If no valid
+    candidate is below the risk threshold, choose the least-risk valid candidate;
+    this fallback is reported explicitly.  The longitudinal controller receives
+    the speed at the end of the first profile interval, reconstructed from its
+    interval-average speed and the measured current speed.
+    """
+
+    if not 0.0 < safe_threshold <= 1.0:
+        raise ValueError("expected 0 < safe_threshold <= 1")
+    current = current_speed.reshape(-1)
+    raw_target = raw_target_speed.reshape(-1)
+    candidates, valid = build_velocity_candidates(
+        current,
+        raw_target,
+        residual_vocabulary,
+        interval_s=interval_s,
+        max_accel_mps2=max_accel_mps2,
+        max_decel_mps2=max_decel_mps2,
+    )
+    preference, collision_logit = scorer(
+        route_features.to(torch.float16).float(),
+        current.to(torch.float16).float(),
+        raw_target.to(torch.float16).float(),
+        candidates.to(torch.float16).float(),
+    )
+    risk = torch.sigmoid(collision_logit.float())
+    safe = valid & (risk < float(safe_threshold))
+    has_safe = safe.any(dim=1)
+    preferred = preference.float().masked_fill(~safe, float("-inf")).argmax(dim=1)
+    least_risk = risk.masked_fill(~valid, float("inf")).argmin(dim=1)
+    selected_index = torch.where(has_safe, preferred, least_risk)
+    rows = torch.arange(len(selected_index), device=selected_index.device)
+    selected_profile = candidates[rows, selected_index]
+    # v_avg=(v_start+v_end)/2 under the first-interval constant-acceleration
+    # approximation already used by the vocabulary's reachability check.
+    near_target = (2.0 * selected_profile[:, 0] - current).clamp_min(0.0)
+    return VelocityGateResult(
+        target_speed=near_target.reshape_as(raw_target_speed),
+        selected_index=selected_index,
+        raw_risk=risk[:, 0],
+        selected_risk=risk[rows, selected_index],
+        triggered=torch.ones_like(has_safe),
+        switched=selected_index != 0,
+        fallback=~has_safe,
+        candidate_velocity=candidates,
+        candidate_valid=valid,
+        preference=preference,
+        risk=risk,
+    )
 
 
 def _raw_target_velocity_profile(

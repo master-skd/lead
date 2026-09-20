@@ -16,12 +16,17 @@ from lead.inference import inference_utils
 from lead.inference.config_open_loop import OpenLoopConfig
 from lead.tfv6.center_net_decoder import PredictedBoundingBox
 from lead.tfv6.planning_decoder import decode_two_hot
+from lead.tfv6.route_safety_rescorer import resolve_route_selection_mode
 from lead.tfv6.route_speed_gate import (
     apply_collision_speed_gate,
     collision_risk_to_speed_factor,
 )
 from lead.tfv6.tfv6 import Prediction
-from lead.tfv6.velocity_scorer import apply_velocity_scorer_gate
+from lead.tfv6.velocity_scorer import (
+    apply_velocity_scorer_gate,
+    compose_route_velocity_trajectory,
+    select_velocity_profile,
+)
 from lead.training.config_training import TrainingConfig
 from lead.training.training_utils import create_model
 
@@ -103,6 +108,19 @@ class OpenLoopInference:
         self.velocity_scorer = None
         self.velocity_vocabulary = None
         if self.config_training.route_velocity_scorer_gate:
+            selection_mode = self.config_training.route_velocity_selection_mode
+            if selection_mode not in {"gate", "profile_select"}:
+                raise ValueError(
+                    "route_velocity_selection_mode must be 'gate' or 'profile_select'"
+                )
+            if selection_mode == "profile_select" and (
+                resolve_route_selection_mode(self.config_training) != "confidence"
+                or not self.config_training.predict_spatial_path
+            ):
+                raise ValueError(
+                    "profile_select requires route_selection_mode='confidence' "
+                    "and predict_spatial_path=True"
+                )
             if (
                 self.config_training.route_speed_safety_gate
                 or self.config_training.route_future_safety_gate
@@ -189,6 +207,8 @@ class OpenLoopInference:
         jt.Int[torch.Tensor, " 1"] | None,
         jt.Bool[torch.Tensor, " 1"] | None,
         jt.Bool[torch.Tensor, " 1"] | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
     ]:
         """Ensemble the outputs of the planning decoder from multiple models.
 
@@ -207,6 +227,7 @@ class OpenLoopInference:
         route_future_collision_risk = current_speed_factor = future_speed_factor = None
         velocity_raw_risk = velocity_selected_risk = velocity_selected_index = None
         velocity_switched = velocity_fallback = None
+        velocity_selected_profile = pred_trajectory = None
 
         if self.config_training.use_planning_decoder:
             if self.config_training.predict_target_speed:
@@ -269,17 +290,28 @@ class OpenLoopInference:
                         .reshape(-1)[:1]
                     )
                     raw_target_speed_scalar = pred_target_speed_scalar.clone()
-                    velocity_gate = apply_velocity_scorer_gate(
-                        self.velocity_scorer,
-                        route_feature,
-                        current_speed,
-                        raw_target_speed_scalar,
-                        self.velocity_vocabulary,
+                    selection_mode = self.config_training.route_velocity_selection_mode
+                    if selection_mode not in {"gate", "profile_select"}:
+                        raise ValueError(
+                            "route_velocity_selection_mode must be 'gate' or 'profile_select'"
+                        )
+                    if selection_mode == "profile_select" and (
+                        resolve_route_selection_mode(self.config_training)
+                        != "confidence"
+                        or not self.config_training.predict_spatial_path
+                    ):
+                        raise ValueError(
+                            "profile_select requires route_selection_mode='confidence' "
+                            "and predict_spatial_path=True"
+                        )
+                    velocity_selector = (
+                        select_velocity_profile
+                        if selection_mode == "profile_select"
+                        else apply_velocity_scorer_gate
+                    )
+                    selector_kwargs = dict(
                         safe_threshold=float(
                             self.config_training.route_velocity_safe_threshold
-                        ),
-                        unsafe_threshold=float(
-                            self.config_training.route_velocity_unsafe_threshold
                         ),
                         interval_s=float(
                             self.config_training.route_velocity_profile_interval_s
@@ -291,6 +323,18 @@ class OpenLoopInference:
                             self.config_training.route_velocity_max_decel_mps2
                         ),
                     )
+                    if selection_mode == "gate":
+                        selector_kwargs["unsafe_threshold"] = float(
+                            self.config_training.route_velocity_unsafe_threshold
+                        )
+                    velocity_gate = velocity_selector(
+                        self.velocity_scorer,
+                        route_feature,
+                        current_speed,
+                        raw_target_speed_scalar,
+                        self.velocity_vocabulary,
+                        **selector_kwargs,
+                    )
                     pred_target_speed_scalar = velocity_gate.target_speed.reshape_as(
                         pred_target_speed_scalar
                     )
@@ -299,6 +343,10 @@ class OpenLoopInference:
                     velocity_selected_index = velocity_gate.selected_index
                     velocity_switched = velocity_gate.switched
                     velocity_fallback = velocity_gate.fallback
+                    if selection_mode == "profile_select":
+                        velocity_selected_profile = velocity_gate.candidate_velocity[
+                            0, velocity_gate.selected_index[0]
+                        ][None]
 
                 if self.config_training.route_speed_safety_gate:
                     risks = [pred.pred_route_collision_risk for pred in predictions]
@@ -407,6 +455,12 @@ class OpenLoopInference:
                 pred_routes = torch.stack(
                     [pred.pred_route[0] for pred in predictions],
                 ).mean(dim=0, keepdim=True)  # Average route.
+                if velocity_selected_profile is not None:
+                    pred_trajectory = compose_route_velocity_trajectory(
+                        pred_routes,
+                        velocity_selected_profile,
+                        float(self.config_training.route_velocity_profile_interval_s),
+                    )
 
             if (
                 self.config_training.use_navsim_data
@@ -433,6 +487,8 @@ class OpenLoopInference:
             velocity_selected_index,
             velocity_switched,
             velocity_fallback,
+            velocity_selected_profile,
+            pred_trajectory,
         )
 
     @beartype
@@ -632,6 +688,8 @@ class OpenLoopInference:
             velocity_selected_index,
             velocity_switched,
             velocity_fallback,
+            velocity_selected_profile,
+            pred_trajectory,
         ) = self.ensemble_planning_decoder(predictions, _)
 
         return OpenLoopPrediction(
@@ -657,6 +715,8 @@ class OpenLoopInference:
             velocity_selected_index=velocity_selected_index,
             velocity_switched=velocity_switched,
             velocity_fallback=velocity_fallback,
+            velocity_selected_profile=velocity_selected_profile,
+            pred_trajectory=pred_trajectory,
         )
 
     @beartype
@@ -719,3 +779,7 @@ class OpenLoopPrediction:
     velocity_selected_index: torch.Tensor | None
     velocity_switched: torch.Tensor | None
     velocity_fallback: torch.Tensor | None
+    # B3a direct-selection mode: complete selected speed profile and its
+    # time-sampled positions on the confidence-selected spatial path.
+    velocity_selected_profile: torch.Tensor | None
+    pred_trajectory: torch.Tensor | None
