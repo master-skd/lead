@@ -270,6 +270,10 @@ def test_velocity_scorer_gate_changes_only_target_speed():
     torch.testing.assert_close(result[13], torch.tensor([1]))
     torch.testing.assert_close(result[14], torch.tensor([True]))
     torch.testing.assert_close(result[15], torch.tensor([False]))
+    assert result[18].shape == (1, 2, 8)
+    torch.testing.assert_close(result[19], torch.tensor([[True, True]]))
+    assert result[20].shape == (1, 2)
+    assert result[21].shape == (1, 2)
 
 
 def test_velocity_profile_select_picks_alternative_even_when_raw_is_safe():
@@ -326,6 +330,10 @@ def test_velocity_profile_select_picks_alternative_even_when_raw_is_safe():
     torch.testing.assert_close(result[2], torch.tensor([[3.4]]))
     torch.testing.assert_close(result[17][0, 0], torch.tensor([0.8, 0.0]))
     torch.testing.assert_close(result[17][0, -1], torch.tensor([6.4, 0.0]))
+    assert result[18].shape == (1, 2, 8)
+    torch.testing.assert_close(result[19], torch.tensor([[True, True]]))
+    assert result[20].shape == (1, 2)
+    assert result[21].shape == (1, 2)
 
 
 def test_velocity_profile_select_falls_back_to_least_risk_valid_candidate():

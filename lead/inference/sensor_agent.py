@@ -33,6 +33,7 @@ from lead.inference.closed_loop_inference import (
 )
 from lead.inference.config_closed_loop import ClosedLoopConfig
 from lead.inference.infraction_recorder import InfractionRecorder
+from lead.inference.velocity_diagnostics import build_velocity_diagnostic_record
 from lead.inference.video_recorder import VideoRecorder
 from lead.training.config_training import TrainingConfig
 from lead.visualization.visualizer import Visualizer
@@ -117,6 +118,8 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         )
         self.metric_info = {}
         self.meters_travelled = 0.0
+        self.velocity_diagnostics_file: typing.TextIO | None = None
+        self.velocity_diagnostics_failed = False
 
         # Infraction tracking
         self.infraction_recorder = InfractionRecorder(
@@ -236,6 +239,48 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             step=self.step,
             meters_travelled=self.meters_travelled,
         )
+
+    def save_velocity_diagnostics(
+        self,
+        prediction: ClosedLoopPrediction,
+        current_speed_mps: float,
+    ) -> None:
+        """Append the velocity scorer's complete decision for the current tick."""
+
+        if self.velocity_diagnostics_failed:
+            return
+        save_path = self.config_closed_loop.save_path
+        if save_path is None:
+            return
+        try:
+            record = build_velocity_diagnostic_record(
+                prediction,
+                step=self.step,
+                current_speed_mps=current_speed_mps,
+                safe_threshold=float(
+                    self.training_config.route_velocity_safe_threshold
+                ),
+                selection_mode=self.training_config.route_velocity_selection_mode,
+                final_steer=float(self.control.steer),
+                final_throttle=float(self.control.throttle),
+                final_brake=float(self.control.brake),
+                stuck_detector=int(self.force_move_post_processor.stuck_detector),
+                force_move_remaining=int(self.force_move_post_processor.force_move),
+            )
+            if record is None:
+                return
+            if self.velocity_diagnostics_file is None:
+                diagnostic_path = save_path / "velocity_diagnostics.jsonl"
+                self.velocity_diagnostics_file = diagnostic_path.open(
+                    "w", encoding="utf-8", buffering=1
+                )
+            self.velocity_diagnostics_file.write(
+                json.dumps(record, allow_nan=False, separators=(",", ":")) + "\n"
+            )
+        except Exception:
+            # Diagnostics must never alter the driving policy or abort a route.
+            self.velocity_diagnostics_failed = True
+            LOG.exception("Disabling velocity diagnostics after a logging failure")
 
     @beartype
     def set_target_points(self, input_data: dict, pop_distance: float):
@@ -510,7 +555,7 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 cam_rgb = strip_rgb
             else:
                 f0, f1 = self.training_config.vlm_front_frac
-                cam_rgb = strip_rgb[:, int(w * f0):int(w * f1)]
+                cam_rgb = strip_rgb[:, int(w * f0) : int(w * f1)]
             vlm_hidden = self.vlm_client.extract(cam_rgb)  # (h', w', D) fp16
             input_data_tensors["vlm_hidden"] = torch.from_numpy(
                 vlm_hidden.astype(np.float32)
@@ -583,6 +628,11 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         # CARLA will not let the car drive in the initial frames. This help the filter not get confused.
         if self.step < self.training_config.inital_frames_delay:
             self.control = carla.VehicleControl(0.0, 0.0, 1.0)
+
+        self.save_velocity_diagnostics(
+            closed_loop_prediction,
+            current_speed_mps=float(input_data["speed"].item()),
+        )
 
         # Check for infractions at this step
         self.check_infractions()
@@ -694,6 +744,11 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
 
     def destroy(self, results=None):
         LOG.info(results)
+
+        diagnostics_file = getattr(self, "velocity_diagnostics_file", None)
+        if diagnostics_file is not None:
+            diagnostics_file.close()
+            self.velocity_diagnostics_file = None
 
         # Clean up video recorder
         if hasattr(self, "video_recorder"):

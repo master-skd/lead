@@ -209,6 +209,10 @@ class OpenLoopInference:
         jt.Bool[torch.Tensor, " 1"] | None,
         torch.Tensor | None,
         torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
     ]:
         """Ensemble the outputs of the planning decoder from multiple models.
 
@@ -228,6 +232,8 @@ class OpenLoopInference:
         velocity_raw_risk = velocity_selected_risk = velocity_selected_index = None
         velocity_switched = velocity_fallback = None
         velocity_selected_profile = pred_trajectory = None
+        velocity_candidate_profiles = velocity_candidate_valid = None
+        velocity_candidate_preference = velocity_candidate_risk = None
 
         if self.config_training.use_planning_decoder:
             if self.config_training.predict_target_speed:
@@ -343,6 +349,10 @@ class OpenLoopInference:
                     velocity_selected_index = velocity_gate.selected_index
                     velocity_switched = velocity_gate.switched
                     velocity_fallback = velocity_gate.fallback
+                    velocity_candidate_profiles = velocity_gate.candidate_velocity
+                    velocity_candidate_valid = velocity_gate.candidate_valid
+                    velocity_candidate_preference = velocity_gate.preference
+                    velocity_candidate_risk = velocity_gate.risk
                     if selection_mode == "profile_select":
                         velocity_selected_profile = velocity_gate.candidate_velocity[
                             0, velocity_gate.selected_index[0]
@@ -489,6 +499,10 @@ class OpenLoopInference:
             velocity_fallback,
             velocity_selected_profile,
             pred_trajectory,
+            velocity_candidate_profiles,
+            velocity_candidate_valid,
+            velocity_candidate_preference,
+            velocity_candidate_risk,
         )
 
     @beartype
@@ -690,6 +704,10 @@ class OpenLoopInference:
             velocity_fallback,
             velocity_selected_profile,
             pred_trajectory,
+            velocity_candidate_profiles,
+            velocity_candidate_valid,
+            velocity_candidate_preference,
+            velocity_candidate_risk,
         ) = self.ensemble_planning_decoder(predictions, _)
 
         return OpenLoopPrediction(
@@ -717,6 +735,10 @@ class OpenLoopInference:
             velocity_fallback=velocity_fallback,
             velocity_selected_profile=velocity_selected_profile,
             pred_trajectory=pred_trajectory,
+            velocity_candidate_profiles=velocity_candidate_profiles,
+            velocity_candidate_valid=velocity_candidate_valid,
+            velocity_candidate_preference=velocity_candidate_preference,
+            velocity_candidate_risk=velocity_candidate_risk,
         )
 
     @beartype
@@ -783,3 +805,8 @@ class OpenLoopPrediction:
     # time-sampled positions on the confidence-selected spatial path.
     velocity_selected_profile: torch.Tensor | None
     pred_trajectory: torch.Tensor | None
+    # Complete per-candidate values are retained only for closed-loop diagnostics.
+    velocity_candidate_profiles: torch.Tensor | None
+    velocity_candidate_valid: torch.Tensor | None
+    velocity_candidate_preference: torch.Tensor | None
+    velocity_candidate_risk: torch.Tensor | None
