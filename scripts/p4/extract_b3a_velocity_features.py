@@ -62,6 +62,11 @@ def main() -> None:
     parser.add_argument("--ckpt-dir", required=True)
     parser.add_argument("--ckpt-name", default="model_0019.pth")
     parser.add_argument("--manifest", required=True)
+    parser.add_argument(
+        "--nearest-vlm-manifest",
+        default=None,
+        help="sparse VLM cache manifest used for nearest-frame reuse on dense data",
+    )
     parser.add_argument("--future-cache-dir", required=True)
     parser.add_argument("--expert-profiles", required=True)
     parser.add_argument("--velocity-vocab", required=True)
@@ -73,6 +78,8 @@ def main() -> None:
     parser.add_argument("--safety-margin", type=float, default=0.2)
     parser.add_argument("--max-accel", type=float, default=1.89)
     parser.add_argument("--max-decel", type=float, default=4.95)
+    parser.add_argument("--full-profile-reachability", action="store_true")
+    parser.add_argument("--scene-v2", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -90,12 +97,11 @@ def main() -> None:
         speed_profile_distances,
     )
     from lead.tfv6.tfv6 import TFv6
+    from lead.tfv6.trajectory_scene_scorer import compress_planner_scene_tokens
+    from lead.tfv6.velocity_scorer import build_velocity_candidates
     from lead.training.config_training import TrainingConfig
-    from scripts.p4.build_b3a_relative_velocity_vocab import realize_relative_profiles
     from scripts.p4.eval_b3a_velocity_vocab_oracle import (
         interval_speeds_from_distances,
-        profile_distances,
-        start_reachability_mask,
     )
 
     checkpoint = Path(args.ckpt_dir) / args.ckpt_name
@@ -162,6 +168,11 @@ def main() -> None:
         torch.load(checkpoint, map_location=device, weights_only=True), strict=True
     )
     model.eval().requires_grad_(False)
+    # The VLMIntentDataset wrapper supplies exact/nearest cached VLM features and
+    # this inference-only pass never consumes GT corridor labels or cached anchors.
+    # Prevent the underlying CARLAData sample loader from requiring sparse-only
+    # lanegraph/VLM/anchor files for every dense frame.
+    config.defer_vlm_inputs_to_wrapper = True
     config.detect_boxes = False
     config.use_semantic = False
     config._loaded_config["use_depth"] = False
@@ -173,6 +184,7 @@ def main() -> None:
         vlm_cache_dir=config.vlm_cache_dir,
         manifest_path=args.manifest,
         anchor_cache_dir=None,
+        nearest_cache_manifest_path=args.nearest_vlm_manifest,
     )
     start = max(0, args.start)
     end = (
@@ -202,7 +214,7 @@ def main() -> None:
         loader_kwargs["prefetch_factor"] = 1
     loader = DataLoader(**loader_kwargs)
 
-    names = (
+    names = [
         "route_features",
         "current_speed",
         "raw_target_speed",
@@ -216,7 +228,19 @@ def main() -> None:
         "selected_arm",
         "multi",
         "keys",
-    )
+    ]
+    if args.scene_v2:
+        names.extend(
+            (
+                "scene_tokens",
+                "candidate_states",
+                "label_collision_free",
+                "label_ttc",
+                "label_progress",
+                "label_comfort",
+                "label_imitation",
+            )
+        )
     saved: dict[str, list[np.ndarray]] = {name: [] for name in names}
     for data in tqdm(loader, desc=f"B3a velocity features {start}:{end}"):
         data.pop("anchor", None)
@@ -232,13 +256,28 @@ def main() -> None:
         if (
             prediction.pred_route_features is None
             or prediction.pred_route_selected_idx is None
+            or (args.scene_v2 and prediction.pred_scene_tokens is None)
         ):
-            raise RuntimeError("corridor model did not expose selected route features")
+            raise RuntimeError("corridor model did not expose route/scene features")
         routes = prediction.pred_route.float().cpu().numpy()
         all_features = prediction.pred_route_features.float().cpu().numpy()
         selected_arm = prediction.pred_route_selected_idx.long().cpu().numpy()
         rows = np.arange(len(routes))
         route_features = all_features[rows, selected_arm]
+        scene_tokens = None
+        if args.scene_v2:
+            scene_tokens = (
+                compress_planner_scene_tokens(
+                    prediction.pred_scene_tokens.float(),
+                    spatial_shape=(
+                        config.lidar_vert_anchors,
+                        config.lidar_horz_anchors,
+                    ),
+                    has_intent_tokens=config.use_control_conditioning,
+                )
+                .cpu()
+                .numpy()
+            )
         anchors = prediction.pred_route_anchor
         multi = (
             (anchors[..., 3].cpu().numpy() > 0.5).sum(axis=1) > 1
@@ -277,15 +316,6 @@ def main() -> None:
                 raise ValueError(f"current-speed mismatch for {key}")
         expert_velocity = np.asarray(expert_velocity, dtype=np.float32)
 
-        relative_velocity = realize_relative_profiles(vocabulary, current_speed)
-        relative_distance = profile_distances(relative_velocity, interval_s)
-        relative_valid = start_reachability_mask(
-            relative_velocity,
-            current_speed,
-            interval_s,
-            max_accel_mps2=args.max_accel,
-            max_decel_mps2=args.max_decel,
-        )
         raw_distance = np.stack(
             [
                 speed_profile_distances(float(v0), float(target))
@@ -293,15 +323,22 @@ def main() -> None:
             ]
         )
         raw_velocity = interval_speeds_from_distances(raw_distance, interval_s)
-        candidate_velocity = np.concatenate(
-            (raw_velocity[:, None], relative_velocity), axis=1
+        candidate_velocity_tensor, candidate_valid_tensor = build_velocity_candidates(
+            torch.as_tensor(current_speed),
+            torch.as_tensor(raw_target_speed),
+            torch.as_tensor(vocabulary),
+            interval_s=interval_s,
+            max_accel_mps2=args.max_accel,
+            max_decel_mps2=args.max_decel,
+            full_profile_reachability=args.full_profile_reachability,
         )
-        candidate_distance = np.concatenate(
-            (raw_distance[:, None], relative_distance), axis=1
-        )
-        candidate_valid = np.concatenate(
-            (np.ones((len(routes), 1), dtype=bool), relative_valid), axis=1
-        )
+        candidate_velocity = candidate_velocity_tensor.numpy()
+        candidate_valid = candidate_valid_tensor.numpy()
+        # Preserve the exact legacy raw profile as candidate zero.  The torch and
+        # NumPy implementations are analytically equal, but this avoids changing
+        # previously audited candidate-zero labels through floating-point noise.
+        candidate_velocity[:, 0] = raw_velocity
+        candidate_distance = np.cumsum(candidate_velocity, axis=-1) * interval_s
         imitation_error = np.abs(expert_velocity[:, None] - candidate_velocity).mean(
             axis=2
         )
@@ -310,6 +347,11 @@ def main() -> None:
         )
         collision = np.zeros_like(candidate_valid)
         ttc = np.full(candidate_valid.shape, np.inf, dtype=np.float32)
+        candidate_states = (
+            np.zeros((*candidate_velocity.shape, 6), dtype=np.float32)
+            if args.scene_v2
+            else None
+        )
 
         for batch_index, (key, route) in enumerate(
             zip(batch_keys, routes, strict=True)
@@ -322,6 +364,24 @@ def main() -> None:
                     candidate_distance[batch_index, candidate_index],
                     extrapolate=True,
                 )
+                speed = candidate_velocity[batch_index, candidate_index]
+                acceleration = np.empty_like(speed)
+                acceleration[0] = (
+                    2.0 * (speed[0] - current_speed[batch_index]) / interval_s
+                )
+                acceleration[1:] = np.diff(speed) / interval_s
+                if candidate_states is not None:
+                    candidate_states[batch_index, candidate_index] = np.stack(
+                        (
+                            positions[:, 0],
+                            positions[:, 1],
+                            np.sin(yaws),
+                            np.cos(yaws),
+                            speed,
+                            acceleration,
+                        ),
+                        axis=-1,
+                    )
                 label = future_collision_label(
                     positions,
                     yaws,
@@ -349,6 +409,44 @@ def main() -> None:
             "multi": multi,
             "keys": np.asarray(batch_keys),
         }
+        if args.scene_v2:
+            horizon_s = float(FUTURE_TIMES_S[-1])
+            label_ttc = np.where(
+                collision,
+                np.clip(ttc / horizon_s, 0.0, 1.0),
+                1.0,
+            ).astype(np.float32)
+            # Near-term progress matters most because closed loop executes the
+            # first interval and replans, rather than open-loop tracking 2 s.
+            near_index = min(1, candidate_distance.shape[-1] - 1)
+            near = candidate_distance[..., near_index]
+            final = candidate_distance[..., -1]
+            near_max = np.where(candidate_valid, near, -np.inf).max(
+                axis=1, keepdims=True
+            )
+            final_max = np.where(candidate_valid, final, -np.inf).max(
+                axis=1, keepdims=True
+            )
+            label_progress = 0.7 * near / np.maximum(near_max, 1e-3)
+            label_progress += 0.3 * final / np.maximum(final_max, 1e-3)
+            acceleration = candidate_states[..., 5]
+            jerk = (
+                np.diff(acceleration, axis=-1, prepend=acceleration[..., :1])
+                / interval_s
+            )
+            accel_rms = np.sqrt(np.mean(np.square(acceleration), axis=-1))
+            jerk_rms = np.sqrt(np.mean(np.square(jerk), axis=-1))
+            values.update(
+                scene_tokens=scene_tokens.astype(np.float16),
+                candidate_states=candidate_states.astype(np.float16),
+                label_collision_free=~collision,
+                label_ttc=label_ttc.astype(np.float16),
+                label_progress=np.clip(label_progress, 0.0, 1.0).astype(np.float16),
+                label_comfort=np.exp(
+                    -0.5 * np.square(accel_rms / 3.0) - 0.5 * np.square(jerk_rms / 8.0)
+                ).astype(np.float16),
+                label_imitation=np.exp(-imitation_error / 0.5).astype(np.float16),
+            )
         for name in names:
             saved[name].append(values[name])
 
@@ -357,10 +455,17 @@ def main() -> None:
     packed.update(
         source_checkpoint=np.asarray(str(checkpoint.resolve())),
         source_manifest=np.asarray(str(Path(args.manifest).resolve())),
+        nearest_vlm_manifest=np.asarray(
+            ""
+            if args.nearest_vlm_manifest is None
+            else str(Path(args.nearest_vlm_manifest).resolve())
+        ),
         source_vocabulary=np.asarray(str(Path(args.velocity_vocab).resolve())),
         vocabulary_sha256=np.asarray(vocab_hash),
         safety_margin_m=np.asarray(args.safety_margin, dtype=np.float32),
         candidate_zero=np.asarray("raw target-speed profile"),
+        scene_v2=np.asarray(args.scene_v2),
+        full_profile_reachability=np.asarray(args.full_profile_reachability),
     )
     temporary = output.with_suffix(".npz.tmp")
     with temporary.open("wb") as handle:

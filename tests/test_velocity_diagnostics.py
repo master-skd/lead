@@ -76,3 +76,28 @@ def test_build_velocity_diagnostic_record_skips_disabled_scorer():
         )
         is None
     )
+
+
+def test_predicted_actor_gate_writes_compact_binary_collision_record():
+    prediction = _prediction()
+    prediction.velocity_raw_risk = torch.tensor([1.0])
+    prediction.velocity_selected_risk = torch.tensor([0.0])
+    record = build_velocity_diagnostic_record(
+        prediction,
+        step=5,
+        current_speed_mps=3.5,
+        safe_threshold=0.5,
+        selection_mode="predicted_actor_gate",
+        final_steer=0.1,
+        final_throttle=0.3,
+        final_brake=0.0,
+        stuck_detector=0,
+        force_move_remaining=0,
+    )
+    assert record["schema_version"] == 2
+    assert record["predicted_raw_collision"] is True
+    assert record["predicted_selected_collision"] is False
+    assert record["selected_index"] == 1
+    assert record["valid_candidate_count"] == 2
+    assert "candidate_profiles_mps" not in record
+    json.dumps(record, allow_nan=False)

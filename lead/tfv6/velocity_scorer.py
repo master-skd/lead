@@ -274,6 +274,7 @@ def build_velocity_candidates(
     interval_s: float = 0.25,
     max_accel_mps2: float = 1.89,
     max_decel_mps2: float = 4.95,
+    full_profile_reachability: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build raw + residual-vocabulary profiles exactly as in feature extraction."""
 
@@ -299,8 +300,22 @@ def build_velocity_candidates(
     first_acceleration = (
         2.0 * (residual[:, :, 0] - current[:, None]) / float(interval_s)
     )
-    residual_valid = (first_acceleration >= -float(max_decel_mps2) - 1e-6) & (
+    # The old vocabulary check only constrained the first 250 ms interval.  It
+    # therefore admitted profiles with physically impossible jumps later in the
+    # horizon.  Consecutive interval-average speeds provide a conservative proxy
+    # for acceleration after that first interval; candidate zero is retained as
+    # an unconditional fallback because its target-reaching interval can be
+    # shorter than the fixed sampling period.
+    later_acceleration = torch.diff(residual, dim=-1) / float(interval_s)
+    first_valid = (first_acceleration >= -float(max_decel_mps2) - 1e-6) & (
         first_acceleration <= float(max_accel_mps2) + 1e-6
+    )
+    later_valid = (
+        (later_acceleration >= -float(max_decel_mps2) - 1e-6)
+        & (later_acceleration <= float(max_accel_mps2) + 1e-6)
+    ).all(dim=-1)
+    residual_valid = (
+        first_valid & later_valid if full_profile_reachability else first_valid
     )
     candidate_velocity = torch.cat((raw[:, None], residual), dim=1)
     candidate_valid = torch.cat(

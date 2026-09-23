@@ -941,6 +941,10 @@ class TrainingConfig(BaseConfig):
     vlm_intent_ckpt = None
     vlm_cache_dir = "data/p5/vlm_cache"
     vlm_manifest = "data/p4/manifest.jsonl"
+    # Offline feature extractors may wrap CARLAData with VLMIntentDataset, which
+    # supplies exact/nearest cached VLM inputs itself.  In that case the base
+    # dataset must not also require sparse-only VLM, anchor or lanegraph files.
+    defer_vlm_inputs_to_wrapper = False
     # P5b closed-loop: at eval time there is no offline cache, so the frozen Qwen-VL must
     # run live. Qwen3-VL cannot load in the lead env (old transformers), so it runs as a
     # separate service (qwenvl env) and the agent talks to it over this Unix socket.
@@ -1076,9 +1080,16 @@ class TrainingConfig(BaseConfig):
     # every valid velocity candidate on the confidence-selected path at every
     # planning step, including the raw model candidate, and tracks the selected
     # profile's first interval instead of sending its terminal speed to PID.
+    # "scene_score" is B3a-v2: encode the complete time-sampled trajectory,
+    # cross-attend to planner scene memory, filter by collision-free/TTC, then
+    # rank progress/comfort with imitation only as a weak prior.
     route_velocity_selection_mode = "gate"
     route_velocity_scorer_head = (
         "outputs/local_training/p5_stepB3a_velocity_scorer/velocity_scorer_best.pth"
+    )
+    route_velocity_scene_scorer_head = (
+        "outputs/local_training/p5_stepB3a_v2_scene_scorer/"
+        "trajectory_scene_scorer_best.pth"
     )
     route_velocity_vocabulary = (
         "outputs/local_training/p5_stepB3a_relative_velocity_vocab/"
@@ -1088,9 +1099,24 @@ class TrainingConfig(BaseConfig):
     # 1.95% switches, 0.97% false switches, and no introduced GT collision.
     route_velocity_safe_threshold = 0.5
     route_velocity_unsafe_threshold = 0.8
+    # B3a-v2 feasibility thresholds; tune on held-out labels before closed loop.
+    route_velocity_scene_collision_free_threshold = 0.5
+    route_velocity_scene_ttc_threshold = 0.5
     route_velocity_profile_interval_s = 0.25
     route_velocity_max_accel_mps2 = 1.89
     route_velocity_max_decel_mps2 = 4.95
+    # B3a predicted-actor gate: fixed confidence-selected path, dense-data K64
+    # velocity vocabulary, CenterNet constant-velocity actor futures and SAT.
+    # Keep raw unless it is predicted to collide; then choose the fastest
+    # predicted-safe slowdown. This is independent of the learned scorers.
+    route_predicted_actor_velocity_gate = False
+    route_predicted_actor_velocity_vocabulary = (
+        "outputs/local_training/p5_stepB3a_v2_dense_data/relative_velocity_vocab/"
+        "relative_velocity_vocab_k64.npy"
+    )
+    route_predicted_actor_score_threshold = 0.5
+    route_predicted_actor_nms_iou_threshold = 0.5
+    route_predicted_actor_safety_margin_m = 0.2
     # P2.2: if true, add a differentiable collision cost on predicted waypoints.
     use_collision_cost = False
     collision_loss_weight = 1.0

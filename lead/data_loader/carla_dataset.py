@@ -431,6 +431,9 @@ class CARLAData(Dataset):
             # keeps its arms on the road -- hence use_route_corridor_loss also opens this.
             if (
                 (self.config.use_intent_decoder or self.config.use_route_corridor_loss)
+                and not getattr(
+                    self.config, "defer_vlm_inputs_to_wrapper", False
+                )
                 and not self.build_cache
                 and not self.build_buckets
             ):
@@ -468,7 +471,9 @@ class CARLAData(Dataset):
             # P5b: attach the cached (frozen) VLM hidden states for this frame so the
             # model can feed them through the frozen VLM intent head. The dataset is
             # already restricted to cached frames in shuffle(), so the .npy exists.
-            if self.config.use_vlm_intent:
+            if self.config.use_vlm_intent and not getattr(
+                self.config, "defer_vlm_inputs_to_wrapper", False
+            ):
                 p = str(self.images[index], encoding="utf-8").split("/")
                 scenario, route, frame = p[-4], p[-3], p[-1].split(".")[0]
                 npy_path = os.path.join(

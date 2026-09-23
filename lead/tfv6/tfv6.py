@@ -190,6 +190,7 @@ class TFv6(nn.Module):
         pred_route_selected_idx = pred_route_collision_cost = None
         pred_route_off_corridor_cost = pred_route_safe_mask = None
         pred_route_collision_risk = None
+        pred_scene_tokens = None
         planner_anchor = None
 
         # Backbone
@@ -251,6 +252,11 @@ class TFv6(nn.Module):
                 intent=planner_intent,
                 anchor=planner_anchor,
             )
+            # Reuse the exact context consumed by the planner as the scene memory
+            # for the B3a-v2 trajectory scorer.  It contains BEV, visual-intent,
+            # ego-status and (when enabled) radar tokens.  Keeping this optional
+            # makes the addition inference/backward compatible with old callers.
+            pred_scene_tokens = self.planning_decoder.kv
 
         # Semantic segmentation forward pass
         if self.config.use_carla_data and self.config.use_semantic:
@@ -392,6 +398,7 @@ class TFv6(nn.Module):
             pred_route_off_corridor_cost=pred_route_off_corridor_cost,
             pred_route_safe_mask=pred_route_safe_mask,
             pred_route_collision_risk=pred_route_collision_risk,
+            pred_scene_tokens=pred_scene_tokens,
         )
 
     @beartype
@@ -527,3 +534,5 @@ class Prediction:
     pred_route_off_corridor_cost: torch.Tensor | None = None
     pred_route_safe_mask: torch.Tensor | None = None
     pred_route_collision_risk: torch.Tensor | None = None
+    # Planner context memory exposed for candidate-scene cross attention.
+    pred_scene_tokens: torch.Tensor | None = None

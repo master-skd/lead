@@ -27,11 +27,15 @@ import argparse
 import json
 import os
 
+from tqdm import tqdm
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", default="data/p4/manifest.jsonl")
-    ap.add_argument("--n", type=int, default=0, help="cap on #frames to output; 0 = no cap")
+    ap.add_argument(
+        "--n", type=int, default=0, help="cap on #frames to output; 0 = no cap"
+    )
     ap.add_argument(
         "--stride",
         type=int,
@@ -46,21 +50,46 @@ def main() -> None:
         default=(1.0 / 3.0, 2.0 / 3.0),
         help="horizontal [start,end] fraction of the front camera within the 3-cam strip",
     )
-    ap.add_argument("--save-png", action="store_true", help="also dump cropped front PNGs (eyeball)")
-    ap.add_argument("--out", default="data/p4/front", help="dir for PNGs when --save-png")
-    ap.add_argument("--densify-junction-dist", type=float, default=0.0,
-                    help="P5: frames within this many metres of a junction are sampled at "
-                         "--stride-near instead of --stride (0 = uniform stride, P4 behaviour)")
-    ap.add_argument("--stride-near", type=int, default=2, help="finer stride near junctions")
+    ap.add_argument(
+        "--save-png", action="store_true", help="also dump cropped front PNGs (eyeball)"
+    )
+    ap.add_argument(
+        "--out", default="data/p4/front", help="dir for PNGs when --save-png"
+    )
+    ap.add_argument(
+        "--skip-meta",
+        action="store_true",
+        help=(
+            "do not read per-frame meta/navigation commands; write LANEFOLLOW as a "
+            "placeholder. Intended for dense scorer manifests, whose dataloader reads "
+            "the real command from CARLAData rather than this manifest field"
+        ),
+    )
+    ap.add_argument(
+        "--densify-junction-dist",
+        type=float,
+        default=0.0,
+        help="P5: frames within this many metres of a junction are sampled at "
+        "--stride-near instead of --stride (0 = uniform stride, P4 behaviour)",
+    )
+    ap.add_argument(
+        "--stride-near", type=int, default=2, help="finer stride near junctions"
+    )
     args = ap.parse_args()
 
+    from lead.common import common_utils
     from lead.data_loader.carla_dataset import CARLAData
     from lead.training.config_training import TrainingConfig
-    from lead.common import common_utils
 
     # CARLA high-level navigation command (integer -> word) for conditioning the VLM.
-    CMD = {1: "LEFT", 2: "RIGHT", 3: "STRAIGHT", 4: "LANEFOLLOW",
-           5: "CHANGELANELEFT", 6: "CHANGELANERIGHT"}
+    CMD = {
+        1: "LEFT",
+        2: "RIGHT",
+        3: "STRAIGHT",
+        4: "LANEFOLLOW",
+        5: "CHANGELANELEFT",
+        6: "CHANGELANERIGHT",
+    }
 
     mdir = os.path.dirname(args.manifest)
     if mdir:
@@ -83,7 +112,9 @@ def main() -> None:
     f0, f1 = args.front_frac
     print(f"dataset frames: {n_total}, base stride: {args.stride}")
     print(f"front-cam horizontal fraction: {args.front_frac}  save_png={args.save_png}")
-    print(f"command key: {cmd_key}  densify<{args.densify_junction_dist}m @stride {args.stride_near}")
+    print(
+        f"command key: {cmd_key}  densify<{args.densify_junction_dist}m @stride {args.stride_near}"
+    )
 
     def read_meta(idx: int) -> tuple[str, float]:
         """Read the nav command word and distance-to-junction for a frame."""
@@ -96,27 +127,43 @@ def main() -> None:
     # filling their neighbours at the finer stride (extras inherit the nearby command,
     # which is unused by the command-agnostic P5 prompt anyway).
     index_cmd: dict[int, str] = {}
-    for pos, i in enumerate(base_indices):
-        try:
-            cmd, dist = read_meta(i)
-        except Exception as exc:  # noqa: BLE001
-            if pos == 0:
-                print(f"  [warn] meta read failed ({exc}); defaulting LANEFOLLOW / far")
-            cmd, dist = "LANEFOLLOW", 1e9
-        index_cmd.setdefault(i, cmd)
-        if args.densify_junction_dist > 0 and dist < args.densify_junction_dist:
-            for j in range(max(0, i - args.stride), min(n_total, i + args.stride + 1),
-                           max(1, args.stride_near)):
-                index_cmd.setdefault(j, cmd)
+    if args.skip_meta:
+        if args.densify_junction_dist > 0:
+            raise ValueError(
+                "--skip-meta cannot be combined with junction densification"
+            )
+        final_indices = base_indices
+        print("skipping per-frame meta scan; manifest command is a placeholder")
+    else:
+        for pos, i in enumerate(
+            tqdm(base_indices, desc="scan frame metadata", unit="frame")
+        ):
+            try:
+                cmd, dist = read_meta(i)
+            except Exception as exc:  # noqa: BLE001
+                if pos == 0:
+                    print(
+                        f"  [warn] meta read failed ({exc}); defaulting LANEFOLLOW / far"
+                    )
+                cmd, dist = "LANEFOLLOW", 1e9
+            index_cmd.setdefault(i, cmd)
+            if args.densify_junction_dist > 0 and dist < args.densify_junction_dist:
+                for j in range(
+                    max(0, i - args.stride),
+                    min(n_total, i + args.stride + 1),
+                    max(1, args.stride_near),
+                ):
+                    index_cmd.setdefault(j, cmd)
+        final_indices = sorted(index_cmd)
+    print(
+        f"dumping: {len(final_indices)} frames "
+        f"({len(base_indices)} base + {len(final_indices) - len(base_indices)} junction-densified)"
+    )
 
-    final_indices = sorted(index_cmd)
-    print(f"dumping: {len(final_indices)} frames "
-          f"({len(base_indices)} base + {len(final_indices) - len(base_indices)} junction-densified)")
-
-    written = skipped = bad = 0
+    written = bad = 0
     seen_keys = set()
     with open(args.manifest, "w") as mf:
-        for i in final_indices:
+        for i in tqdm(final_indices, desc="write dense manifest", unit="frame"):
             p = str(paths[i], encoding="utf-8")
             parts = p.split("/")
             scenario, route, frame = parts[-4], parts[-3], parts[-1].split(".")[0]
@@ -132,7 +179,7 @@ def main() -> None:
                 "frame": frame,
                 "src": p,
                 "front_frac": [f0, f1],
-                "command": index_cmd[i],
+                "command": index_cmd.get(i, "LANEFOLLOW"),
             }
 
             if args.save_png:
@@ -145,13 +192,11 @@ def main() -> None:
                             print(f"  [bad] cannot read {p}")
                         continue
                     W = img.shape[1]
-                    cv2.imwrite(out_png, img[:, int(W * f0):int(W * f1)])
+                    cv2.imwrite(out_png, img[:, int(W * f0) : int(W * f1)])
                 entry["png"] = out_png
 
             mf.write(json.dumps(entry) + "\n")
             written += 1
-            if written <= 3 or written % 20000 == 0:
-                print(f"[{written}] {key}  src={p}")
 
     print(f"done: written={written} bad={bad}")
     print(f"manifest -> {args.manifest}  ({written} frames)")

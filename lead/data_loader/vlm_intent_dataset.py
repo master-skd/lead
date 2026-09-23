@@ -4,10 +4,20 @@ from __future__ import annotations
 
 import json
 import os
+from bisect import bisect_left
+from collections import defaultdict
+from functools import lru_cache
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+
+@lru_cache(maxsize=64)
+def _load_vlm_hidden(path: str) -> np.ndarray:
+    """Reuse a sparse VLM feature for nearby dense frames in each loader worker."""
+
+    return np.load(path)
 
 
 class VLMIntentDataset(Dataset):
@@ -25,6 +35,7 @@ class VLMIntentDataset(Dataset):
         vlm_cache_dir: str = "data/p4/vlm_cache",
         manifest_path: str | None = None,
         anchor_cache_dir: str | None = None,
+        nearest_cache_manifest_path: str | None = None,
     ):
         """
         Args:
@@ -39,6 +50,10 @@ class VLMIntentDataset(Dataset):
                 ((K_MAX,5)=[valid,angle,reach,tip_row,tip_col]). When given, __getitem__
                 adds data["anchor"] = (K_MAX,4)=[sin a, cos a, reach/30, valid] ready for
                 the multimodal planner's anchor embedding (B2).
+            nearest_cache_manifest_path: optional sparse cache manifest. Frames in
+                ``manifest_path`` without their own VLM feature reuse the nearest
+                cached frame from the same route. This supports dense scorer-label
+                extraction without rerunning Qwen-VL on near-duplicate frames.
         """
         self.carla_ds = carla_dataset
         self.vlm_cache_dir = vlm_cache_dir
@@ -53,6 +68,24 @@ class VLMIntentDataset(Dataset):
                     for e in (json.loads(line) for line in f)
                 }
 
+        nearest_by_route: dict[tuple[str, str], list[tuple[int, str]]] = defaultdict(
+            list
+        )
+        nearest_cache_keys: set[tuple[str, str, str]] = set()
+        if nearest_cache_manifest_path is not None:
+            with open(nearest_cache_manifest_path) as f:
+                for entry in (json.loads(line) for line in f if line.strip()):
+                    nearest_cache_keys.add(
+                        (entry["scenario"], entry["route"], entry["frame"])
+                    )
+                    nearest_by_route[(entry["scenario"], entry["route"])].append(
+                        (int(entry["frame"]), entry["frame"])
+                    )
+            for frames in nearest_by_route.values():
+                frames.sort()
+        self._nearest_cache_frame: dict[int, str] = {}
+        nearest_gaps = []
+
         # Filter to frames that have cached VLM features
         self.valid_indices = []
         for i in range(len(carla_dataset.images)):
@@ -64,11 +97,32 @@ class VLMIntentDataset(Dataset):
             else:
                 npy_path = os.path.join(vlm_cache_dir, scenario, route, frame + ".npy")
                 has_cache = os.path.exists(npy_path)
+            if has_cache and nearest_by_route:
+                if (scenario, route, frame) not in nearest_cache_keys:
+                    candidates = nearest_by_route.get((scenario, route), [])
+                    if candidates:
+                        position = bisect_left(candidates, (int(frame), ""))
+                        neighbors = candidates[max(0, position - 1) : position + 1]
+                        nearest_value, nearest_frame = min(
+                            neighbors, key=lambda item: abs(item[0] - int(frame))
+                        )
+                        self._nearest_cache_frame[i] = nearest_frame
+                        nearest_gaps.append(abs(nearest_value - int(frame)))
+                    else:
+                        has_cache = False
             if has_cache:
                 self.valid_indices.append(i)
 
-        print(f"VLMIntentDataset: {len(self.valid_indices)} / {len(carla_dataset.images)} frames have VLM cache")
-
+        print(
+            f"VLMIntentDataset: {len(self.valid_indices)} / {len(carla_dataset.images)} frames have VLM cache"
+        )
+        if nearest_gaps:
+            gaps = np.asarray(nearest_gaps)
+            print(
+                "VLMIntentDataset nearest-cache reuse: "
+                f"n={len(gaps)} mean_gap={gaps.mean():.1f} "
+                f"p95={np.percentile(gaps, 95):.0f} max={gaps.max()} frames"
+            )
 
     def __len__(self) -> int:
         return len(self.valid_indices)
@@ -83,14 +137,21 @@ class VLMIntentDataset(Dataset):
         p = str(self.carla_ds.images[carla_idx], encoding="utf-8")
         parts = p.split("/")
         scenario, route, frame = parts[-4], parts[-3], parts[-1].split(".")[0]
-        npy_path = os.path.join(self.vlm_cache_dir, scenario, route, frame + ".npy")
-        vlm_hidden = np.load(npy_path)  # (h', w', D_vlm), fp16
+        cache_frame = self._nearest_cache_frame.get(carla_idx, frame)
+        npy_path = os.path.join(
+            self.vlm_cache_dir, scenario, route, cache_frame + ".npy"
+        )
+        vlm_hidden = _load_vlm_hidden(npy_path)  # (h', w', D_vlm), fp16
         data["vlm_hidden"] = torch.from_numpy(vlm_hidden).to(torch.float32)
 
         # B2: load precomputed anchors -> (K_MAX,4)=[sin a, cos a, reach/30, valid]
         if self.anchor_cache_dir is not None:
-            a_path = os.path.join(self.anchor_cache_dir, scenario, route, frame + ".npy")
-            a = np.load(a_path).astype(np.float32)  # (K_MAX,5)=[valid,angle,reach,tr,tc]
+            a_path = os.path.join(
+                self.anchor_cache_dir, scenario, route, frame + ".npy"
+            )
+            a = np.load(a_path).astype(
+                np.float32
+            )  # (K_MAX,5)=[valid,angle,reach,tr,tc]
             valid, ang, reach = a[:, 0], a[:, 1], a[:, 2]
             feat = np.stack([np.sin(ang), np.cos(ang), reach / 30.0, valid], axis=1)
             feat[valid < 0.5] = 0.0  # zero padding slots
@@ -107,7 +168,9 @@ def vlm_intent_collate_fn(batch: list[dict]) -> dict:
         return x if torch.is_tensor(x) else torch.from_numpy(np.asarray(x))
 
     # vlm_hidden is already a float tensor from __getitem__
-    data["vlm_hidden"] = torch.stack([b["vlm_hidden"] for b in batch], dim=0)  # (B, h', w', D)
+    data["vlm_hidden"] = torch.stack(
+        [b["vlm_hidden"] for b in batch], dim=0
+    )  # (B, h', w', D)
 
     # visual_intent_label: numpy (1,H,W) from CARLAData rasterization -> tensor
     if batch[0].get("visual_intent_label") is not None:
@@ -117,7 +180,9 @@ def vlm_intent_collate_fn(batch: list[dict]) -> dict:
 
     # route: fallback for label generation
     if batch[0].get("route") is not None:
-        data["route"] = torch.stack([_to_tensor(b["route"]).float() for b in batch], dim=0)
+        data["route"] = torch.stack(
+            [_to_tensor(b["route"]).float() for b in batch], dim=0
+        )
 
     return data
 
@@ -125,6 +190,7 @@ def vlm_intent_collate_fn(batch: list[dict]) -> dict:
 def main():
     """Smoke: load a few samples."""
     import sys
+
     sys.path.insert(0, "/mmu_mllm_hdd_3/liuzihan08/vla/lead")
     from lead.data_loader.carla_dataset import CARLAData
     from lead.training.config_training import TrainingConfig

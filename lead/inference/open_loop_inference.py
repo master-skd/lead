@@ -16,14 +16,25 @@ from lead.inference import inference_utils
 from lead.inference.config_open_loop import OpenLoopConfig
 from lead.tfv6.center_net_decoder import PredictedBoundingBox
 from lead.tfv6.planning_decoder import decode_two_hot
+from lead.tfv6.predicted_actor_velocity_gate import (
+    extrapolate_detected_actors,
+    predicted_candidate_collisions,
+    select_safe_slowdown,
+)
 from lead.tfv6.route_safety_rescorer import resolve_route_selection_mode
 from lead.tfv6.route_speed_gate import (
     apply_collision_speed_gate,
     collision_risk_to_speed_factor,
 )
 from lead.tfv6.tfv6 import Prediction
+from lead.tfv6.trajectory_scene_scorer import (
+    build_trajectory_candidate_states,
+    compress_planner_scene_tokens,
+    select_scene_scored_trajectory,
+)
 from lead.tfv6.velocity_scorer import (
     apply_velocity_scorer_gate,
+    build_velocity_candidates,
     compose_route_velocity_trajectory,
     select_velocity_profile,
 )
@@ -107,18 +118,66 @@ class OpenLoopInference:
             LOG.info(f"Loaded B2d route safety head from {head_path}")
         self.velocity_scorer = None
         self.velocity_vocabulary = None
+        self.predicted_actor_velocity_vocabulary = None
+        if self.config_training.route_predicted_actor_velocity_gate:
+            from lead.data_loader.future_actor_cache import FUTURE_TIMES_S
+
+            if self.config_training.route_velocity_scorer_gate:
+                raise ValueError(
+                    "predicted-actor gate and learned velocity scorer are exclusive"
+                )
+            if (
+                self.config_training.route_speed_safety_gate
+                or self.config_training.route_future_safety_gate
+            ):
+                raise ValueError(
+                    "predicted-actor gate must run without B2c/B2d speed gates"
+                )
+            if (
+                resolve_route_selection_mode(self.config_training) != "confidence"
+                or not self.config_training.predict_spatial_path
+                or not self.config_training.detect_boxes
+                or self.config_training.training_used_lidar_steps <= 1
+                or len(self.nets) != 1
+            ):
+                raise ValueError(
+                    "predicted-actor gate requires one confidence-route model with "
+                    "spatial path, CenterNet boxes and predicted actor speed"
+                )
+            if float(self.config_training.route_velocity_profile_interval_s) != 0.25:
+                raise ValueError("predicted-actor gate was audited at 0.25 s intervals")
+            vocabulary_path = (
+                self.config_training.route_predicted_actor_velocity_vocabulary
+            )
+            vocabulary = np.load(vocabulary_path, allow_pickle=False)
+            if (
+                vocabulary.ndim != 2
+                or vocabulary.shape[1] != len(FUTURE_TIMES_S)
+                or not np.isfinite(vocabulary).all()
+            ):
+                raise ValueError(
+                    f"invalid predicted-actor vocabulary: {vocabulary.shape}"
+                )
+            self.predicted_actor_velocity_vocabulary = torch.from_numpy(
+                vocabulary.astype(np.float32, copy=False)
+            ).to(self.device)
+            LOG.info(
+                "Loaded B3a predicted-actor velocity vocabulary from %s",
+                vocabulary_path,
+            )
         if self.config_training.route_velocity_scorer_gate:
             selection_mode = self.config_training.route_velocity_selection_mode
-            if selection_mode not in {"gate", "profile_select"}:
+            if selection_mode not in {"gate", "profile_select", "scene_score"}:
                 raise ValueError(
-                    "route_velocity_selection_mode must be 'gate' or 'profile_select'"
+                    "route_velocity_selection_mode must be 'gate', 'profile_select', "
+                    "or 'scene_score'"
                 )
-            if selection_mode == "profile_select" and (
+            if selection_mode in {"profile_select", "scene_score"} and (
                 resolve_route_selection_mode(self.config_training) != "confidence"
                 or not self.config_training.predict_spatial_path
             ):
                 raise ValueError(
-                    "profile_select requires route_selection_mode='confidence' "
+                    f"{selection_mode} requires route_selection_mode='confidence' "
                     "and predict_spatial_path=True"
                 )
             if (
@@ -134,13 +193,28 @@ class OpenLoopInference:
                     "B3a velocity scorer was trained on one frozen corridor model and "
                     "requires exactly one model weight at inference"
                 )
+            from lead.tfv6.trajectory_scene_scorer import (
+                load_trajectory_scene_scorer,
+            )
             from lead.tfv6.velocity_scorer import load_velocity_scorer
 
-            scorer_path = self.config_training.route_velocity_scorer_head
+            scorer_path = (
+                self.config_training.route_velocity_scene_scorer_head
+                if selection_mode == "scene_score"
+                else self.config_training.route_velocity_scorer_head
+            )
             vocabulary_path = self.config_training.route_velocity_vocabulary
             checkpoint = torch.load(
                 scorer_path, map_location=self.device, weights_only=True
             )
+            if selection_mode == "scene_score" and not checkpoint.get(
+                "safety_qualified", False
+            ):
+                raise ValueError(
+                    "B3a-v2 scene scorer has not passed the held-out safety gate; "
+                    "set route_velocity_scene_scorer_head to the safety-qualified "
+                    "checkpoint recorded in selection_status.json"
+                )
             source = checkpoint.get("source_checkpoint")
             if source is not None and os.path.exists(source):
                 source = os.path.abspath(source)
@@ -170,8 +244,13 @@ class OpenLoopInference:
                     f"B3a vocabulary has {vocabulary.shape[1]} steps but scorer expects "
                     f"{profile_steps}"
                 )
+            scorer_loader = (
+                load_trajectory_scene_scorer
+                if selection_mode == "scene_score"
+                else load_velocity_scorer
+            )
             self.velocity_scorer = (
-                load_velocity_scorer(checkpoint, self.device)
+                scorer_loader(checkpoint, self.device)
                 .eval()
                 .requires_grad_(False)
             )
@@ -179,7 +258,8 @@ class OpenLoopInference:
                 vocabulary.astype(np.float32, copy=False)
             ).to(self.device)
             LOG.info(
-                "Loaded B3a velocity scorer from %s with vocabulary %s",
+                "Loaded B3a %s scorer from %s with vocabulary %s",
+                selection_mode,
                 scorer_path,
                 vocabulary_path,
             )
@@ -297,66 +377,230 @@ class OpenLoopInference:
                     )
                     raw_target_speed_scalar = pred_target_speed_scalar.clone()
                     selection_mode = self.config_training.route_velocity_selection_mode
-                    if selection_mode not in {"gate", "profile_select"}:
+                    if selection_mode not in {
+                        "gate",
+                        "profile_select",
+                        "scene_score",
+                    }:
                         raise ValueError(
-                            "route_velocity_selection_mode must be 'gate' or 'profile_select'"
+                            "invalid route_velocity_selection_mode"
                         )
-                    if selection_mode == "profile_select" and (
+                    if selection_mode in {"profile_select", "scene_score"} and (
                         resolve_route_selection_mode(self.config_training)
                         != "confidence"
                         or not self.config_training.predict_spatial_path
                     ):
                         raise ValueError(
-                            "profile_select requires route_selection_mode='confidence' "
+                            f"{selection_mode} requires route_selection_mode='confidence' "
                             "and predict_spatial_path=True"
                         )
-                    velocity_selector = (
-                        select_velocity_profile
-                        if selection_mode == "profile_select"
-                        else apply_velocity_scorer_gate
-                    )
-                    selector_kwargs = dict(
-                        safe_threshold=float(
-                            self.config_training.route_velocity_safe_threshold
-                        ),
-                        interval_s=float(
-                            self.config_training.route_velocity_profile_interval_s
-                        ),
+                    if selection_mode == "scene_score":
+                        if prediction.pred_scene_tokens is None:
+                            raise RuntimeError(
+                                "scene_score requires planner scene tokens"
+                            )
+                        candidates, valid = build_velocity_candidates(
+                            current_speed,
+                            raw_target_speed_scalar,
+                            self.velocity_vocabulary,
+                            interval_s=float(
+                                self.config_training.route_velocity_profile_interval_s
+                            ),
+                            max_accel_mps2=float(
+                                self.config_training.route_velocity_max_accel_mps2
+                            ),
+                            max_decel_mps2=float(
+                                self.config_training.route_velocity_max_decel_mps2
+                            ),
+                            full_profile_reachability=True,
+                        )
+                        candidate_states = build_trajectory_candidate_states(
+                            prediction.pred_route[:1].float(),
+                            candidates,
+                            current_speed,
+                            interval_s=float(
+                                self.config_training.route_velocity_profile_interval_s
+                            ),
+                        )
+                        scene_tokens = compress_planner_scene_tokens(
+                            prediction.pred_scene_tokens[:1].float(),
+                            spatial_shape=(
+                                self.config_training.lidar_vert_anchors,
+                                self.config_training.lidar_horz_anchors,
+                            ),
+                            has_intent_tokens=self.config_training.use_control_conditioning,
+                        )
+                        logits = self.velocity_scorer(
+                            candidate_states.to(torch.float16).float(),
+                            scene_tokens.to(torch.float16).float(),
+                            valid,
+                        )
+                        score_selection = select_scene_scored_trajectory(
+                            logits,
+                            valid,
+                            collision_free_threshold=float(
+                                self.config_training.route_velocity_scene_collision_free_threshold
+                            ),
+                            ttc_threshold=float(
+                                self.config_training.route_velocity_scene_ttc_threshold
+                            ),
+                        )
+                        selected_index = score_selection.selected_index
+                        rows = torch.arange(len(selected_index), device=self.device)
+                        selected_profile = candidates[rows, selected_index]
+                        pred_target_speed_scalar = (
+                            2.0 * selected_profile[:, :1]
+                            - current_speed[:, None]
+                        ).clamp_min(0.0)
+                        collision_risk = 1.0 - score_selection.scores[
+                            "collision_free"
+                        ]
+                        utility = (
+                            0.65 * score_selection.scores["progress"]
+                            + 0.25 * score_selection.scores["comfort"]
+                            + 0.10 * score_selection.scores["imitation"]
+                        )
+                        velocity_raw_risk = collision_risk[:, 0]
+                        velocity_selected_risk = collision_risk[rows, selected_index]
+                        velocity_selected_index = selected_index
+                        velocity_switched = selected_index != 0
+                        velocity_fallback = score_selection.fallback
+                        velocity_candidate_profiles = candidates
+                        velocity_candidate_valid = valid
+                        velocity_candidate_preference = utility
+                        velocity_candidate_risk = collision_risk
+                        velocity_selected_profile = selected_profile
+                    else:
+                        velocity_selector = (
+                            select_velocity_profile
+                            if selection_mode == "profile_select"
+                            else apply_velocity_scorer_gate
+                        )
+                        selector_kwargs = dict(
+                            safe_threshold=float(
+                                self.config_training.route_velocity_safe_threshold
+                            ),
+                            interval_s=float(
+                                self.config_training.route_velocity_profile_interval_s
+                            ),
+                            max_accel_mps2=float(
+                                self.config_training.route_velocity_max_accel_mps2
+                            ),
+                            max_decel_mps2=float(
+                                self.config_training.route_velocity_max_decel_mps2
+                            ),
+                        )
+                        if selection_mode == "gate":
+                            selector_kwargs["unsafe_threshold"] = float(
+                                self.config_training.route_velocity_unsafe_threshold
+                            )
+                        velocity_gate = velocity_selector(
+                            self.velocity_scorer,
+                            route_feature,
+                            current_speed,
+                            raw_target_speed_scalar,
+                            self.velocity_vocabulary,
+                            **selector_kwargs,
+                        )
+                        pred_target_speed_scalar = velocity_gate.target_speed.reshape_as(
+                            pred_target_speed_scalar
+                        )
+                        velocity_raw_risk = velocity_gate.raw_risk
+                        velocity_selected_risk = velocity_gate.selected_risk
+                        velocity_selected_index = velocity_gate.selected_index
+                        velocity_switched = velocity_gate.switched
+                        velocity_fallback = velocity_gate.fallback
+                        velocity_candidate_profiles = velocity_gate.candidate_velocity
+                        velocity_candidate_valid = velocity_gate.candidate_valid
+                        velocity_candidate_preference = velocity_gate.preference
+                        velocity_candidate_risk = velocity_gate.risk
+                        if selection_mode == "profile_select":
+                            velocity_selected_profile = velocity_gate.candidate_velocity[
+                                0, velocity_gate.selected_index[0]
+                            ][None]
+
+                if self.config_training.route_predicted_actor_velocity_gate:
+                    if data is None or "speed" not in data:
+                        raise RuntimeError("predicted-actor gate requires current speed")
+                    prediction = predictions[0]
+                    if (
+                        prediction.pred_bounding_box is None
+                        or prediction.pred_route is None
+                    ):
+                        raise RuntimeError("predicted-actor gate requires boxes and route")
+                    current_speed = data["speed"].to(self.device).float().reshape(-1)[:1]
+                    raw_target_speed_scalar = pred_target_speed_scalar.clone()
+                    candidates, valid = build_velocity_candidates(
+                        current_speed,
+                        raw_target_speed_scalar,
+                        self.predicted_actor_velocity_vocabulary,
+                        interval_s=0.25,
                         max_accel_mps2=float(
                             self.config_training.route_velocity_max_accel_mps2
                         ),
                         max_decel_mps2=float(
                             self.config_training.route_velocity_max_decel_mps2
                         ),
+                        full_profile_reachability=True,
                     )
-                    if selection_mode == "gate":
-                        selector_kwargs["unsafe_threshold"] = float(
-                            self.config_training.route_velocity_unsafe_threshold
-                        )
-                    velocity_gate = velocity_selector(
-                        self.velocity_scorer,
-                        route_feature,
+                    states = build_trajectory_candidate_states(
+                        prediction.pred_route[:1].float(),
+                        candidates,
                         current_speed,
-                        raw_target_speed_scalar,
-                        self.velocity_vocabulary,
-                        **selector_kwargs,
+                        interval_s=0.25,
                     )
-                    pred_target_speed_scalar = velocity_gate.target_speed.reshape_as(
-                        pred_target_speed_scalar
+                    boxes = carla_dataset_utils.bb_image_to_vehicle_system(
+                        prediction.pred_bounding_box.pred_bounding_box_image_system[0],
+                        self.config_training.pixels_per_meter,
+                        self.config_training.min_x_meter,
+                        self.config_training.min_y_meter,
                     )
-                    velocity_raw_risk = velocity_gate.raw_risk
-                    velocity_selected_risk = velocity_gate.selected_risk
-                    velocity_selected_index = velocity_gate.selected_index
-                    velocity_switched = velocity_gate.switched
-                    velocity_fallback = velocity_gate.fallback
-                    velocity_candidate_profiles = velocity_gate.candidate_velocity
-                    velocity_candidate_valid = velocity_gate.candidate_valid
-                    velocity_candidate_preference = velocity_gate.preference
-                    velocity_candidate_risk = velocity_gate.risk
-                    if selection_mode == "profile_select":
-                        velocity_selected_profile = velocity_gate.candidate_velocity[
-                            0, velocity_gate.selected_index[0]
-                        ][None]
+                    actors = extrapolate_detected_actors(
+                        boxes,
+                        score_threshold=float(
+                            self.config_training.route_predicted_actor_score_threshold
+                        ),
+                        nms_iou_threshold=float(
+                            self.config_training.route_predicted_actor_nms_iou_threshold
+                        ),
+                    )
+                    collision = predicted_candidate_collisions(
+                        states[0].detach().float().cpu().numpy(),
+                        valid[0].detach().cpu().numpy(),
+                        actors,
+                        safety_margin_m=float(
+                            self.config_training.route_predicted_actor_safety_margin_m
+                        ),
+                    )
+                    selected = select_safe_slowdown(
+                        valid[0].detach().cpu().numpy(),
+                        collision,
+                        candidates[0].detach().float().cpu().numpy(),
+                    )
+                    velocity_selected_index = torch.tensor(
+                        [selected], device=self.device
+                    )
+                    velocity_switched = velocity_selected_index != 0
+                    velocity_fallback = torch.tensor(
+                        [bool(collision[0]) and selected == 0], device=self.device
+                    )
+                    velocity_candidate_profiles = candidates
+                    velocity_candidate_valid = valid
+                    velocity_candidate_risk = torch.from_numpy(
+                        collision.astype(np.float32)
+                    ).to(self.device)[None]
+                    velocity_candidate_preference = (
+                        candidates.clamp_min(0).sum(-1) * 0.25
+                    )
+                    velocity_raw_risk = velocity_candidate_risk[:, 0]
+                    velocity_selected_risk = velocity_candidate_risk[:, selected]
+                    velocity_selected_profile = candidates[:, selected]
+                    if selected != 0:
+                        # Match the existing profile-select controller contract.
+                        pred_target_speed_scalar = (
+                            2.0 * velocity_selected_profile[:, :1]
+                            - current_speed[:, None]
+                        ).clamp_min(0.0)
 
                 if self.config_training.route_speed_safety_gate:
                     risks = [pred.pred_route_collision_risk for pred in predictions]

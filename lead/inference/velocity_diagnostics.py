@@ -57,6 +57,42 @@ def build_velocity_diagnostic_record(
     if risk_tensor is None:
         return None
 
+    if selection_mode == "predicted_actor_gate":
+        # The geometric gate produces deterministic 0/1 collision flags, not
+        # learned probabilities. Avoid serializing all 65 profiles every tick:
+        # doing so adds CPU synchronization and large JSON writes in CARLA.
+        return {
+            "schema_version": 2,
+            "step": int(step),
+            "selection_mode": selection_mode,
+            "current_speed_mps": float(current_speed_mps),
+            "raw_target_speed_mps": _scalar(prediction.raw_target_speed_scalar),
+            "selected_target_speed_mps": _scalar(prediction.pred_target_speed_scalar),
+            "selected_index": int(_scalar(prediction.velocity_selected_index)),
+            "switched": bool(_scalar(prediction.velocity_switched)),
+            "fallback": bool(_scalar(prediction.velocity_fallback)),
+            "predicted_raw_collision": bool(_scalar(prediction.velocity_raw_risk)),
+            "predicted_selected_collision": bool(
+                _scalar(prediction.velocity_selected_risk)
+            ),
+            "valid_candidate_count": int(
+                prediction.velocity_candidate_valid.detach().sum().item()
+            ),
+            "selected_profile_mps": _single_batch_list(
+                prediction.velocity_selected_profile
+            ),
+            "controller": {
+                "target_speed_pid_steer": _scalar(prediction.route_steer),
+                "target_speed_pid_throttle": _scalar(prediction.target_speed_throttle),
+                "target_speed_pid_brake": _scalar(prediction.target_speed_brake),
+                "final_steer": float(final_steer),
+                "final_throttle": float(final_throttle),
+                "final_brake": float(final_brake),
+                "stuck_detector": int(stuck_detector),
+                "force_move_remaining": int(force_move_remaining),
+            },
+        }
+
     candidate_risk = risk_tensor.detach().float().cpu()
     candidate_valid = prediction.velocity_candidate_valid.detach().bool().cpu()
     candidate_preference = (

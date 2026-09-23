@@ -88,6 +88,23 @@ def test_online_raw_candidate_matches_feature_extraction_profile():
     assert valid[:, 0].all()
 
 
+def test_velocity_vocabulary_rejects_unreachable_later_jump():
+    current = torch.tensor([3.0])
+    target = torch.tensor([3.0])
+    vocabulary = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 3.0, 3.0, 3.0, 3.0, 3.0],
+            [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4],
+        ]
+    )
+    _, valid = build_velocity_candidates(
+        current, target, vocabulary, full_profile_reachability=True
+    )
+    # Candidate zero is always the raw fallback; the first residual candidate
+    # jumps by 12 m/s^2 halfway through and must no longer reach the scorer.
+    torch.testing.assert_close(valid, torch.tensor([[True, False, True]]))
+
+
 class _FixedVelocityScorer(torch.nn.Module):
     def __init__(self, preference: torch.Tensor, risk: torch.Tensor):
         super().__init__()
