@@ -96,16 +96,34 @@ def select_safe_slowdown(
     candidate_velocity: np.ndarray,
     *,
     distance_tolerance_m: float = 0.25,
+    current_speed_mps: float | None = None,
+    raw_target_speed_mps: float | None = None,
+    near_target_tolerance_mps: float = 0.01,
 ) -> int:
-    """Keep raw profile unless predicted unsafe; take fastest safe slowdown."""
+    """Keep raw unless unsafe; take the fastest safe, controller-safe slowdown.
+
+    When current/target speeds are supplied, the actual first-interval PID target
+    must not exceed the model's raw target. A two-second distance cap alone does
+    not guarantee this for profiles that brake late. A raw brake command is
+    always preserved, even if the raw profile is predicted to collide.
+    """
 
     valid = np.asarray(candidate_valid, dtype=bool)
     collision = np.asarray(candidate_collision, dtype=bool)
     velocity = np.asarray(candidate_velocity, dtype=np.float32)
+    if (current_speed_mps is None) != (raw_target_speed_mps is None):
+        raise ValueError("current and raw target speeds must be provided together")
+    if near_target_tolerance_mps < 0:
+        raise ValueError("near-target tolerance must be nonnegative")
     if not valid[0] or not collision[0]:
+        return 0
+    if raw_target_speed_mps is not None and raw_target_speed_mps <= 0.01:
         return 0
     distance = velocity.clip(min=0).sum(axis=1) * float(FUTURE_TIMES_S[0])
     allowed = valid & ~collision & (distance <= distance[0] + distance_tolerance_m)
+    if raw_target_speed_mps is not None:
+        near_target = np.maximum(2.0 * velocity[:, 0] - current_speed_mps, 0.0)
+        allowed &= near_target <= raw_target_speed_mps + near_target_tolerance_mps
     if not allowed.any():
         return 0
     return int(np.where(allowed, distance, -np.inf).argmax())

@@ -13,10 +13,24 @@ collision-free and does not travel farther than the raw candidate over 2 s.
 If no such candidate exists, it retains candidate zero. No learned scorer or
 GT future actor state is used to make the decision.
 
+The guarded closed-loop variant additionally preserves any raw brake command
+and rejects alternatives whose first-interval PID target exceeds the raw
+target speed. This matters because a profile can have less *total* distance
+over 2 s while initially accelerating harder than the raw model command.
+
 On a GPU machine, from the lead repository root:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 bash scripts/p4/eval_b3a_predicted_actor_gate.sh
+```
+
+To re-evaluate the controller-speed guard without overwriting the original
+report, reuse the cached detections and write a separate report:
+
+```bash
+B3A_PRED_ACTOR_REPORT_STEM=predicted_actor_gate_speed_guard \
+  CUDA_VISIBLE_DEVICES=0 bash scripts/p4/eval_b3a_predicted_actor_gate.sh \
+  --controller-speed-guard --score-thresholds 0.5
 ```
 
 The default sample is 5,000 evenly spaced held-out feature frames, covering
@@ -41,7 +55,7 @@ used only for evaluation.
 
 ## 5,000-frame result and failure taxonomy
 
-With the 0.50 detection threshold, the raw candidate collides in 143/5000
+For the original, unguarded 0.50 policy, the raw candidate collides in 143/5000
 frames (2.86%); predicted-actor selection leaves 117/5000 (2.34%), versus
 60/5000 (1.20%) for the GT-actor oracle. It switches 63 frames, rescues 26,
 and introduces no new GT collisions in this sample. Mean velocity-profile MAE
@@ -64,6 +78,16 @@ and four switch to another candidate that still collides with a GT actor.
 There are 33 switches on GT-safe raw frames, but none introduces a collision
 in this sample. The audit JSON contains example frame keys for each group.
 
+After adding the controller-speed guard, the same 5,000 frames at threshold
+0.50 have 143 raw GT collisions, 119 selected GT collisions (24 rescued),
+60 switches, 32 false switches and zero introduced GT collisions. The guarded
+GT oracle leaves 70 collisions; its floor changes because unsafe-for-control
+speedups are no longer eligible. Mean profile MAE changes from 1.08216 to
+1.08210 m/s. The original unguarded gate selected 117 collisions and 63
+switches, so the brake-preserving rule gives up two open-loop rescues in
+exchange for a non-increasing PID target. The guarded audit is saved as
+`predicted_actor_gate_speed_guard.json` alongside the original report.
+
 ## Optional closed-loop A/B
 
 The deployable gate is disabled by default and needs no learned scorer weight.
@@ -82,7 +106,7 @@ Then run the same checkpoint and routes for both arms, using distinct tags:
 
 ```bash
 bash scripts/p4/eval_b3a_predicted_actor_baseline_local.sh <corridor-checkpoint-dir> "0 1 2 3 4 5 6 7" b3a_actor_baseline
-bash scripts/p4/eval_b3a_predicted_actor_gate_local.sh <corridor-checkpoint-dir> "0 1 2 3 4 5 6 7" b3a_actor_gate_050
+bash scripts/p4/eval_b3a_predicted_actor_gate_local.sh <corridor-checkpoint-dir> "0 1 2 3 4 5 6 7" b3a_actor_gate_050_speed_guard
 ```
 
 Do not run both arms simultaneously on the same CARLA ports/GPUs. Compare

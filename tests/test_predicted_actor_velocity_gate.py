@@ -3,6 +3,7 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from lead.tfv6.predicted_actor_velocity_gate import (
@@ -34,6 +35,42 @@ def test_low_confidence_detection_does_not_trigger_gate():
     assert actors.num_actors == 0
 
 
+def test_controller_guard_excludes_late_braking_profile_and_preserves_raw_brake():
+    velocity = np.asarray(
+        [
+            [4.0] * 8,  # raw
+            [5.0] + [3.5] * 7,  # shorter distance, but fast first tick
+            [3.5] * 8,  # genuine slowdown
+        ],
+        dtype=np.float32,
+    )
+    valid = np.ones(3, dtype=bool)
+    collision = np.asarray([True, False, False])
+    assert select_safe_slowdown(valid, collision, velocity) == 1
+    assert (
+        select_safe_slowdown(
+            valid,
+            collision,
+            velocity,
+            current_speed_mps=4.0,
+            raw_target_speed_mps=4.0,
+        )
+        == 2
+    )
+    assert (
+        select_safe_slowdown(
+            valid,
+            collision,
+            velocity,
+            current_speed_mps=4.0,
+            raw_target_speed_mps=0.0,
+        )
+        == 0
+    )
+    with pytest.raises(ValueError, match="provided together"):
+        select_safe_slowdown(valid, collision, velocity, current_speed_mps=4.0)
+
+
 def test_predicted_actor_audit_runs_on_cached_candidates(tmp_path, monkeypatch):
     from scripts.p4.eval_b3a_predicted_actor_gate import main
 
@@ -54,6 +91,8 @@ def test_predicted_actor_audit_runs_on_cached_candidates(tmp_path, monkeypatch):
         candidate_velocity=velocity,
         collision=np.asarray([[True, False], [False, False]]),
         imitation_error=np.asarray([[0.1, 2.0], [0.1, 2.0]]),
+        current_speed=np.asarray([8.0, 8.0]),
+        raw_target_speed=np.asarray([8.0, 8.0]),
     )
     boxes = np.asarray(
         [
@@ -82,6 +121,7 @@ def test_predicted_actor_audit_runs_on_cached_candidates(tmp_path, monkeypatch):
             str(output),
             "--score-thresholds",
             "0.3",
+            "--controller-speed-guard",
         ],
     )
     main()
@@ -90,6 +130,7 @@ def test_predicted_actor_audit_runs_on_cached_candidates(tmp_path, monkeypatch):
     assert result["oracle_gt_collision_rate"] == 0.0
     assert result["selected_gt_collision_rate"] == 0.0
     assert result["switch_rate"] == 0.5
+    assert json.loads(output.read_text())["controller_speed_guard"] is True
 
 
 def test_closed_loop_gate_keeps_path_and_selects_only_safe_slowdown():

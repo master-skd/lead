@@ -528,7 +528,9 @@ class OpenLoopInference:
                         or prediction.pred_route is None
                     ):
                         raise RuntimeError("predicted-actor gate requires boxes and route")
-                    current_speed = data["speed"].to(self.device).float().reshape(-1)[:1]
+                    current_speed = (
+                        data["speed"].to(self.device).float().reshape(-1)[:1]
+                    ).clamp_min(0.0)
                     raw_target_speed_scalar = pred_target_speed_scalar.clone()
                     candidates, valid = build_velocity_candidates(
                         current_speed,
@@ -576,6 +578,8 @@ class OpenLoopInference:
                         valid[0].detach().cpu().numpy(),
                         collision,
                         candidates[0].detach().float().cpu().numpy(),
+                        current_speed_mps=float(current_speed[0].item()),
+                        raw_target_speed_mps=float(raw_target_speed_scalar[0, 0].item()),
                     )
                     velocity_selected_index = torch.tensor(
                         [selected], device=self.device
@@ -596,11 +600,15 @@ class OpenLoopInference:
                     velocity_selected_risk = velocity_candidate_risk[:, selected]
                     velocity_selected_profile = candidates[:, selected]
                     if selected != 0:
-                        # Match the existing profile-select controller contract.
-                        pred_target_speed_scalar = (
+                        # The selector enforces this ceiling; clamp as a final
+                        # safeguard against fp16/float32 rounding differences.
+                        near_target = (
                             2.0 * velocity_selected_profile[:, :1]
                             - current_speed[:, None]
                         ).clamp_min(0.0)
+                        pred_target_speed_scalar = torch.minimum(
+                            near_target, raw_target_speed_scalar
+                        )
 
                 if self.config_training.route_speed_safety_gate:
                     risks = [pred.pred_route_collision_risk for pred in predictions]

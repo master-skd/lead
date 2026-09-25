@@ -5,7 +5,7 @@ set -euo pipefail
 
 CHECKPOINT_DIR="${1:?provide the corridor checkpoint directory}"
 GPU_LIST="${2:-0}"
-OUTPUT_TAG="${3:-b3a_predicted_actor_gate_050}"
+OUTPUT_TAG="${3:-b3a_actor_gate_050_speed_guard}"
 VOCABULARY="${B3A_PRED_ACTOR_VOCABULARY:-outputs/local_training/p5_stepB3a_v2_dense_data/relative_velocity_vocab/relative_velocity_vocab_k64.npy}"
 
 if [[ ! -f "${VOCABULARY}" ]]; then

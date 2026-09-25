@@ -32,7 +32,10 @@ def _load_predicted_boxes(path: Path) -> tuple[dict[str, np.ndarray], str]:
 
 
 def _load_sample_features(
-    path: Path, boxes_by_key: dict[str, np.ndarray]
+    path: Path,
+    boxes_by_key: dict[str, np.ndarray],
+    *,
+    controller_speed_guard: bool = False,
 ) -> list[dict]:
     frames = []
     matched = set()
@@ -49,6 +52,8 @@ def _load_sample_features(
                 "collision",
                 "imitation_error",
             )
+            if controller_speed_guard:
+                fields += ("current_speed", "raw_target_speed")
             selected = {name: shard[name][indices] for name in fields}
             for row, index in enumerate(indices):
                 key = str(keys[index])
@@ -125,6 +130,11 @@ def main() -> None:
     parser.add_argument("--score-thresholds", default="0.3,0.5,0.7")
     parser.add_argument("--nms-iou-threshold", type=float, default=0.5)
     parser.add_argument("--safety-margin", type=float, default=0.2)
+    parser.add_argument(
+        "--controller-speed-guard",
+        action="store_true",
+        help="preserve raw brake and forbid PID target speed above the raw command",
+    )
     args = parser.parse_args()
     thresholds = [float(item) for item in args.score_thresholds.split(",")]
     if not thresholds or any(not 0 < value < 1 for value in thresholds):
@@ -139,15 +149,25 @@ def main() -> None:
 
     predicted_box_dir = Path(args.predicted_box_dir)
     boxes_by_key, checkpoint = _load_predicted_boxes(predicted_box_dir)
-    frames = _load_sample_features(Path(args.feature_cache_dir), boxes_by_key)
+    frames = _load_sample_features(
+        Path(args.feature_cache_dir),
+        boxes_by_key,
+        controller_speed_guard=args.controller_speed_guard,
+    )
     output = {
         "source_checkpoint": checkpoint,
         "feature_cache": str(Path(args.feature_cache_dir).resolve()),
         "predicted_box_cache": str(predicted_box_dir.resolve()),
         "actor_motion_model": "constant speed along detected yaw over eight 0.25 s steps",
-        "selection": "keep raw unless predicted collision; fastest predicted-safe slowdown",
+        "selection": (
+            "keep raw brake; otherwise fastest predicted-safe slowdown with "
+            "non-increasing PID target"
+            if args.controller_speed_guard
+            else "keep raw unless predicted collision; fastest predicted-safe slowdown"
+        ),
         "safety_margin_m": args.safety_margin,
         "nms_iou_threshold": args.nms_iou_threshold,
+        "controller_speed_guard": args.controller_speed_guard,
         "threshold_sweep": [],
     }
     frame_details = {"keys": np.asarray([frame["key"] for frame in frames])}
@@ -168,8 +188,20 @@ def main() -> None:
                 safety_margin_m=args.safety_margin,
             )
             velocity = frame["candidate_velocity"]
-            selected_index = select_safe_slowdown(valid, predicted, velocity)
-            oracle_index = select_safe_slowdown(valid, ground_truth, velocity)
+            selection_kwargs = (
+                {
+                    "current_speed_mps": float(frame["current_speed"]),
+                    "raw_target_speed_mps": float(frame["raw_target_speed"]),
+                }
+                if args.controller_speed_guard
+                else {}
+            )
+            selected_index = select_safe_slowdown(
+                valid, predicted, velocity, **selection_kwargs
+            )
+            oracle_index = select_safe_slowdown(
+                valid, ground_truth, velocity, **selection_kwargs
+            )
             progress = velocity.astype(np.float32).clip(min=0).sum(1) * 0.25
             records.append(
                 {
