@@ -523,6 +523,8 @@ def main() -> None:
     frame_path = output.with_suffix(".frames.npz")
     np.savez_compressed(frame_path, **arrays, **selected)
     report = {
+        "start": args.start,
+        "end": end,
         "n_frames": n,
         "candidate_shape": [k_count, m_count],
         "original_path_count": original_path_count,

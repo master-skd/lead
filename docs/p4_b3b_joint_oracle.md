@@ -84,3 +84,23 @@ then check whether reachable-only gains require acceleration beyond the raw
 target. Collision labels are exhaustive only on raw-unsafe frames; the
 `.frames.npz` file includes `collision_evaluated` to identify tested entries.
 Raw-safe frames keep the raw trajectory and need no counterfactual scoring.
+
+For the same local-Path audit on eight GPUs, split the held-out interval into
+contiguous shards. The driver gives each worker one GPU, then concatenates the
+per-frame NPZ records and recomputes global rates and progress quantiles (it
+does not average shard-level percentages). For example:
+
+```bash
+B3B_GPU_LIST=0,1,2,3,4,5,6,7 B3B_VOCAB_K=16 \
+  B3B_OUTPUT=outputs/local_training/p5_stepB3b_joint_oracle/joint_k16_local_8gpu.json \
+  bash scripts/p4/eval_b3b_joint_oracle_8gpu.sh
+```
+
+Change `B3B_VOCAB_K` to `32` or `64` and give each run a distinct
+`B3B_OUTPUT` filename. `B3B_START`/`B3B_LIMIT` default to `0`/`5000`;
+`B3B_LOCAL_OFFSETS` defaults to `-1.5,-0.75,0.75,1.5`. The merged JSON and
+same-stem `.frames.npz` appear at `B3B_OUTPUT`; individual shards and logs
+are under its `shards/` subdirectory. If any worker fails, there is no merge;
+check its log, then rerun. `B3B_CPU_THREADS` defaults to 4 per worker. Each
+worker loads its own copy of the model and dataset, so shared-storage
+throughput may limit the speedup. No gpu-burn is started.
