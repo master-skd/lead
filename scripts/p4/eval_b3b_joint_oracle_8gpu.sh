@@ -75,3 +75,5 @@ done
 trap - INT TERM
 if (( failed )); then exit 1; fi
 "${LEAD_PYTHON}" scripts/p4/merge_b3b_joint_oracle.py --out "${OUT}" "${SHARDS[@]}"
+"${LEAD_PYTHON}" scripts/p4/audit_b3b_local_paths.py \
+    --report "${OUT}" --out "${OUT%.json}.feasibility.json"

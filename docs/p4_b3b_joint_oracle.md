@@ -104,3 +104,41 @@ are under its `shards/` subdirectory. If any worker fails, there is no merge;
 check its log, then rerun. `B3B_CPU_THREADS` defaults to 4 per worker. Each
 worker loads its own copy of the model and dataset, so shared-storage
 throughput may limit the speedup. No gpu-burn is started.
+
+## B3b-2: nested vocabulary and local-Path feasibility screen
+
+K32 was fitted independently of K16 and is **not** a superset. On the matched
+5,000 frames, conservative expanded rescue fell from 91/164 (K16) to 58/164
+(K32). The per-frame union of their rescue sets is 95/164, so the additional
+coverage from K32 is small. Keep all K16 centers when expanding the vocabulary:
+
+```bash
+LEAD_PYTHON=/mmu_mllm_hdd_3/liuzihan08/miniconda3/envs/lead/bin/python
+DENSE_ROOT=outputs/local_training/p5_stepB3a_v2_dense_data
+NESTED_VOCAB="${DENSE_ROOT}/relative_velocity_vocab/relative_velocity_vocab_k16_plus_k32.npy"
+"${LEAD_PYTHON}" scripts/p4/build_b3b_nested_velocity_vocab.py \
+  --out "${NESTED_VOCAB}" \
+  "${DENSE_ROOT}/relative_velocity_vocab/relative_velocity_vocab_k16.npy" \
+  "${DENSE_ROOT}/relative_velocity_vocab/relative_velocity_vocab_k32.npy"
+
+B3B_GPU_LIST=0,1,2,3,4,5,6,7 B3B_VOCAB_PATH="${NESTED_VOCAB}" \
+  B3B_OUTPUT=outputs/local_training/p5_stepB3b_joint_oracle/joint_nested_k16_k32_local_8gpu.json \
+  bash scripts/p4/eval_b3b_joint_oracle_8gpu.sh
+```
+
+The combined vocabulary has 48 residual centers, and the oracle adds its raw
+profile for 49 speed candidates per Path. The 8-GPU driver also writes a
+same-stem `.feasibility.json`. It screens incremental local-Path rescues for
+at least 1 m of two-second progress, prefix curvature, a conservative
+`max(speed)^2 * max(curvature)` lateral-acceleration proxy, and per-point
+off-corridor cost from **predicted Visual Intent**. Thresholds in this audit
+are diagnostic flags, not certified vehicle limits. It does not check true
+road occupancy or closed-loop controller tracking. Because the nested file
+records its K16 prefix, the audit also reselects the K16-only candidates
+from the same forward pass and labels them `*_base_k16`; this avoids a
+separate, potentially mismatched baseline run. For moving rescues it also
+rechecks the SAT collision after limiting the ego box's yaw change from the
+current heading to 30 or 60 degrees/second, while keeping the candidate's
+positions unchanged. A collision appearing only after this check suggests
+the original oracle relied on an instantaneous heading change; passing it
+still does not prove the steering controller can follow the path.

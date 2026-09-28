@@ -9,15 +9,20 @@ DENSE_ROOT="${B3B_DENSE_ROOT:-${REPO_ROOT}/outputs/local_training/p5_stepB3a_v2_
 CKPT_DIR="${B3B_CKPT_DIR:-${REPO_ROOT}/outputs/local_training/p5_stepB2_corridor}"
 OUT="${B3B_OUTPUT:-${REPO_ROOT}/outputs/local_training/p5_stepB3b_joint_oracle/joint_oracle.json}"
 VOCAB_K="${B3B_VOCAB_K:-16}"
-case "${VOCAB_K}" in
-    16|32|64) ;;
-    *) echo "B3B_VOCAB_K must be 16, 32 or 64" >&2; exit 2 ;;
-esac
+if [[ -n "${B3B_VOCAB_PATH:-}" ]]; then
+    VOCAB_PATH="${B3B_VOCAB_PATH}"
+else
+    case "${VOCAB_K}" in
+        16|32|64) ;;
+        *) echo "B3B_VOCAB_K must be 16, 32 or 64" >&2; exit 2 ;;
+    esac
+    VOCAB_PATH="${DENSE_ROOT}/relative_velocity_vocab/relative_velocity_vocab_k${VOCAB_K}.npy"
+fi
 
 for required in \
     "${CKPT_DIR}/model_0019.pth" \
     "${DENSE_ROOT}/route_split/heldout.jsonl" \
-    "${DENSE_ROOT}/relative_velocity_vocab/relative_velocity_vocab_k${VOCAB_K}.npy"; do
+    "${VOCAB_PATH}"; do
     if [[ ! -f "${required}" ]]; then
         echo "missing B3b input: ${required}" >&2
         exit 1
@@ -34,6 +39,6 @@ cd "${REPO_ROOT}"
     --manifest "${DENSE_ROOT}/route_split/heldout.jsonl" \
     --nearest-vlm-manifest "${B3B_NEAREST_VLM_MANIFEST:-${REPO_ROOT}/data/p4/manifest.jsonl}" \
     --future-cache-dir "${DENSE_ROOT}/future_actor_cache/heldout_future_actors" \
-    --velocity-vocab "${DENSE_ROOT}/relative_velocity_vocab/relative_velocity_vocab_k${VOCAB_K}.npy" \
+    --velocity-vocab "${VOCAB_PATH}" \
     --out "${OUT}" \
     "$@"

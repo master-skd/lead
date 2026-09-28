@@ -289,6 +289,7 @@ def main() -> None:
         "key", "winner", "multi", "raw_collision", "raw_progress", "raw_target_speed", "route_valid",
         "direction_ok", "corridor_cost", "candidate_valid", "candidate_collision",
         "collision_evaluated", "candidate_progress", "candidate_pid_target", "route_length", "route_ade",
+        "routes", "corridor_points", "candidate_velocity",
     )}
     for data in tqdm(loader, desc=f"B3b joint oracle {args.start}:{end}"):
         data.pop("anchor", None)  # extract live anchors from the predicted intent blob
@@ -335,12 +336,13 @@ def main() -> None:
         ), axis=1)
         routes_tensor = torch.as_tensor(routes, device=original_routes_tensor.device)
         direction_ok = expert_direction_mask(routes, expert, args.max_expert_heading_error_deg)
-        corridor = corridor_cost_per_point(
+        corridor_points = corridor_cost_per_point(
             routes_tensor.float(),
             torch.sigmoid(intent_tensor.float()),
             config,
             reach_m=float(config.route_corridor_reach_m),
-        ).mean(dim=-1).float().cpu().numpy()
+        ).float().cpu().numpy()
+        corridor = corridor_points.mean(axis=-1)
         route_ade = np.linalg.norm(routes - expert[:, None], axis=-1).mean(axis=-1)
         current = data["speed"].float().reshape(-1).clamp_min(0)
         raw_target = prediction.pred_target_speed_scalar.float().reshape(-1).cpu()
@@ -414,6 +416,9 @@ def main() -> None:
                 ), axis=-1).sum(axis=-1)
             )
             records["route_ade"].append(route_ade[b])
+            records["routes"].append(routes[b].astype(np.float32))
+            records["corridor_points"].append(corridor_points[b].astype(np.float32))
+            records["candidate_velocity"].append(candidate[b].astype(np.float32))
 
     arrays = {name: np.asarray(value) for name, value in records.items()}
     n, k_count, m_count = arrays["candidate_collision"].shape
