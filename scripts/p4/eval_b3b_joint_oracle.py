@@ -16,6 +16,36 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+
+def local_path_variants(
+    winner_routes: np.ndarray, offsets_m: tuple[float, ...], ramp_m: float = 8.0
+) -> np.ndarray:
+    """Smooth ego-anchored lateral offsets of the selected geometric path."""
+
+    routes = np.asarray(winner_routes, dtype=np.float32)
+    if routes.ndim != 3 or routes.shape[-1] != 2 or routes.shape[1] < 2:
+        raise ValueError("winner routes must have shape [B,N>=2,2]")
+    if ramp_m <= 0:
+        raise ValueError("ramp_m must be positive")
+    if not offsets_m:
+        return np.empty((len(routes), 0, routes.shape[1], 2), dtype=np.float32)
+    path = np.concatenate((np.zeros_like(routes[:, :1]), routes), axis=1)
+    segments = np.diff(path, axis=1)
+    lengths = np.linalg.norm(segments, axis=-1)
+    arc = np.cumsum(lengths, axis=1)
+    tangent = np.zeros_like(routes)
+    tangent[:, 0] = segments[:, 0]
+    tangent[:, -1] = segments[:, -1]
+    if routes.shape[1] > 2:
+        tangent[:, 1:-1] = segments[:, :-2] + segments[:, 1:-1]
+    tangent /= np.maximum(np.linalg.norm(tangent, axis=-1, keepdims=True), 1e-6)
+    normal = np.stack((-tangent[..., 1], tangent[..., 0]), axis=-1)
+    u = np.clip(arc / float(ramp_m), 0.0, 1.0)
+    ramp = u * u * (3.0 - 2.0 * u)
+    offsets = np.asarray(offsets_m, dtype=np.float32)
+    return routes[:, None] + offsets[None, :, None, None] * ramp[:, None, :, None] * normal[:, None]
+
+
 def expert_direction_mask(
     routes: np.ndarray, expert_route: np.ndarray, max_error_deg: float
 ) -> np.ndarray:
@@ -142,11 +172,20 @@ def main() -> None:
     parser.add_argument("--min-progress-ratio", type=float, default=0.5)
     parser.add_argument("--max-accel", type=float, default=1.89)
     parser.add_argument("--max-decel", type=float, default=4.95)
+    parser.add_argument(
+        "--local-offsets",
+        default="",
+        help="comma-separated lateral path offsets in metres, e.g. -1.5,-0.75,0.75,1.5",
+    )
+    parser.add_argument("--variant-ramp-m", type=float, default=8.0)
     args = parser.parse_args()
     if args.start < 0 or args.limit <= 0 or args.batch_size <= 0:
         raise ValueError("start, limit, and batch-size must be positive/in range")
     if not 0 <= args.min_progress_ratio <= 1:
         raise ValueError("min-progress-ratio must be in [0,1]")
+    offsets = tuple(float(value) for value in args.local_offsets.split(",") if value)
+    if len(set(offsets)) != len(offsets) or any(abs(value) > 2.0 or value == 0 for value in offsets):
+        raise ValueError("local offsets must be unique, nonzero, and within +/-2m")
 
     root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(root))
@@ -245,10 +284,11 @@ def main() -> None:
     if not actor_location:
         raise FileNotFoundError(f"no future-actor shards in {args.future_cache_dir}")
 
+    original_path_count = None
     records: dict[str, list] = {name: [] for name in (
         "key", "winner", "multi", "raw_collision", "raw_progress", "raw_target_speed", "route_valid",
         "direction_ok", "corridor_cost", "candidate_valid", "candidate_collision",
-        "candidate_progress", "candidate_pid_target", "route_length", "route_ade",
+        "collision_evaluated", "candidate_progress", "candidate_pid_target", "route_length", "route_ade",
     )}
     for data in tqdm(loader, desc=f"B3b joint oracle {args.start}:{end}"):
         data.pop("anchor", None)  # extract live anchors from the predicted intent blob
@@ -261,22 +301,39 @@ def main() -> None:
             ),
         ):
             prediction = model(data)
-        routes_tensor = prediction.pred_route_multimodal
+        original_routes_tensor = prediction.pred_route_multimodal
         anchors_tensor = prediction.pred_route_anchor
         intent_tensor = prediction.pred_visual_intent
         required = (
-            routes_tensor,
+            original_routes_tensor,
             anchors_tensor,
             intent_tensor,
             prediction.pred_route_selected_idx,
         )
         if any(value is None for value in required):
             raise RuntimeError("model did not expose all route arms, anchors, or intent")
-        routes = routes_tensor.float().cpu().numpy()
+        original_routes = original_routes_tensor.float().cpu().numpy()
+        if original_path_count is None:
+            original_path_count = original_routes.shape[1]
+        elif original_path_count != original_routes.shape[1]:
+            raise ValueError("number of original paths changed between batches")
         anchors = anchors_tensor.float().cpu().numpy()
         winner = prediction.pred_route_selected_idx.long().cpu().numpy()
         expert = data["route"].float().cpu().numpy()
-        route_valid = anchors[..., 3] > 0.5
+        original_valid = anchors[..., 3] > 0.5
+        variants = local_path_variants(
+            original_routes[np.arange(len(winner)), winner], offsets,
+            ramp_m=args.variant_ramp_m,
+        )
+        routes = np.concatenate((original_routes, variants), axis=1)
+        route_valid = np.concatenate((
+            original_valid,
+            np.broadcast_to(
+                original_valid[np.arange(len(winner)), winner, None],
+                (len(winner), len(offsets)),
+            ),
+        ), axis=1)
+        routes_tensor = torch.as_tensor(routes, device=original_routes_tensor.device)
         direction_ok = expert_direction_mask(routes, expert, args.max_expert_heading_error_deg)
         corridor = corridor_cost_per_point(
             routes_tensor.float(),
@@ -311,24 +368,34 @@ def main() -> None:
             actors = unpack_future_actor_frame(actor_shards[path], local_index)
             k_count, m_count = routes.shape[1], candidate.shape[1]
             collision = np.zeros((k_count, m_count), dtype=bool)
-            arms_to_label = route_valid[b].copy()
-            arms_to_label[int(winner[b])] = True
-            for arm in np.flatnonzero(arms_to_label):
-                for mode in np.flatnonzero(candidate_valid[b]):
-                    positions, yaws = interpolate_route_by_distance(
-                        routes[b, arm], distances[b, mode], extrapolate=True
-                    )
-                    collision[arm, mode] = future_collision_label(
-                        positions,
-                        yaws,
-                        actors,
-                        safety_margin_m=args.safety_margin,
-                        include_class_ids=(1, 2),
-                    ).collision
+            evaluated = np.zeros_like(collision)
             win = int(winner[b])
+
+            def check_candidate(arm: int, mode: int) -> bool:
+                positions, yaws = interpolate_route_by_distance(
+                    routes[b, arm], distances[b, mode], extrapolate=True
+                )
+                evaluated[arm, mode] = True
+                return future_collision_label(
+                    positions,
+                    yaws,
+                    actors,
+                    safety_margin_m=args.safety_margin,
+                    include_class_ids=(1, 2),
+                ).collision
+
+            collision[win, 0] = check_candidate(win, 0)
+            if collision[win, 0]:
+                arms_to_label = route_valid[b].copy()
+                arms_to_label[win] = True
+                for arm in np.flatnonzero(arms_to_label):
+                    for mode in np.flatnonzero(candidate_valid[b]):
+                        if arm == win and mode == 0:
+                            continue
+                        collision[arm, mode] = check_candidate(int(arm), int(mode))
             records["key"].append(key)
             records["winner"].append(win)
-            records["multi"].append(bool(route_valid[b].sum() > 1))
+            records["multi"].append(bool(original_valid[b].sum() > 1))
             records["raw_collision"].append(bool(collision[win, 0]))
             records["raw_progress"].append(float(distances[b, 0, -1]))
             records["raw_target_speed"].append(float(raw_target[b]))
@@ -337,6 +404,7 @@ def main() -> None:
             records["corridor_cost"].append(corridor[b])
             records["candidate_valid"].append(candidate_valid[b])
             records["candidate_collision"].append(collision)
+            records["collision_evaluated"].append(evaluated)
             records["candidate_progress"].append(distances[b, :, -1])
             records["candidate_pid_target"].append(pid_target[b])
             records["route_length"].append(
@@ -354,9 +422,13 @@ def main() -> None:
     for policy_name, conservative in (("reachable", False), ("conservative", True)):
         fixed_rescue = np.zeros(n, dtype=bool)
         joint_rescue = np.zeros(n, dtype=bool)
+        expanded_rescue = np.zeros(n, dtype=bool)
         joint_arm = arrays["winner"].copy()
         joint_mode = np.zeros(n, dtype=np.int16)
         joint_progress = arrays["raw_progress"].copy()
+        expanded_arm = arrays["winner"].copy()
+        expanded_mode = np.zeros(n, dtype=np.int16)
+        expanded_progress = arrays["raw_progress"].copy()
         for row in range(n):
             win = int(arrays["winner"][row])
             eligible = candidate_eligibility(
@@ -380,19 +452,34 @@ def main() -> None:
                 bool(arrays["raw_collision"][row]),
                 arrays["candidate_collision"][row], eligible, progress, win, joint=False,
             )
+            original_eligible = eligible.copy()
+            original_eligible[original_path_count:] = False
             joint = choose_oracle(
                 bool(arrays["raw_collision"][row]),
-                arrays["candidate_collision"][row], eligible, progress, win, joint=True,
+                arrays["candidate_collision"][row], original_eligible, progress,
+                win, joint=True,
+            )
+            expanded = choose_oracle(
+                bool(arrays["raw_collision"][row]),
+                arrays["candidate_collision"][row], eligible, progress,
+                win, joint=True,
             )
             fixed_rescue[row] = fixed != (win, 0)
             joint_rescue[row] = joint != (win, 0)
+            expanded_rescue[row] = expanded != (win, 0)
             joint_arm[row], joint_mode[row] = joint
+            expanded_arm[row], expanded_mode[row] = expanded
             if joint_rescue[row]:
                 joint_progress[row] = progress[joint]
+            if expanded_rescue[row]:
+                expanded_progress[row] = progress[expanded]
         selected[f"{policy_name}_fixed_rescue"] = fixed_rescue
         selected[f"{policy_name}_joint_rescue"] = joint_rescue
         selected[f"{policy_name}_joint_arm"] = joint_arm
         selected[f"{policy_name}_joint_mode"] = joint_mode
+        selected[f"{policy_name}_expanded_rescue"] = expanded_rescue
+        selected[f"{policy_name}_expanded_arm"] = expanded_arm
+        selected[f"{policy_name}_expanded_mode"] = expanded_mode
         summary[policy_name] = {
             scope_name: summarize(
                 raw_collision=arrays["raw_collision"],
@@ -408,6 +495,28 @@ def main() -> None:
                 ("all", np.ones(n, dtype=bool)), ("multi", arrays["multi"]),
             )
         }
+        if offsets:
+            for scope_name, scope in (
+                ("all", np.ones(n, dtype=bool)), ("multi", arrays["multi"]),
+            ):
+                expanded_summary = summarize(
+                    raw_collision=arrays["raw_collision"],
+                    fixed_rescue=fixed_rescue,
+                    joint_rescue=expanded_rescue,
+                    joint_arm=expanded_arm,
+                    winner_arm=arrays["winner"],
+                    raw_progress=arrays["raw_progress"],
+                    joint_progress=expanded_progress,
+                    scope=scope,
+                )
+                expanded_summary["incremental_local_rescue_count"] = int((
+                    arrays["raw_collision"] & scope & expanded_rescue & ~joint_rescue
+                ).sum())
+                expanded_summary["local_path_selected_on_rescue_count"] = int((
+                    arrays["raw_collision"] & scope & expanded_rescue
+                    & (expanded_arm >= original_path_count)
+                ).sum())
+                summary[policy_name][f"expanded_{scope_name}"] = expanded_summary
 
     output = Path(args.out)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -416,6 +525,9 @@ def main() -> None:
     report = {
         "n_frames": n,
         "candidate_shape": [k_count, m_count],
+        "original_path_count": original_path_count,
+        "local_offsets_m": list(offsets),
+        "variant_ramp_m": args.variant_ramp_m,
         "checkpoint": str((ckpt_dir / "model_0019.pth").resolve()),
         "manifest": str(Path(args.manifest).resolve()),
         "vocabulary": str(Path(args.velocity_vocab).resolve()),
@@ -436,6 +548,10 @@ def main() -> None:
                 "PID target +0.01m/s"
             ),
             "raw_safe_behavior": "always keep raw candidate",
+            "collision_label_scope": (
+                "raw candidate on every frame; all physically reachable valid-path "
+                "candidates only when raw collides"
+            ),
         },
         "diagnostics": {
             "winner_direction_proxy_pass_rate": float(
@@ -446,6 +562,9 @@ def main() -> None:
                  <= args.max_off_corridor_cost).mean()
             ),
             "mean_valid_arms": float(arrays["route_valid"].sum(axis=1).mean()),
+            "mean_original_valid_arms": float(
+                arrays["route_valid"][:, :original_path_count].sum(axis=1).mean()
+            ),
             "mean_direction_and_corridor_eligible_arms": float((
                 arrays["route_valid"]
                 & arrays["direction_ok"]
@@ -473,6 +592,10 @@ def main() -> None:
                 f"joint rescue={result['joint_rescue_count']} "
                 f"incremental={result['incremental_joint_rescue_count']} "
                 f"path switches={result['changed_path_on_rescue_count']}"
+                + (
+                    f" local incremental={result['incremental_local_rescue_count']}"
+                    if "incremental_local_rescue_count" in result else ""
+                )
             )
     print(f"wrote {output} and {frame_path}")
 

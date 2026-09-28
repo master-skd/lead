@@ -5,6 +5,7 @@ from scripts.p4.eval_b3b_joint_oracle import (
     candidate_eligibility,
     choose_oracle,
     expert_direction_mask,
+    local_path_variants,
     summarize,
 )
 
@@ -27,6 +28,20 @@ def test_direction_proxy_filters_opposite_path():
         expert_direction_mask(routes, expert, max_error_deg=50.0),
         [[True, False, True]],
     )
+
+
+def test_local_path_variants_are_smooth_and_keep_forward_progress():
+    route = np.stack((np.arange(2, 22, 2), np.zeros(10)), axis=-1)[None].astype(float)
+    assert local_path_variants(route, ()).shape == (1, 0, 10, 2)
+    paths = local_path_variants(route, (-1.0, 1.0), ramp_m=8.0)
+    assert paths.shape == (1, 2, 10, 2)
+    np.testing.assert_allclose(
+        paths[0, :, :, 0], np.broadcast_to(route[0, :, 0], (2, 10))
+    )
+    assert abs(paths[0, 0, 0, 1]) < 0.2
+    assert abs(paths[0, 1, 0, 1]) < 0.2
+    assert paths[0, 0, -1, 1] == pytest.approx(-1.0)
+    assert paths[0, 1, -1, 1] == pytest.approx(1.0)
 
 
 def test_candidate_eligibility_applies_navigation_corridor_and_pid_limits():
