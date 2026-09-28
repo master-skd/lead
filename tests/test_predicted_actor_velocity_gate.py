@@ -188,6 +188,16 @@ def test_closed_loop_gate_keeps_path_and_selects_only_safe_slowdown():
     torch.testing.assert_close(result[11], torch.tensor([1.0]))
     torch.testing.assert_close(result[12], torch.tensor([0.0]))
 
+    config.route_predicted_actor_velocity_shadow = True
+    shadow = inference.ensemble_planning_decoder(
+        [prediction], {"speed": torch.tensor([3.0])}
+    )
+    torch.testing.assert_close(shadow[0], result[0])
+    torch.testing.assert_close(shadow[13], result[13])
+    torch.testing.assert_close(shadow[14], result[14])
+    torch.testing.assert_close(shadow[2], shadow[6])
+    assert shadow[2].item() > result[2].item()
+
     prediction.pred_bounding_box.pred_bounding_box_image_system[0, 0, 8] = 0.1
     no_actor = inference.ensemble_planning_decoder(
         [prediction], {"speed": torch.tensor([3.0])}

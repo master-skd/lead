@@ -261,7 +261,11 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                     self.training_config.route_velocity_safe_threshold
                 ),
                 selection_mode=(
-                    "predicted_actor_gate"
+                    (
+                        "predicted_actor_gate_shadow"
+                        if self.training_config.route_predicted_actor_velocity_shadow
+                        else "predicted_actor_gate"
+                    )
                     if self.training_config.route_predicted_actor_velocity_gate
                     else self.training_config.route_velocity_selection_mode
                 ),

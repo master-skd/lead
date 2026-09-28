@@ -99,5 +99,27 @@ def test_predicted_actor_gate_writes_compact_binary_collision_record():
     assert record["predicted_selected_collision"] is False
     assert record["selected_index"] == 1
     assert record["valid_candidate_count"] == 2
+    assert record["would_select_target_speed_mps"] == pytest.approx(2.5)
     assert "candidate_profiles_mps" not in record
     json.dumps(record, allow_nan=False)
+
+
+def test_shadow_diagnostic_logs_counterfactual_without_changing_executed_speed():
+    prediction = _prediction()
+    prediction.pred_target_speed_scalar = prediction.raw_target_speed_scalar
+    record = build_velocity_diagnostic_record(
+        prediction,
+        step=5,
+        current_speed_mps=3.5,
+        safe_threshold=0.5,
+        selection_mode="predicted_actor_gate_shadow",
+        final_steer=0.1,
+        final_throttle=0.3,
+        final_brake=0.0,
+        stuck_detector=0,
+        force_move_remaining=0,
+    )
+    assert record["selection_mode"] == "predicted_actor_gate_shadow"
+    assert record["switched"] is True
+    assert record["selected_target_speed_mps"] == 4.0
+    assert record["would_select_target_speed_mps"] == pytest.approx(2.5)

@@ -115,3 +115,27 @@ and the gate's `velocity_diagnostics.jsonl` files. Neither the safety head nor
 the learned velocity scorer is enabled by the gate wrapper. The gate's
 diagnostics are compact: each tick logs predicted raw/selected collision flags,
 switch/fallback, selected profile and final control, but not all 65 candidates.
+
+## Targeted baseline / shadow / active comparison
+
+Use the same corridor checkpoint directory and K64 vocabulary for all three
+runs. `B2D_ROUTE_IDS` limits the driver to the listed Bench2Drive XML route
+IDs (spaces or commas). Use distinct tags, and run the three commands
+sequentially on the same GPUs/ports:
+
+```bash
+export B2D_ROUTE_IDS="2084 2091 2881 3737 24333 2129"
+CKPT=outputs/local_training/p5_stepB2_corridor
+bash scripts/p4/eval_b3a_predicted_actor_baseline_local.sh "$CKPT" "0 1 2 3 4 5 6 7" b3a_diag_baseline
+bash scripts/p4/eval_b3a_predicted_actor_shadow_local.sh "$CKPT" "0 1 2 3 4 5 6 7" b3a_diag_shadow
+bash scripts/p4/eval_b3a_predicted_actor_gate_local.sh "$CKPT" "0 1 2 3 4 5 6 7" b3a_diag_active
+```
+
+The shadow run performs the same candidate and collision calculations as the
+active gate and logs the counterfactual choice, but sends the original target
+speed to the controller. Inspect `outputs/local_evaluation_b3a_diag_shadow/<id>/velocity_diagnostics.jsonl`:
+`selected_target_speed_mps` is the executed target and
+`would_select_target_speed_mps` is the counterfactual gated target. The
+`switched` flag means the gate *would* switch; it does not mean shadow changed
+control. A subset run has per-route `checkpoint_endpoint.json` results; do
+not use the full 220-route merge script to score only these six routes.

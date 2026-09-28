@@ -28,6 +28,19 @@ mkdir -p "$LOGDIR" "$OUTROOT"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 
 mapfile -t ROUTES < <(ls "$ROUTES_DIR"/*.xml | sort)
+if [[ -n "${B2D_ROUTE_IDS:-}" ]]; then
+  requested_ids=()
+  read -r -a requested_ids <<< "${B2D_ROUTE_IDS//,/ }"
+  selected_routes=()
+  for route_id in "${requested_ids[@]}"; do
+    if [[ ! "$route_id" =~ ^[0-9]+$ || ! -f "$ROUTES_DIR/$route_id.xml" ]]; then
+      echo "unknown Bench2Drive route ID: $route_id" >&2
+      exit 1
+    fi
+    selected_routes+=("$ROUTES_DIR/$route_id.xml")
+  done
+  ROUTES=("${selected_routes[@]}")
+fi
 GPU_ARR=($GPUS); NG=${#GPU_ARR[@]}
 echo "routes=${#ROUTES[@]}  gpus=$NG  ckpt=$CKPT"
 
@@ -112,6 +125,10 @@ for i in "${!GPU_ARR[@]}"; do
 done
 wait
 echo "=== all workers done. logs in $LOGDIR ==="
+if [[ -n "${B2D_ROUTE_IDS:-}" ]]; then
+  echo "Subset run: per-route results are in $OUTROOT; do not use the 220-route merge score."
+  exit 0
+fi
 echo "collect results + merge:"
 echo "  mkdir -p outputs/b2d_${TAG} && for f in $OUTROOT/*/checkpoint_endpoint.json; do cp \$f outputs/b2d_${TAG}/\$(basename \$(dirname \$f)).json; done"
 echo "  python slurm/evaluation/merge_route_json.py -f outputs/b2d_${TAG}"

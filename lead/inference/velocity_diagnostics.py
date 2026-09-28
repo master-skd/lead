@@ -57,18 +57,28 @@ def build_velocity_diagnostic_record(
     if risk_tensor is None:
         return None
 
-    if selection_mode == "predicted_actor_gate":
+    if selection_mode in {"predicted_actor_gate", "predicted_actor_gate_shadow"}:
         # The geometric gate produces deterministic 0/1 collision flags, not
         # learned probabilities. Avoid serializing all 65 profiles every tick:
         # doing so adds CPU synchronization and large JSON writes in CARLA.
+        raw_target = float(_scalar(prediction.raw_target_speed_scalar))
+        selected_profile = _single_batch_list(prediction.velocity_selected_profile)
+        selected_index = int(_scalar(prediction.velocity_selected_index))
+        would_target = raw_target
+        if selected_index != 0:
+            would_target = min(
+                raw_target,
+                max(2.0 * float(selected_profile[0]) - current_speed_mps, 0.0),
+            )
         return {
             "schema_version": 2,
             "step": int(step),
             "selection_mode": selection_mode,
             "current_speed_mps": float(current_speed_mps),
-            "raw_target_speed_mps": _scalar(prediction.raw_target_speed_scalar),
+            "raw_target_speed_mps": raw_target,
             "selected_target_speed_mps": _scalar(prediction.pred_target_speed_scalar),
-            "selected_index": int(_scalar(prediction.velocity_selected_index)),
+            "would_select_target_speed_mps": would_target,
+            "selected_index": selected_index,
             "switched": bool(_scalar(prediction.velocity_switched)),
             "fallback": bool(_scalar(prediction.velocity_fallback)),
             "predicted_raw_collision": bool(_scalar(prediction.velocity_raw_risk)),
@@ -78,9 +88,7 @@ def build_velocity_diagnostic_record(
             "valid_candidate_count": int(
                 prediction.velocity_candidate_valid.detach().sum().item()
             ),
-            "selected_profile_mps": _single_batch_list(
-                prediction.velocity_selected_profile
-            ),
+            "selected_profile_mps": selected_profile,
             "controller": {
                 "target_speed_pid_steer": _scalar(prediction.route_steer),
                 "target_speed_pid_throttle": _scalar(prediction.target_speed_throttle),

@@ -119,6 +119,11 @@ class OpenLoopInference:
         self.velocity_scorer = None
         self.velocity_vocabulary = None
         self.predicted_actor_velocity_vocabulary = None
+        if (
+            self.config_training.route_predicted_actor_velocity_shadow
+            and not self.config_training.route_predicted_actor_velocity_gate
+        ):
+            raise ValueError("predicted-actor shadow requires the gate to be enabled")
         if self.config_training.route_predicted_actor_velocity_gate:
             from lead.data_loader.future_actor_cache import FUTURE_TIMES_S
 
@@ -599,7 +604,10 @@ class OpenLoopInference:
                     velocity_raw_risk = velocity_candidate_risk[:, 0]
                     velocity_selected_risk = velocity_candidate_risk[:, selected]
                     velocity_selected_profile = candidates[:, selected]
-                    if selected != 0:
+                    if (
+                        selected != 0
+                        and not self.config_training.route_predicted_actor_velocity_shadow
+                    ):
                         # The selector enforces this ceiling; clamp as a final
                         # safeguard against fp16/float32 rounding differences.
                         near_target = (

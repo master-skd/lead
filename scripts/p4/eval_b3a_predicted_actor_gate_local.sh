@@ -13,6 +13,6 @@ if [[ ! -f "${VOCABULARY}" ]]; then
     exit 1
 fi
 
-export LEAD_TRAINING_CONFIG="${LEAD_TRAINING_CONFIG:-} route_selection_mode=confidence route_predicted_actor_velocity_gate=true route_predicted_actor_velocity_vocabulary=${VOCABULARY} route_predicted_actor_score_threshold=0.5 route_predicted_actor_nms_iou_threshold=0.5 route_predicted_actor_safety_margin_m=0.2 route_velocity_scorer_gate=false route_speed_safety_gate=false route_future_safety_gate=false"
+export LEAD_TRAINING_CONFIG="${LEAD_TRAINING_CONFIG:-} route_selection_mode=confidence route_predicted_actor_velocity_gate=true route_predicted_actor_velocity_shadow=false route_predicted_actor_velocity_vocabulary=${VOCABULARY} route_predicted_actor_score_threshold=0.5 route_predicted_actor_nms_iou_threshold=0.5 route_predicted_actor_safety_margin_m=0.2 route_velocity_scorer_gate=false route_speed_safety_gate=false route_future_safety_gate=false"
 
 bash scripts/eval_bench2drive_local.sh "${CHECKPOINT_DIR}" "${GPU_LIST}" "${OUTPUT_TAG}"
