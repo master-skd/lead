@@ -120,6 +120,8 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         self.meters_travelled = 0.0
         self.velocity_diagnostics_file: typing.TextIO | None = None
         self.velocity_diagnostics_failed = False
+        self.local_path_shadow_file: typing.TextIO | None = None
+        self.local_path_shadow_failed = False
 
         # Infraction tracking
         self.infraction_recorder = InfractionRecorder(
@@ -289,6 +291,33 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             # Diagnostics must never alter the driving policy or abort a route.
             self.velocity_diagnostics_failed = True
             LOG.exception("Disabling velocity diagnostics after a logging failure")
+
+    def save_local_path_shadow(self, prediction: ClosedLoopPrediction) -> None:
+        """Log counterfactual local Paths without changing the executed control."""
+
+        if self.local_path_shadow_failed or prediction.route_path_shadow is None:
+            return
+        save_path = self.config_closed_loop.save_path
+        if save_path is None:
+            return
+        try:
+            if self.local_path_shadow_file is None:
+                self.local_path_shadow_file = (
+                    save_path / "local_path_shadow.jsonl"
+                ).open("w", encoding="utf-8", buffering=1)
+            record = dict(prediction.route_path_shadow)
+            record.update(
+                step=int(self.step),
+                final_steer=float(self.control.steer),
+                final_throttle=float(self.control.throttle),
+                final_brake=float(self.control.brake),
+            )
+            self.local_path_shadow_file.write(
+                json.dumps(record, allow_nan=False, separators=(",", ":")) + "\n"
+            )
+        except Exception:
+            self.local_path_shadow_failed = True
+            LOG.exception("Disabling local-Path shadow logging after failure")
 
     @beartype
     def set_target_points(self, input_data: dict, pop_distance: float):
@@ -641,6 +670,7 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             closed_loop_prediction,
             current_speed_mps=float(input_data["speed"].item()),
         )
+        self.save_local_path_shadow(closed_loop_prediction)
 
         # Check for infractions at this step
         self.check_infractions()
@@ -757,6 +787,10 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         if diagnostics_file is not None:
             diagnostics_file.close()
             self.velocity_diagnostics_file = None
+        shadow_file = getattr(self, "local_path_shadow_file", None)
+        if shadow_file is not None:
+            shadow_file.close()
+            self.local_path_shadow_file = None
 
         # Clean up video recorder
         if hasattr(self, "video_recorder"):

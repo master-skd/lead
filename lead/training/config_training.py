@@ -1112,6 +1112,9 @@ class TrainingConfig(BaseConfig):
     route_predicted_actor_velocity_gate = False
     # Compute and log the gate decision, but keep the baseline target speed.
     route_predicted_actor_velocity_shadow = False
+    # B3b shadow only: evaluate local same-branch Path offsets against predicted
+    # actors and a copied lateral PID state; never replace executed Path/speed.
+    route_local_path_shadow = False
     route_predicted_actor_velocity_vocabulary = (
         "outputs/local_training/p5_stepB3a_v2_dense_data/relative_velocity_vocab/"
         "relative_velocity_vocab_k64.npy"

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from copy import deepcopy
 
 import jaxtyping as jt
 import numpy as np
@@ -10,6 +11,16 @@ from lead.expert.config_expert import ExpertConfig
 from lead.inference.config_closed_loop import ClosedLoopConfig
 from lead.inference.open_loop_inference import OpenLoopInference, OpenLoopPrediction
 from lead.tfv6.tfv6 import Prediction
+from lead.tfv6.local_path_shadow import local_path_variants, score_local_paths
+from lead.tfv6.collision_cost import corridor_cost_per_point
+from lead.tfv6.predicted_actor_velocity_gate import extrapolate_detected_actors
+from lead.tfv6.route_safety_rescorer import resolve_route_selection_mode
+from lead.tfv6.future_collision import (
+    future_collision_label,
+    interpolate_route_by_distance,
+    speed_profile_distances,
+)
+from lead.data_loader import carla_dataset_utils
 from lead.training.config_training import TrainingConfig
 
 np.set_printoptions(suppress=True)
@@ -27,6 +38,7 @@ class ClosedLoopPrediction(OpenLoopPrediction):
     route_steer: float
     target_speed_throttle: float
     target_speed_brake: float
+    route_path_shadow: dict | None
 
 
 class ClosedLoopInference(OpenLoopInference):
@@ -64,6 +76,21 @@ class ClosedLoopInference(OpenLoopInference):
             n=self.config_closed_loop.speed_n,
         )
         self.lateral_route_controller = LateralPIDController(self.config_closed_loop)
+        if self.config_training.route_local_path_shadow:
+            if (
+                len(self.nets) != 1
+                or resolve_route_selection_mode(self.config_training) != "confidence"
+                or not self.config_training.predict_spatial_path
+                or not self.config_training.detect_boxes
+                or self.config_training.route_predicted_actor_velocity_gate
+                or self.config_training.route_velocity_scorer_gate
+                or self.config_training.route_speed_safety_gate
+                or self.config_training.route_future_safety_gate
+            ):
+                raise ValueError(
+                    "local-Path shadow requires one confidence-route model with boxes "
+                    "and no active safety/velocity gate"
+                )
         self.longitudinal_target_speed_controller = PIDController(
             k_p=self.config_closed_loop.speed_kp,
             k_i=self.config_closed_loop.speed_ki,
@@ -210,6 +237,11 @@ class ClosedLoopInference(OpenLoopInference):
         steer = throttle = brake = waypoint_steer = waypoint_throttle = (
             waypoint_brake
         ) = route_steer = target_speed_throttle = target_speed_brake = None
+        route_path_shadow = None
+        route_controller_snapshot = (
+            deepcopy(self.lateral_route_controller)
+            if self.config_training.route_local_path_shadow else None
+        )
 
         if open_loop_prediction.pred_route is not None:
             route_steer, target_speed_throttle, target_speed_brake = (
@@ -219,6 +251,78 @@ class ClosedLoopInference(OpenLoopInference):
                     ego_speed,
                 )
             )
+        if route_controller_snapshot is not None:
+            prediction = predictions[0]
+            if (
+                route_steer is None
+                or open_loop_prediction.pred_route is None
+                or prediction.pred_visual_intent is None
+                or prediction.pred_bounding_box is None
+            ):
+                raise RuntimeError("local-Path shadow is missing route, intent or boxes")
+            raw_route = open_loop_prediction.pred_route[0].float().cpu().numpy()
+            current_speed = float(ego_speed.reshape(-1)[0].item())
+            raw_target_speed = float(
+                open_loop_prediction.pred_target_speed_scalar.reshape(-1)[0].item()
+            )
+            boxes = carla_dataset_utils.bb_image_to_vehicle_system(
+                prediction.pred_bounding_box.pred_bounding_box_image_system[0],
+                self.config_training.pixels_per_meter,
+                self.config_training.min_x_meter,
+                self.config_training.min_y_meter,
+            )
+            actors = extrapolate_detected_actors(
+                boxes,
+                score_threshold=float(
+                    self.config_training.route_predicted_actor_score_threshold
+                ),
+                nms_iou_threshold=float(
+                    self.config_training.route_predicted_actor_nms_iou_threshold
+                ),
+            )
+            distances = speed_profile_distances(current_speed, raw_target_speed)
+            raw_xy, raw_yaw = interpolate_route_by_distance(
+                raw_route, distances, extrapolate=True
+            )
+            raw_collision = future_collision_label(
+                raw_xy, raw_yaw, actors, safety_margin_m=0.2,
+                include_class_ids=(1, 2),
+            ).collision
+            if not raw_collision or current_speed < 1.0:
+                route_path_shadow = {
+                    "schema_version": 1,
+                    "shadow_only": True,
+                    "candidate_evaluated": False,
+                    "current_speed_mps": current_speed,
+                    "raw_target_speed_mps": raw_target_speed,
+                    "predicted_actor_count": int(actors.num_actors),
+                    "baseline_steer": float(route_steer),
+                    "raw_predicted_collision": bool(raw_collision),
+                    "would_select_index": None,
+                    "would_switch": False,
+                    "candidates": [],
+                }
+            else:
+                variants = local_path_variants(raw_route)
+                routes = np.concatenate((raw_route[None], variants), axis=0)
+                corridor_points = corridor_cost_per_point(
+                    torch.as_tensor(routes[None], device=self.device),
+                    torch.sigmoid(prediction.pred_visual_intent.float()),
+                    self.config_training,
+                    reach_m=float(self.config_training.route_corridor_reach_m),
+                )[0].float().cpu().numpy()
+                route_path_shadow = score_local_paths(
+                    routes,
+                    corridor_points,
+                    actors,
+                    route_controller_snapshot,
+                    current_speed_mps=current_speed,
+                    raw_target_speed_mps=raw_target_speed,
+                    baseline_steer=float(route_steer),
+                    sensor_agent_steer_correction=bool(
+                        self.config_closed_loop.sensor_agent_steer_correction
+                    ),
+                )
         if open_loop_prediction.pred_future_waypoints is not None:
             waypoints_steer, waypoints_throttle, waypoints_brake = (
                 self.execute_waypoints(
@@ -275,4 +379,5 @@ class ClosedLoopInference(OpenLoopInference):
             route_steer=route_steer,
             target_speed_throttle=target_speed_throttle,
             target_speed_brake=target_speed_brake,
+            route_path_shadow=route_path_shadow,
         )
