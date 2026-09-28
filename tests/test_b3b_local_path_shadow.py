@@ -4,7 +4,12 @@ from copy import deepcopy
 from lead.common.pid_controller import LateralPIDController
 from lead.data_loader.future_actor_cache import FUTURE_STEPS, FutureActorFrame
 from lead.inference.config_closed_loop import ClosedLoopConfig
-from lead.tfv6.local_path_shadow import local_path_variants, score_local_paths
+from lead.tfv6.local_path_shadow import (
+    encode_intent_probability_map,
+    local_path_variants,
+    score_local_paths,
+)
+from scripts.p4.analyze_b3b_local_path_shadow import decode_intent_probability_map
 
 
 class FakeLateralController:
@@ -43,6 +48,10 @@ def test_shadow_scores_local_paths_without_mutating_controller():
     assert record["would_switch"]
     assert record["would_select_index"] in (1, 2, 3, 4)
     assert len(record["candidates"]) == 5
+    assert record["candidates"][0]["predicted_ttc_s"] is not None
+    assert record["candidates"][0]["predicted_collision_actor_id"] == 1
+    assert len(record["candidates"][0]["corridor_per_point"]) == 30
+    assert record["predicted_actors"][0]["id"] == 1
 
 
 def test_shadow_never_proposes_switch_below_speed_floor():
@@ -70,3 +79,11 @@ def test_actual_pid_shadow_matches_baseline_without_advancing_state():
     )
     assert record["pid_snapshot_raw_steer"] == baseline
     assert controller._window == baseline_history
+
+
+def test_intent_probability_map_roundtrip():
+    probability = np.array([[0.0, 0.25, 0.5], [0.75, 1.0, 0.3]], dtype=np.float32)
+    encoded = encode_intent_probability_map(probability)
+    decoded = decode_intent_probability_map({"intent_probability_map": encoded})
+    assert encoded["fraction_above_0_5"] == 2 / 6
+    np.testing.assert_allclose(decoded, probability, atol=1 / 255)

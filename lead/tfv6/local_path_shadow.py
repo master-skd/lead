@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import zlib
 from copy import deepcopy
 
 import numpy as np
@@ -14,6 +16,21 @@ from lead.tfv6.future_collision import (
 
 
 DEFAULT_OFFSETS_M = (-1.5, -0.75, 0.75, 1.5)
+
+
+def encode_intent_probability_map(probability: np.ndarray) -> dict:
+    """Compact, lossily quantized BEV map for triggered shadow diagnostics only."""
+
+    probability = np.asarray(probability, dtype=np.float32)
+    if probability.ndim != 2 or not np.isfinite(probability).all():
+        raise ValueError("intent probability map must be finite [H,W]")
+    quantized = np.rint(np.clip(probability, 0.0, 1.0) * 255).astype(np.uint8)
+    return {
+        "shape": list(quantized.shape),
+        "encoding": "uint8_zlib_base64",
+        "data": base64.b64encode(zlib.compress(quantized.tobytes())).decode("ascii"),
+        "fraction_above_0_5": float((probability > 0.5).mean()),
+    }
 
 
 def local_path_variants(
@@ -75,7 +92,7 @@ def score_local_paths(
         collision = future_collision_label(
             xy, yaw, actors, safety_margin_m=safety_margin_m,
             include_class_ids=(1, 2),
-        ).collision
+        )
         steer = deepcopy(lateral_controller).step(
             route,
             float(current_speed_mps),
@@ -87,9 +104,15 @@ def score_local_paths(
         candidates.append({
             "index": index,
             "offset_m": 0.0 if index == 0 else float(offsets_m[index - 1]),
-            "predicted_collision": bool(collision),
+            "predicted_collision": bool(collision.collision),
+            "predicted_ttc_s": float(collision.ttc_s) if collision.collision else None,
+            "predicted_collision_actor_id": int(collision.actor_id) if collision.collision else None,
             "corridor_mean": float(cost.mean()),
             "corridor_max": float(cost.max()),
+            "corridor_per_point": cost.astype(float).tolist(),
+            "route_xy_m": route.astype(float).tolist(),
+            "predicted_ego_xy_m": xy.astype(float).tolist(),
+            "predicted_ego_yaw_rad": yaw.astype(float).tolist(),
             "counterfactual_steer": float(steer),
             "steer_delta_from_baseline": steer_delta,
             "pid_steer_effective": bool(
@@ -109,12 +132,22 @@ def score_local_paths(
     if raw_collision and current_speed_mps >= min_speed_mps and eligible:
         would_select = min(eligible, key=lambda item: abs(item["offset_m"]))["index"]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "shadow_only": True,
         "candidate_evaluated": True,
         "current_speed_mps": float(current_speed_mps),
         "raw_target_speed_mps": float(raw_target_speed_mps),
         "predicted_actor_count": int(actors.num_actors),
+        "predicted_actors": [
+            {
+                "id": int(actors.actor_ids[i]),
+                "class_id": int(actors.class_ids[i]),
+                "xy_m": actors.positions[i].astype(float).tolist(),
+                "yaw_rad": actors.yaws[i].astype(float).tolist(),
+                "half_extent_m": actors.extents[i, :2].astype(float).tolist(),
+            }
+            for i in range(actors.num_actors)
+        ],
         "baseline_steer": float(baseline_steer),
         "pid_snapshot_raw_steer": candidates[0]["counterfactual_steer"],
         "raw_predicted_collision": bool(raw_collision),

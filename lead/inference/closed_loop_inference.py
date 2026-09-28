@@ -11,7 +11,11 @@ from lead.expert.config_expert import ExpertConfig
 from lead.inference.config_closed_loop import ClosedLoopConfig
 from lead.inference.open_loop_inference import OpenLoopInference, OpenLoopPrediction
 from lead.tfv6.tfv6 import Prediction
-from lead.tfv6.local_path_shadow import local_path_variants, score_local_paths
+from lead.tfv6.local_path_shadow import (
+    encode_intent_probability_map,
+    local_path_variants,
+    score_local_paths,
+)
 from lead.tfv6.collision_cost import corridor_cost_per_point
 from lead.tfv6.predicted_actor_velocity_gate import extrapolate_detected_actors
 from lead.tfv6.route_safety_rescorer import resolve_route_selection_mode
@@ -284,13 +288,14 @@ class ClosedLoopInference(OpenLoopInference):
             raw_xy, raw_yaw = interpolate_route_by_distance(
                 raw_route, distances, extrapolate=True
             )
-            raw_collision = future_collision_label(
+            raw_collision_label = future_collision_label(
                 raw_xy, raw_yaw, actors, safety_margin_m=0.2,
                 include_class_ids=(1, 2),
-            ).collision
+            )
+            raw_collision = raw_collision_label.collision
             if not raw_collision or current_speed < 1.0:
                 route_path_shadow = {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "shadow_only": True,
                     "candidate_evaluated": False,
                     "current_speed_mps": current_speed,
@@ -298,6 +303,12 @@ class ClosedLoopInference(OpenLoopInference):
                     "predicted_actor_count": int(actors.num_actors),
                     "baseline_steer": float(route_steer),
                     "raw_predicted_collision": bool(raw_collision),
+                    "raw_predicted_ttc_s": (
+                        float(raw_collision_label.ttc_s) if raw_collision else None
+                    ),
+                    "raw_predicted_collision_actor_id": (
+                        int(raw_collision_label.actor_id) if raw_collision else None
+                    ),
                     "would_select_index": None,
                     "would_switch": False,
                     "candidates": [],
@@ -305,9 +316,12 @@ class ClosedLoopInference(OpenLoopInference):
             else:
                 variants = local_path_variants(raw_route)
                 routes = np.concatenate((raw_route[None], variants), axis=0)
+                intent_probability = torch.sigmoid(
+                    prediction.pred_visual_intent.float()
+                )
                 corridor_points = corridor_cost_per_point(
                     torch.as_tensor(routes[None], device=self.device),
-                    torch.sigmoid(prediction.pred_visual_intent.float()),
+                    intent_probability,
                     self.config_training,
                     reach_m=float(self.config_training.route_corridor_reach_m),
                 )[0].float().cpu().numpy()
@@ -322,6 +336,11 @@ class ClosedLoopInference(OpenLoopInference):
                     sensor_agent_steer_correction=bool(
                         self.config_closed_loop.sensor_agent_steer_correction
                     ),
+                )
+                route_path_shadow["intent_probability_map"] = (
+                    encode_intent_probability_map(
+                        intent_probability[0, 0].detach().cpu().numpy()
+                    )
                 )
         if open_loop_prediction.pred_future_waypoints is not None:
             waypoints_steer, waypoints_throttle, waypoints_brake = (
