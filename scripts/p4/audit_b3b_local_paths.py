@@ -38,10 +38,16 @@ def selected_actor_frames(cache_dir: Path, keys: set[str]) -> dict:
     found = {}
     for path in sorted(cache_dir.glob("future_actors_*.npz")):
         with np.load(path, allow_pickle=False) as shard:
-            for index, key in enumerate(shard["keys"]):
-                key = str(key)
-                if key in keys:
-                    found[key] = unpack_future_actor_frame(shard, index)
+            selected = [
+                (index, str(key)) for index, key in enumerate(shard["keys"])
+                if str(key) in keys
+            ]
+            if selected:
+                # NpzFile decompresses on every field access. Materialize this
+                # shard once instead of re-inflating it for every frame.
+                data = {name: shard[name] for name in shard.files}
+                for index, key in selected:
+                    found[key] = unpack_future_actor_frame(data, index)
         if len(found) == len(keys):
             break
     missing = keys - found.keys()

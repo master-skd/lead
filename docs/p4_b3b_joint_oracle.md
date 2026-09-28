@@ -142,3 +142,40 @@ current heading to 30 or 60 degrees/second, while keeping the candidate's
 positions unchanged. A collision appearing only after this check suggests
 the original oracle relied on an instantaneous heading change; passing it
 still does not prove the steering controller can follow the path.
+
+## B3b-3: pose-consistent offline collision recheck
+
+The older oracle interpolates ego positions along the Path and independently
+sets the box yaw to the Path tangent. In particular, a local Path offset can
+change the ego box's yaw immediately even when it has barely moved. To check
+the dependence on this shortcut, `eval_b3b_kinematic_oracle.py` reuses the
+saved Path×Velocity lattice and GT actor cache (no model forward or GPU). It
+tracks each Path from ego pose `(0,0,0)` with a bounded-yaw unicycle follower,
+integrates position and yaw together, and reruns SAT collision. A 2 m
+lookahead and 30 degrees/s maximum yaw rate are the default *sensitivity
+assumptions*, not measurements of the CARLA controller. It also sweeps
+maximum distance to the desired Path at 1 and 2 m.
+
+```bash
+/mmu_mllm_hdd_3/liuzihan08/miniconda3/envs/lead/bin/python \
+  scripts/p4/eval_b3b_kinematic_oracle.py \
+  --report outputs/local_training/p5_stepB3b_joint_oracle/joint_nested_k16_k32_local_8gpu.json \
+  --out outputs/local_training/p5_stepB3b_joint_oracle/joint_nested_k16_k32_kinematic_yaw30.json
+```
+
+The output reports both the new raw-collision set and the intersection with
+the old one (`common_old_and_kinematic_unsafe`). Compare rescues on that
+intersection for a paired interpretation; raw collision counts alone can hide
+many frame-level changes. Also try `--max-yaw-rate-deg-s 60` and
+`--lookahead-m 4` as sensitivity checks. This is still a GT-future oracle and
+a simplified follower, not LEAD's lateral PID or a closed-loop score.
+
+On the first 5,000 frames, the original interpolation labels 164 raw collisions.
+With 30 degrees/s yaw and 2 m lookahead, the pose-consistent rollout labels
+163, but only 133 are the **same frames** (31 old-only, 30 new-only). Under a
+1 m maximum tracking-error screen, the conservative oracle rescues 69 with
+original Paths and 82 with local variants: 13 incremental local rescues, all
+with at least 1 m progress. The incremental count becomes 16 at 60 degrees/s
+and 21 at 4 m lookahead. This sensitivity is the reason to check controller
+behavior in a small closed-loop diagnostic before treating any oracle count
+as an expected driving-score gain.
