@@ -231,7 +231,7 @@ def main() -> None:
         "shuffle": False,
         "num_workers": args.num_workers,
         "collate_fn": _collate,
-        "pin_memory": device.type == "cuda" and not args.selected_path_only,
+        "pin_memory": device.type == "cuda",
     }
     if args.num_workers > 0:
         loader_kwargs["prefetch_factor"] = 1
