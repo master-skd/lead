@@ -9,6 +9,7 @@ from lead.tfv6.control_aware_velocity_oracle import (
     scalar_actions,
 )
 from scripts.p4.audit_b3a_control_aware_actions import evaluate_frame
+from scripts.p4.audit_b3a_short_horizon_actions import audit_horizon
 from scripts.p4.verify_b3a_selected_paths import verify_shard
 
 
@@ -45,6 +46,30 @@ def test_controller_rollout_exposes_full_brake_from_scalar_collapse():
     assert slower.progress_m < baseline.progress_m
     assert len(slower.acceleration_mps2) == 40
     assert len(slower.xy_distance_m) == 8
+
+
+def test_short_horizon_coverage_uses_executable_moving_action():
+    targets, valid = scalar_actions(3.0)
+    collision = np.zeros((1, len(targets)), bool)
+    collision[0, 0] = True
+    ttc = np.full(collision.shape, 2.0, np.float32)
+    ttc[0, 0] = 0.75
+    summary, details = audit_horizon(
+        horizon_s=1.0,
+        keys=np.array(["scenario__route__0001"]),
+        targets=targets[None],
+        valid=valid[None],
+        collisions_2s=collision,
+        ttc_s=ttc,
+        current_speeds=np.array([3.0]),
+        route_ends=np.array([20.0]),
+        dynamics=Dynamics(),
+        max_progress_loss_m=2.0,
+    )
+    assert summary["raw_unsafe_qualified_frames"] == 1
+    assert summary["moving_rescue_frames"] == 1
+    assert summary["stop_only_rescue_frames"] == 0
+    assert details["moving_rescue"].tolist() == [True]
 
 
 def test_fixed_path_labels_are_multidimensional_and_keep_baseline_when_safe():
