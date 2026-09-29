@@ -350,3 +350,56 @@ def test_velocity_profile_select_falls_back_to_least_risk_valid_candidate():
     torch.testing.assert_close(result.selected_index, torch.tensor([1]))
     torch.testing.assert_close(result.fallback, torch.tensor([True]))
     torch.testing.assert_close(result.target_speed, torch.tensor([3.4]))
+
+
+@pytest.mark.parametrize("shadow", [False, True])
+def test_baseline_guard_inference_keeps_path_and_only_lowers_target(shadow):
+    from lead.inference.config_open_loop import OpenLoopConfig
+    from lead.inference.open_loop_inference import OpenLoopInference
+    from lead.tfv6.tfv6 import Prediction
+
+    config = TrainingConfig()
+    config.use_planning_decoder = True
+    config.predict_temporal_spatial_waypoints = False
+    config.use_navsim_data = False
+    config.route_velocity_scorer_gate = True
+    config.route_velocity_selection_mode = "baseline_guard"
+    config.route_velocity_baseline_guard_shadow = shadow
+    config.route_selection_mode = "confidence"
+    inference = OpenLoopInference.__new__(OpenLoopInference)
+    inference.config_training = config
+    inference.config_open_loop = OpenLoopConfig(raise_error_on_missing_key=False)
+    inference.device = torch.device("cpu")
+    inference.velocity_scorer = _VelocitySelectHead(0.95, 0.1)
+    inference.velocity_vocabulary = torch.full((1, 8), -0.2)
+
+    logits = torch.full((1, len(config.target_speed_classes)), -10.0)
+    logits[:, 2] = 10.0
+    route = torch.stack(
+        (torch.arange(1, 11, dtype=torch.float32), torch.zeros(10)), dim=-1
+    )[None]
+    prediction = Prediction(
+        pred_future_waypoints=None,
+        pred_target_speed_distribution=logits,
+        pred_target_speed_scalar=torch.tensor([8.0]),
+        pred_route=route,
+        pred_semantic=None,
+        pred_bev_semantic=None,
+        pred_depth=None,
+        pred_bounding_box=None,
+        pred_radar_features=None,
+        pred_radar_predictions=None,
+        pred_bounding_box_navsim=None,
+        pred_bev_semantic_navsim=None,
+        pred_headings=None,
+        pred_route_features=torch.zeros(1, 2, 256),
+        pred_route_selected_idx=torch.tensor([1]),
+    )
+    result = inference.ensemble_planning_decoder(
+        [prediction], {"speed": torch.tensor([8.0])}
+    )
+    torch.testing.assert_close(result[0], route)
+    torch.testing.assert_close(
+        result[2], torch.tensor([[8.0 if shadow else 7.6]]), atol=1e-4, rtol=0
+    )
+    torch.testing.assert_close(result[14], torch.tensor([True]))

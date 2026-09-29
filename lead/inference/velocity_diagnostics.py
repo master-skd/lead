@@ -138,7 +138,7 @@ def build_velocity_diagnostic_record(
     safe = valid & (risk < float(safe_threshold))
     valid_risk = risk[valid]
 
-    return {
+    record = {
         "schema_version": 1,
         "step": int(step),
         "selection_mode": selection_mode,
@@ -174,3 +174,11 @@ def build_velocity_diagnostic_record(
             "force_move_remaining": int(force_move_remaining),
         },
     }
+    if selection_mode == "baseline_guard_shadow":
+        profile = record["selected_profile_mps"]
+        raw_target = float(record["raw_target_speed_mps"])
+        record["would_select_target_speed_mps"] = (
+            min(raw_target, max(2.0 * float(profile[0]) - current_speed_mps, 0.0))
+            if selected_index != 0 else raw_target
+        )
+    return record

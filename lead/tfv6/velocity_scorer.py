@@ -213,6 +213,85 @@ def select_velocity_profile(
     )
 
 
+@torch.inference_mode()
+def select_baseline_preserving_velocity(
+    scorer: VelocityScorer,
+    route_features: torch.Tensor,
+    current_speed: torch.Tensor,
+    raw_target_speed: torch.Tensor,
+    residual_vocabulary: torch.Tensor,
+    *,
+    unsafe_threshold: float = 0.9,
+    safe_threshold: float = 0.3,
+    max_slowdown_mps: float = 1.0,
+    interval_s: float = 0.25,
+    max_accel_mps2: float = 1.89,
+    max_decel_mps2: float = 4.95,
+) -> VelocityGateResult:
+    """Keep the *exact* baseline scalar unless a modest slowing is justified.
+
+    The first velocity candidate is a 2 s rollout of the raw target, not an
+    invertible encoding of that target. It is only a scoring feature here: index
+    zero always sends ``raw_target_speed`` unchanged to the controller.
+    """
+
+    if not 0.0 <= safe_threshold < unsafe_threshold <= 1.0:
+        raise ValueError("expected 0 <= safe_threshold < unsafe_threshold <= 1")
+    if max_slowdown_mps <= 0:
+        raise ValueError("max_slowdown_mps must be positive")
+    current = current_speed.reshape(-1)
+    raw = raw_target_speed.reshape(-1)
+    candidates, valid = build_velocity_candidates(
+        current,
+        raw,
+        residual_vocabulary,
+        interval_s=interval_s,
+        max_accel_mps2=max_accel_mps2,
+        max_decel_mps2=max_decel_mps2,
+        full_profile_reachability=True,
+    )
+    preference, collision_logit = scorer(
+        route_features.to(torch.float16).float(),
+        current.to(torch.float16).float(),
+        raw.to(torch.float16).float(),
+        candidates.to(torch.float16).float(),
+    )
+    risk = torch.sigmoid(collision_logit.float())
+    target = (2.0 * candidates[..., 0] - current[:, None]).clamp_min(0.0)
+    slowdown = raw[:, None] - target
+    eligible = (
+        valid
+        & (risk < float(safe_threshold))
+        & (slowdown > 0.05)
+        & (slowdown <= float(max_slowdown_mps))
+    )
+    eligible[:, 0] = False
+    # A confident raw stop is not a request for a learned scorer to drive on.
+    triggered = (risk[:, 0] >= float(unsafe_threshold)) & (raw > 0.1)
+    has_alternative = eligible.any(dim=1)
+    # Among sufficiently safe actions, intervene as little as possible.
+    alternative_index = slowdown.masked_fill(~eligible, float("inf")).argmin(dim=1)
+    switched = triggered & has_alternative
+    selected_index = torch.where(
+        switched, alternative_index, torch.zeros_like(alternative_index)
+    )
+    rows = torch.arange(len(selected_index), device=selected_index.device)
+    selected_target = torch.where(switched, target[rows, selected_index], raw)
+    return VelocityGateResult(
+        target_speed=selected_target.reshape_as(raw_target_speed),
+        selected_index=selected_index,
+        raw_risk=risk[:, 0],
+        selected_risk=risk[rows, selected_index],
+        triggered=triggered,
+        switched=switched,
+        fallback=triggered & ~has_alternative,
+        candidate_velocity=candidates,
+        candidate_valid=valid,
+        preference=preference,
+        risk=risk,
+    )
+
+
 def _raw_target_velocity_profile(
     current_speed: torch.Tensor,
     target_speed: torch.Tensor,

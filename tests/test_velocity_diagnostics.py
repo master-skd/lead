@@ -123,3 +123,23 @@ def test_shadow_diagnostic_logs_counterfactual_without_changing_executed_speed()
     assert record["switched"] is True
     assert record["selected_target_speed_mps"] == 4.0
     assert record["would_select_target_speed_mps"] == pytest.approx(2.5)
+
+
+def test_baseline_guard_shadow_logs_would_target_without_overriding_raw():
+    prediction = _prediction()
+    prediction.pred_target_speed_scalar = prediction.raw_target_speed_scalar
+    record = build_velocity_diagnostic_record(
+        prediction,
+        step=5,
+        current_speed_mps=3.5,
+        safe_threshold=0.3,
+        selection_mode="baseline_guard_shadow",
+        final_steer=0.1,
+        final_throttle=0.3,
+        final_brake=0.0,
+        stuck_detector=0,
+        force_move_remaining=0,
+    )
+    assert record["selection_mode"] == "baseline_guard_shadow"
+    assert record["selected_target_speed_mps"] == 4.0
+    assert record["would_select_target_speed_mps"] == pytest.approx(2.5)

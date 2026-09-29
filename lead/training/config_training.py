@@ -1076,7 +1076,11 @@ class TrainingConfig(BaseConfig):
     # unsafe threshold; only reachable alternatives below the safe threshold may replace
     # it.  Disabled by default so historical checkpoints remain bit-identical.
     route_velocity_scorer_gate = False
-    # "gate" preserves the B3a intervention-only policy.  "profile_select" scores
+    # "gate" preserves the B3a intervention-only policy.  "baseline_guard"
+    # retains the exact raw scalar (including brakes) and permits only modest,
+    # high-confidence slowing. It is experimental until control-consistent
+    # held-out labels qualify a scorer/threshold combination.
+    # "profile_select" scores
     # every valid velocity candidate on the confidence-selected path at every
     # planning step, including the raw model candidate, and tracks the selected
     # profile's first interval instead of sending its terminal speed to PID.
@@ -1099,6 +1103,10 @@ class TrainingConfig(BaseConfig):
     # 1.95% switches, 0.97% false switches, and no introduced GT collision.
     route_velocity_safe_threshold = 0.5
     route_velocity_unsafe_threshold = 0.8
+    route_velocity_baseline_guard_safe_threshold = 0.3
+    route_velocity_baseline_guard_unsafe_threshold = 0.9
+    route_velocity_baseline_guard_max_slowdown_mps = 1.0
+    route_velocity_baseline_guard_shadow = False
     # B3a-v2 feasibility thresholds; tune on held-out labels before closed loop.
     route_velocity_scene_collision_free_threshold = 0.5
     route_velocity_scene_ttc_threshold = 0.5

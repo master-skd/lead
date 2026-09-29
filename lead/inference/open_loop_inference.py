@@ -36,6 +36,7 @@ from lead.tfv6.velocity_scorer import (
     apply_velocity_scorer_gate,
     build_velocity_candidates,
     compose_route_velocity_trajectory,
+    select_baseline_preserving_velocity,
     select_velocity_profile,
 )
 from lead.training.config_training import TrainingConfig
@@ -172,12 +173,19 @@ class OpenLoopInference:
             )
         if self.config_training.route_velocity_scorer_gate:
             selection_mode = self.config_training.route_velocity_selection_mode
-            if selection_mode not in {"gate", "profile_select", "scene_score"}:
+            if selection_mode not in {"gate", "baseline_guard", "profile_select", "scene_score"}:
                 raise ValueError(
-                    "route_velocity_selection_mode must be 'gate', 'profile_select', "
-                    "or 'scene_score'"
+                    "route_velocity_selection_mode must be 'gate', 'baseline_guard', "
+                    "'profile_select', or 'scene_score'"
                 )
-            if selection_mode in {"profile_select", "scene_score"} and (
+            if (
+                self.config_training.route_velocity_baseline_guard_shadow
+                and selection_mode != "baseline_guard"
+            ):
+                raise ValueError(
+                    "route_velocity_baseline_guard_shadow requires baseline_guard mode"
+                )
+            if selection_mode in {"baseline_guard", "profile_select", "scene_score"} and (
                 resolve_route_selection_mode(self.config_training) != "confidence"
                 or not self.config_training.predict_spatial_path
             ):
@@ -384,13 +392,14 @@ class OpenLoopInference:
                     selection_mode = self.config_training.route_velocity_selection_mode
                     if selection_mode not in {
                         "gate",
+                        "baseline_guard",
                         "profile_select",
                         "scene_score",
                     }:
                         raise ValueError(
                             "invalid route_velocity_selection_mode"
                         )
-                    if selection_mode in {"profile_select", "scene_score"} and (
+                    if selection_mode in {"baseline_guard", "profile_select", "scene_score"} and (
                         resolve_route_selection_mode(self.config_training)
                         != "confidence"
                         or not self.config_training.predict_spatial_path
@@ -476,11 +485,11 @@ class OpenLoopInference:
                         velocity_candidate_risk = collision_risk
                         velocity_selected_profile = selected_profile
                     else:
-                        velocity_selector = (
-                            select_velocity_profile
-                            if selection_mode == "profile_select"
-                            else apply_velocity_scorer_gate
-                        )
+                        velocity_selector = {
+                            "gate": apply_velocity_scorer_gate,
+                            "baseline_guard": select_baseline_preserving_velocity,
+                            "profile_select": select_velocity_profile,
+                        }[selection_mode]
                         selector_kwargs = dict(
                             safe_threshold=float(
                                 self.config_training.route_velocity_safe_threshold
@@ -499,6 +508,16 @@ class OpenLoopInference:
                             selector_kwargs["unsafe_threshold"] = float(
                                 self.config_training.route_velocity_unsafe_threshold
                             )
+                        elif selection_mode == "baseline_guard":
+                            selector_kwargs["safe_threshold"] = float(
+                                self.config_training.route_velocity_baseline_guard_safe_threshold
+                            )
+                            selector_kwargs["unsafe_threshold"] = float(
+                                self.config_training.route_velocity_baseline_guard_unsafe_threshold
+                            )
+                            selector_kwargs["max_slowdown_mps"] = float(
+                                self.config_training.route_velocity_baseline_guard_max_slowdown_mps
+                            )
                         velocity_gate = velocity_selector(
                             self.velocity_scorer,
                             route_feature,
@@ -510,6 +529,11 @@ class OpenLoopInference:
                         pred_target_speed_scalar = velocity_gate.target_speed.reshape_as(
                             pred_target_speed_scalar
                         )
+                        if (
+                            selection_mode == "baseline_guard"
+                            and self.config_training.route_velocity_baseline_guard_shadow
+                        ):
+                            pred_target_speed_scalar = raw_target_speed_scalar
                         velocity_raw_risk = velocity_gate.raw_risk
                         velocity_selected_risk = velocity_gate.selected_risk
                         velocity_selected_index = velocity_gate.selected_index
@@ -519,7 +543,7 @@ class OpenLoopInference:
                         velocity_candidate_valid = velocity_gate.candidate_valid
                         velocity_candidate_preference = velocity_gate.preference
                         velocity_candidate_risk = velocity_gate.risk
-                        if selection_mode == "profile_select":
+                        if selection_mode in {"profile_select", "baseline_guard"}:
                             velocity_selected_profile = velocity_gate.candidate_velocity[
                                 0, velocity_gate.selected_index[0]
                             ][None]

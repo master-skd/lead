@@ -9,6 +9,7 @@ from lead.tfv6.velocity_scorer import (
     apply_velocity_scorer_gate,
     build_velocity_candidates,
     load_velocity_scorer,
+    select_baseline_preserving_velocity,
 )
 from scripts.p4.eval_b3a_velocity_scorer import evaluate_gate
 from scripts.p4.eval_b3a_velocity_vocab_oracle import (
@@ -152,3 +153,38 @@ def test_online_gate_falls_back_to_raw_when_no_safe_alternative():
     torch.testing.assert_close(result.target_speed, torch.tensor([[5.0]]))
     torch.testing.assert_close(result.switched, torch.tensor([False]))
     torch.testing.assert_close(result.fallback, torch.tensor([True]))
+
+
+def test_baseline_guard_keeps_exact_raw_and_only_modestly_slows():
+    scorer = _FixedVelocityScorer(
+        preference=torch.tensor([[0.0, 9.0]] * 3),
+        risk=torch.tensor([[0.1, 0.1], [0.95, 0.1], [0.95, 0.1]]),
+    )
+    result = select_baseline_preserving_velocity(
+        scorer,
+        torch.zeros(3, 4),
+        torch.tensor([3.0, 3.0, 3.0]),
+        torch.tensor([[4.0], [4.0], [0.0]]),
+        torch.full((1, 8), 0.2),
+    )
+    # Index zero is a two-second rollout, but its execution target must remain
+    # the original scalar 4.0, not a reconstructed first-interval target.
+    torch.testing.assert_close(result.target_speed, torch.tensor([[4.0], [3.4], [0.0]]))
+    torch.testing.assert_close(result.selected_index, torch.tensor([0, 1, 0]))
+    torch.testing.assert_close(result.switched, torch.tensor([False, True, False]))
+
+
+def test_baseline_guard_rejects_large_or_unsafe_slowdown():
+    scorer = _FixedVelocityScorer(
+        preference=torch.zeros(2, 2),
+        risk=torch.tensor([[0.95, 0.1], [0.95, 0.5]]),
+    )
+    result = select_baseline_preserving_velocity(
+        scorer,
+        torch.zeros(2, 4),
+        torch.tensor([3.0, 3.0]),
+        torch.tensor([[5.0], [4.0]]),
+        torch.full((1, 8), 0.2),
+    )
+    torch.testing.assert_close(result.target_speed, torch.tensor([[5.0], [4.0]]))
+    torch.testing.assert_close(result.fallback, torch.tensor([True, True]))

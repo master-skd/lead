@@ -6,6 +6,7 @@ from scripts.p4.audit_b3a_control_velocity_oracle import (
     interpolate_samples,
     reconstruct_route_samples,
 )
+from scripts.p4.audit_b3a_baseline_guard import rate_limited_distances
 
 
 def test_control_target_matches_pid_mapping_and_clips_to_zero():
@@ -30,3 +31,9 @@ def test_reconstructed_fixed_route_recovers_cached_positions():
     np.testing.assert_allclose(xy[:, 0], [0.25, 0.5, 2.0, 8.0])
     np.testing.assert_allclose(xy[:, 1], 0.0)
     np.testing.assert_allclose(yaw, 0.0)
+
+
+def test_rate_limited_proxy_does_not_instantly_stop_from_eight_mps():
+    distances = rate_limited_distances(8.0, 0.0)
+    np.testing.assert_allclose(distances[0], 1.8453125, atol=1e-6)
+    assert np.all(np.diff(distances) >= 0)

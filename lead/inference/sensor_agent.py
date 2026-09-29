@@ -269,7 +269,13 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                         else "predicted_actor_gate"
                     )
                     if self.training_config.route_predicted_actor_velocity_gate
-                    else self.training_config.route_velocity_selection_mode
+                    else (
+                        "baseline_guard_shadow"
+                        if self.training_config.route_velocity_selection_mode
+                        == "baseline_guard"
+                        and self.training_config.route_velocity_baseline_guard_shadow
+                        else self.training_config.route_velocity_selection_mode
+                    )
                 ),
                 final_steer=float(self.control.steer),
                 final_throttle=float(self.control.throttle),
