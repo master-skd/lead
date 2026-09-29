@@ -33,6 +33,7 @@ from lead.inference.closed_loop_inference import (
 )
 from lead.inference.config_closed_loop import ClosedLoopConfig
 from lead.inference.infraction_recorder import InfractionRecorder
+from lead.inference.route2129_capture import build_route2129_capture_record
 from lead.inference.velocity_diagnostics import build_velocity_diagnostic_record
 from lead.inference.video_recorder import VideoRecorder
 from lead.training.config_training import TrainingConfig
@@ -122,6 +123,8 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         self.velocity_diagnostics_failed = False
         self.local_path_shadow_file: typing.TextIO | None = None
         self.local_path_shadow_failed = False
+        self.route2129_capture_file: typing.TextIO | None = None
+        self.route2129_capture_failed = False
 
         # Infraction tracking
         self.infraction_recorder = InfractionRecorder(
@@ -297,6 +300,41 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             # Diagnostics must never alter the driving policy or abort a route.
             self.velocity_diagnostics_failed = True
             LOG.exception("Disabling velocity diagnostics after a logging failure")
+
+    def save_route2129_capture(
+        self, prediction: ClosedLoopPrediction, current_speed_mps: float
+    ) -> None:
+        """Read-only, opt-in simulator/model trace around route 2129's hazard."""
+        if self.route2129_capture_failed or os.getenv("LEAD_ROUTE2129_CAPTURE") != "1":
+            return
+        if self.config_closed_loop.route_id != "2129":
+            return
+        try:
+            start = int(os.getenv("LEAD_ROUTE2129_CAPTURE_START", "180"))
+            end = int(os.getenv("LEAD_ROUTE2129_CAPTURE_END", "360"))
+            if not start <= self.step <= end:
+                return
+            save_path = self.config_closed_loop.save_path
+            if save_path is None:
+                return
+            record = build_route2129_capture_record(
+                step=self.step,
+                world=self._world,
+                ego=self._vehicle,
+                prediction=prediction,
+                control=self.control,
+                sensor_speed_mps=current_speed_mps,
+            )
+            if self.route2129_capture_file is None:
+                self.route2129_capture_file = (
+                    save_path / "route2129_capture.jsonl"
+                ).open("w", encoding="utf-8", buffering=1)
+            self.route2129_capture_file.write(
+                json.dumps(record, allow_nan=False, separators=(",", ":")) + "\n"
+            )
+        except Exception:
+            self.route2129_capture_failed = True
+            LOG.exception("Disabling route 2129 capture after a logging failure")
 
     def save_local_path_shadow(self, prediction: ClosedLoopPrediction) -> None:
         """Log counterfactual local Paths without changing the executed control."""
@@ -676,6 +714,10 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             closed_loop_prediction,
             current_speed_mps=float(input_data["speed"].item()),
         )
+        self.save_route2129_capture(
+            closed_loop_prediction,
+            current_speed_mps=float(input_data["speed"].item()),
+        )
         self.save_local_path_shadow(closed_loop_prediction)
 
         # Check for infractions at this step
@@ -797,6 +839,10 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         if shadow_file is not None:
             shadow_file.close()
             self.local_path_shadow_file = None
+        capture_file = getattr(self, "route2129_capture_file", None)
+        if capture_file is not None:
+            capture_file.close()
+            self.route2129_capture_file = None
 
         # Clean up video recorder
         if hasattr(self, "video_recorder"):
