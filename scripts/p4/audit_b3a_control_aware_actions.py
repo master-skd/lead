@@ -29,7 +29,10 @@ from lead.tfv6.control_aware_velocity_oracle import (
     rollout_scalar_target,
     scalar_actions,
 )
-from lead.tfv6.future_collision import future_collision_label
+from lead.tfv6.future_collision import (
+    future_collision_label,
+    interpolate_route_by_distance,
+)
 from scripts.p4.audit_b3a_control_velocity_oracle import (
     actor_locations,
     interpolate_samples,
@@ -41,13 +44,23 @@ def _rate(count: int, total: int) -> float:
     return count / total if total else 0.0
 
 
+def _route_arc_length(route: np.ndarray) -> float:
+    route = np.asarray(route, dtype=np.float32).reshape(-1, 2)
+    if len(route) == 0:
+        return 0.0
+    if np.linalg.norm(route[0]) > 1e-4:
+        route = np.concatenate((np.zeros((1, 2), dtype=np.float32), route))
+    return float(np.linalg.norm(np.diff(route, axis=0), axis=1).sum())
+
+
 def evaluate_frame(
     *,
     current_speed: float,
     raw_target: float,
     candidate_velocity: np.ndarray,
-    candidate_states: np.ndarray,
+    candidate_states: np.ndarray | None,
     candidate_valid: np.ndarray,
+    selected_path: np.ndarray | None = None,
     actors,
     dynamics: Dynamics,
     expert_config: ExpertConfig,
@@ -57,9 +70,13 @@ def evaluate_frame(
     """Evaluate all actions on one confidence-selected geometric Path."""
     if not candidate_valid[0]:
         raise ValueError("raw fixed-Path candidate is invalid")
-    samples = reconstruct_route_samples(
-        candidate_velocity.astype(np.float32), candidate_states, candidate_valid
-    )
+    samples = None
+    if selected_path is None:
+        if candidate_states is None:
+            raise ValueError("candidate_states are required without selected_path")
+        samples = reconstruct_route_samples(
+            candidate_velocity.astype(np.float32), candidate_states, candidate_valid
+        )
     targets, valid = scalar_actions(raw_target)
     count = len(targets)
     collision = np.zeros(count, dtype=bool)
@@ -69,7 +86,11 @@ def evaluate_frame(
     brake_fraction = np.zeros(count, dtype=np.float32)
     terminal_speed = np.zeros(count, dtype=np.float32)
     route_overflow = np.zeros(count, dtype=bool)
-    route_end_m = float(samples[0][-1])
+    route_end_m = (
+        _route_arc_length(selected_path)
+        if selected_path is not None
+        else float(samples[0][-1])
+    )
     for index in np.flatnonzero(valid):
         rollout = rollout_scalar_target(
             current_speed,
@@ -77,7 +98,13 @@ def evaluate_frame(
             dynamics=dynamics,
             expert_config=expert_config,
         )
-        xy, yaw = interpolate_samples(samples, rollout.xy_distance_m)
+        xy, yaw = (
+            interpolate_route_by_distance(
+                selected_path, rollout.xy_distance_m, extrapolate=True
+            )
+            if selected_path is not None
+            else interpolate_samples(samples, rollout.xy_distance_m)
+        )
         label = future_collision_label(
             xy,
             yaw,
@@ -135,6 +162,11 @@ def main() -> None:
         / "outputs/local_training/p5_stepB3a_v2_dense_data/future_actor_cache/heldout_future_actors",
     )
     parser.add_argument(
+        "--selected-paths",
+        type=Path,
+        help="directory of aligned selected_paths_*.npz sidecars; use full Paths",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=root
@@ -179,12 +211,52 @@ def main() -> None:
                 "raw_target_speed",
                 "candidate_velocity",
                 "candidate_valid",
-                "candidate_states",
+                "selected_arm",
             )
+            if args.selected_paths is None:
+                required += ("candidate_states",)
             missing = [name for name in required if name not in feature_file]
             if missing:
                 raise ValueError(f"{path} missing {missing}")
             arrays = {name: feature_file[name] for name in required}
+            feature_checkpoint = str(feature_file["source_checkpoint"])
+            feature_manifest = str(feature_file["source_manifest"])
+            feature_vlm_manifest = str(feature_file["nearest_vlm_manifest"])
+        selected_paths = None
+        if args.selected_paths is not None:
+            path_file = args.selected_paths / path.name.replace(
+                "velocity_features_", "selected_paths_"
+            )
+            if not path_file.is_file():
+                raise FileNotFoundError(
+                    f"missing aligned selected Path shard: {path_file}"
+                )
+            with np.load(path_file, allow_pickle=False) as sidecar:
+                if not np.array_equal(sidecar["keys"], arrays["keys"]):
+                    raise ValueError(f"selected Path keys/order mismatch: {path_file}")
+                if str(sidecar["source_checkpoint"]) != feature_checkpoint:
+                    raise ValueError(f"selected Path checkpoint mismatch: {path_file}")
+                if str(sidecar["source_manifest"]) != feature_manifest:
+                    raise ValueError(f"selected Path manifest mismatch: {path_file}")
+                if str(sidecar["nearest_vlm_manifest"]) != feature_vlm_manifest:
+                    raise ValueError(
+                        f"selected Path VLM manifest mismatch: {path_file}"
+                    )
+                if not np.array_equal(sidecar["selected_arm"], arrays["selected_arm"]):
+                    raise ValueError(f"selected Path arm mismatch: {path_file}")
+                for name in ("current_speed", "raw_target_speed"):
+                    if not np.allclose(
+                        sidecar[name], arrays[name].astype(np.float32), atol=0.03
+                    ):
+                        raise ValueError(f"selected Path {name} mismatch: {path_file}")
+                selected_paths = sidecar["selected_path"].astype(np.float32)
+                if (
+                    selected_paths.ndim != 3
+                    or selected_paths.shape[0] != len(arrays["keys"])
+                    or selected_paths.shape[2] != 2
+                    or not np.isfinite(selected_paths).all()
+                ):
+                    raise ValueError(f"invalid selected Path shape/values: {path_file}")
         n = len(arrays["keys"])
         rows = (
             np.unique(np.linspace(0, n - 1, min(n, args.sample_per_shard), dtype=int))
@@ -210,8 +282,13 @@ def main() -> None:
                 current_speed=float(arrays["current_speed"][row]),
                 raw_target=float(arrays["raw_target_speed"][row]),
                 candidate_velocity=arrays["candidate_velocity"][row],
-                candidate_states=arrays["candidate_states"][row],
+                candidate_states=(
+                    None
+                    if args.selected_paths is not None
+                    else arrays["candidate_states"][row]
+                ),
                 candidate_valid=arrays["candidate_valid"][row],
+                selected_path=(None if selected_paths is None else selected_paths[row]),
                 actors=actors,
                 dynamics=dynamics,
                 expert_config=expert_config,
@@ -339,6 +416,9 @@ def main() -> None:
             "slowdown_rescue_by_max_progress_loss_m": rescue_curve,
         },
         "features": str(args.features.resolve()),
+        "selected_paths": (
+            None if args.selected_paths is None else str(args.selected_paths.resolve())
+        ),
         "future_actors": str(args.future_actors.resolve()),
         "frame_labels": str(npz_path.resolve()),
         "limitations": "Counterfactual GT actors, fixed Path and fixed scalar target for 2 s. No CARLA physics, lateral tracking error, perception error or receding-horizon replanning. Do not deploy oracle decisions.",

@@ -61,8 +61,40 @@ differs from the old candidate-zero velocity profile by more than 1 m in
 Thus the old full-profile safety target is not interchangeable with the action
 actually supplied to the controller.
 
-Next decision: before training a DrivoR-style scorer on these labels, either
-cache the complete selected Path or restrict training/evaluation to verified
-geometry, then validate the acceleration model against actual CARLA control
-traces. Only if that audit preserves useful collision-free, progress-feasible
-alternatives should the multidimensional scorer be trained.
+## Full selected-Path sidecars
+
+The old velocity feature shards contain time-sampled candidate points but not
+the complete `pred_route` returned by the frozen corridor model. Points past
+their farthest sample cannot be reconstructed. The path-only extraction mode
+reruns the **same checkpoint and manifest** and saves `selected_path` as a
+separate float32 sidecar per existing shard; it does not rebuild future actors,
+velocity candidates, scene tokens, or labels. It needs GPUs for model forward.
+
+On the GPU machine, first run held-out alone for validation, then train:
+
+```bash
+B3A_PATH_SPLITS=heldout CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  bash scripts/p4/build_p5_stepB3a_selected_path_cache.sh
+
+B3A_PATH_SPLITS=train CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  bash scripts/p4/build_p5_stepB3a_selected_path_cache.sh
+```
+
+The wrapper resumes completed sidecars and verifies every shard against the
+existing feature cache: identical keys/order and source checkpoint, matching
+selected arm/current speed/raw target, and sampled geometric agreement between
+old candidate positions and the newly stored full Path. Verification fails
+closed if any source has drifted. No GPU burn is started.
+
+After held-out sidecars pass verification, repeat the oracle on full Paths:
+
+```bash
+python scripts/p4/audit_b3a_control_aware_actions.py \
+  --selected-paths outputs/local_training/p5_stepB3a_v2_scene_scorer/selected_paths/heldout \
+  --limit 5000 --sample-per-shard 600 \
+  --output outputs/local_training/p5_stepB3a_control_aware_oracle/full_path_5000.json
+```
+
+Then validate the acceleration proxy against CARLA traces before training a
+DrivoR-style scorer. Only if the full-Path audit preserves useful
+collision-free, progress-feasible alternatives should that training proceed.

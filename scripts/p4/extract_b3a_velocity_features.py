@@ -67,9 +67,9 @@ def main() -> None:
         default=None,
         help="sparse VLM cache manifest used for nearest-frame reuse on dense data",
     )
-    parser.add_argument("--future-cache-dir", required=True)
-    parser.add_argument("--expert-profiles", required=True)
-    parser.add_argument("--velocity-vocab", required=True)
+    parser.add_argument("--future-cache-dir")
+    parser.add_argument("--expert-profiles")
+    parser.add_argument("--velocity-vocab")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--end", type=int, default=None)
@@ -80,8 +80,23 @@ def main() -> None:
     parser.add_argument("--max-decel", type=float, default=4.95)
     parser.add_argument("--full-profile-reachability", action="store_true")
     parser.add_argument("--scene-v2", action="store_true")
+    parser.add_argument(
+        "--selected-path-only",
+        action="store_true",
+        help="save full selected Paths without rebuilding velocity labels",
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
+    if args.selected_path_only and args.scene_v2:
+        parser.error("--selected-path-only does not need --scene-v2")
+    if not args.selected_path_only:
+        missing = [
+            name
+            for name in ("future_cache_dir", "expert_profiles", "velocity_vocab")
+            if getattr(args, name) is None
+        ]
+        if missing:
+            parser.error(f"velocity extraction requires {', '.join(missing)}")
 
     repo_root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(repo_root))
@@ -126,34 +141,38 @@ def main() -> None:
 
     actor_shards = {}
     actor_location = {}
-    for path in sorted(Path(args.future_cache_dir).glob("future_actors_*.npz")):
-        shard = np.load(path, allow_pickle=False)
-        actor_shards[path] = shard
-        for index, key in enumerate(shard["keys"]):
-            actor_location[str(key)] = (path, index)
-    missing_actors = [
-        entry["key"] for entry in manifest if entry["key"] not in actor_location
-    ]
-    if missing_actors:
-        raise FileNotFoundError(
-            f"future actor cache is incomplete: {len(missing_actors)} missing; "
-            f"first={missing_actors[0]}"
-        )
+    profile_location = {}
+    expert_cache = {}
+    vocabulary = None
+    if not args.selected_path_only:
+        for path in sorted(Path(args.future_cache_dir).glob("future_actors_*.npz")):
+            shard = np.load(path, allow_pickle=False)
+            actor_shards[path] = shard
+            for index, key in enumerate(shard["keys"]):
+                actor_location[str(key)] = (path, index)
+        missing_actors = [
+            entry["key"] for entry in manifest if entry["key"] not in actor_location
+        ]
+        if missing_actors:
+            raise FileNotFoundError(
+                f"future actor cache is incomplete: {len(missing_actors)} missing; "
+                f"first={missing_actors[0]}"
+            )
 
-    profile_location, expert_cache = _load_profile_cache(Path(args.expert_profiles))
-    missing_profiles = [
-        entry["key"] for entry in manifest if entry["key"] not in profile_location
-    ]
-    if missing_profiles:
-        raise FileNotFoundError(
-            f"expert profile cache is incomplete: {len(missing_profiles)} missing; "
-            f"first={missing_profiles[0]}"
-        )
-    vocabulary = np.load(args.velocity_vocab).astype(np.float32)
-    if vocabulary.ndim != 2 or vocabulary.shape[1] != len(FUTURE_TIMES_S):
-        raise ValueError(
-            f"velocity vocabulary has shape {vocabulary.shape}; expected [K,{len(FUTURE_TIMES_S)}]"
-        )
+        profile_location, expert_cache = _load_profile_cache(Path(args.expert_profiles))
+        missing_profiles = [
+            entry["key"] for entry in manifest if entry["key"] not in profile_location
+        ]
+        if missing_profiles:
+            raise FileNotFoundError(
+                f"expert profile cache is incomplete: {len(missing_profiles)} missing; "
+                f"first={missing_profiles[0]}"
+            )
+        vocabulary = np.load(args.velocity_vocab).astype(np.float32)
+        if vocabulary.ndim != 2 or vocabulary.shape[1] != len(FUTURE_TIMES_S):
+            raise ValueError(
+                f"velocity vocabulary has shape {vocabulary.shape}; expected [K,{len(FUTURE_TIMES_S)}]"
+            )
     interval_s = float(FUTURE_TIMES_S[0])
 
     import timm
@@ -198,7 +217,11 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"velocity_features_{start:06d}_{end:06d}.npz"
+    output = output_dir / (
+        f"selected_paths_{start:06d}_{end:06d}.npz"
+        if args.selected_path_only
+        else f"velocity_features_{start:06d}_{end:06d}.npz"
+    )
     if output.exists() and not args.overwrite:
         print(f"exists, skipping {output}")
         return
@@ -242,6 +265,16 @@ def main() -> None:
             )
         )
     saved: dict[str, list[np.ndarray]] = {name: [] for name in names}
+    path_saved: dict[str, list[np.ndarray]] = {
+        name: []
+        for name in (
+            "keys",
+            "selected_path",
+            "selected_arm",
+            "current_speed",
+            "raw_target_speed",
+        )
+    }
     for data in tqdm(loader, desc=f"B3a velocity features {start}:{end}"):
         data.pop("anchor", None)
         with (
@@ -254,16 +287,18 @@ def main() -> None:
         ):
             prediction = model(data)
         if (
-            prediction.pred_route_features is None
+            prediction.pred_route is None
             or prediction.pred_route_selected_idx is None
+            or (not args.selected_path_only and prediction.pred_route_features is None)
             or (args.scene_v2 and prediction.pred_scene_tokens is None)
         ):
             raise RuntimeError("corridor model did not expose route/scene features")
         routes = prediction.pred_route.float().cpu().numpy()
-        all_features = prediction.pred_route_features.float().cpu().numpy()
         selected_arm = prediction.pred_route_selected_idx.long().cpu().numpy()
-        rows = np.arange(len(routes))
-        route_features = all_features[rows, selected_arm]
+        if not args.selected_path_only:
+            all_features = prediction.pred_route_features.float().cpu().numpy()
+            rows = np.arange(len(routes))
+            route_features = all_features[rows, selected_arm]
         scene_tokens = None
         if args.scene_v2:
             scene_tokens = (
@@ -298,6 +333,20 @@ def main() -> None:
             .cpu()
             .numpy()
         )
+
+        if args.selected_path_only:
+            batch_keys = [
+                entry_by_route_frame[(route_name, frame_name)]["key"]
+                for route_name, frame_name in zip(
+                    data["route_number"], data["frame_number"], strict=True
+                )
+            ]
+            path_saved["keys"].append(np.asarray(batch_keys))
+            path_saved["selected_path"].append(routes.astype(np.float32))
+            path_saved["selected_arm"].append(selected_arm.astype(np.int8))
+            path_saved["current_speed"].append(current_speed.astype(np.float32))
+            path_saved["raw_target_speed"].append(raw_target_speed.astype(np.float32))
+            continue
 
         batch_keys = []
         expert_velocity = []
@@ -449,6 +498,31 @@ def main() -> None:
             )
         for name in names:
             saved[name].append(values[name])
+
+    if args.selected_path_only:
+        packed = {
+            name: np.concatenate(parts, axis=0) for name, parts in path_saved.items()
+        }
+        packed.update(
+            source_checkpoint=np.asarray(str(checkpoint.resolve())),
+            source_manifest=np.asarray(str(Path(args.manifest).resolve())),
+            nearest_vlm_manifest=np.asarray(
+                ""
+                if args.nearest_vlm_manifest is None
+                else str(Path(args.nearest_vlm_manifest).resolve())
+            ),
+            coordinate_frame=np.asarray("ego_vehicle"),
+            selection_mode=np.asarray("confidence"),
+        )
+        temporary = output.with_suffix(".npz.tmp")
+        with temporary.open("wb") as handle:
+            np.savez_compressed(handle, **packed)
+        os.replace(temporary, output)
+        print(
+            f"wrote {output}: frames={len(packed['keys'])} "
+            f"path_points={packed['selected_path'].shape[1]}"
+        )
+        return
 
     packed = {name: np.concatenate(parts, axis=0) for name, parts in saved.items()}
     vocab_hash = hashlib.sha256(Path(args.velocity_vocab).read_bytes()).hexdigest()
