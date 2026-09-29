@@ -84,7 +84,10 @@ The wrapper resumes completed sidecars and verifies every shard against the
 existing feature cache: identical keys/order and source checkpoint, matching
 selected arm/current speed/raw target, and sampled geometric agreement between
 old candidate positions and the newly stored full Path. Verification fails
-closed if any source has drifted. No GPU burn is started.
+closed if any source has drifted. Its path-only defaults are batch 16 and zero
+DataLoader workers to avoid exhausting container `/dev/shm` when eight GPU jobs
+run simultaneously. A failed batch waits for all sibling jobs before exiting;
+rerunning resumes completed sidecars. No GPU burn is started.
 
 After held-out sidecars pass verification, repeat the oracle on full Paths:
 

@@ -10,8 +10,10 @@ DENSE_ROOT="${B3A_V2_DENSE_ROOT:-${REPO_ROOT}/outputs/local_training/p5_stepB3a_
 FEATURE_ROOT="${B3A_V2_FEATURE_ROOT:-${REPO_ROOT}/outputs/local_training/p5_stepB3a_v2_scene_scorer/features}"
 PATH_ROOT="${B3A_SELECTED_PATH_ROOT:-${REPO_ROOT}/outputs/local_training/p5_stepB3a_v2_scene_scorer/selected_paths}"
 NEAREST_VLM_MANIFEST="${B3A_NEAREST_VLM_MANIFEST:-${REPO_ROOT}/data/p4/manifest.jsonl}"
-BATCH_SIZE="${B3A_EXTRACT_BATCH_SIZE:-64}"
-NUM_WORKERS="${B3A_EXTRACT_NUM_WORKERS:-4}"
+# Eight simultaneous 64x4-worker loaders can exceed a container's /dev/shm
+# before the first batch. Path-only extraction does not need worker prefetch.
+BATCH_SIZE="${B3A_EXTRACT_BATCH_SIZE:-16}"
+NUM_WORKERS="${B3A_EXTRACT_NUM_WORKERS:-0}"
 read -r -a SPLITS <<< "${B3A_PATH_SPLITS:-heldout train}"
 
 if [[ ! -x "${LEAD_ENV}/bin/python" || ! -f "${CKPT_DIR}/model_0019.pth" ]]; then
@@ -89,7 +91,17 @@ for split in "${SPLITS[@]}"; do
                 --batch-size "${BATCH_SIZE}" --num-workers "${NUM_WORKERS}" &
             pids+=("$!")
         done
-        for pid in "${pids[@]}"; do wait "${pid}"; done
+        failed=0
+        for pid in "${pids[@]}"; do
+            if ! wait "${pid}"; then
+                failed=1
+            fi
+        done
+        if (( failed )); then
+            echo "${split}: at least one Path shard failed; all batch jobs have exited" >&2
+            echo "rerun the same command to resume completed shards" >&2
+            exit 1
+        fi
     done
     "${LEAD_ENV}/bin/python" scripts/p4/verify_b3a_selected_paths.py \
         --features "${FEATURE_DIR}" --selected-paths "${PATH_DIR}"
