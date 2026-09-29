@@ -89,41 +89,6 @@ DataLoader workers to avoid exhausting container `/dev/shm` when eight GPU jobs
 run simultaneously. A failed batch waits for all sibling jobs before exiting;
 rerunning resumes completed sidecars. No GPU burn is started.
 
-Important: an independent Path-only re-forward is not guaranteed to reproduce
-the previous feature shard exactly. The model can select the same arm while
-returning a slightly different target speed or Path. Do not loosen the
-cross-run verification threshold or discard the old feature cache on that
-basis. For a strict pair, normal feature extraction can also write a Path
-sidecar from the *same* forward pass via `--selected-path-output-dir`. Write
-both into new directories and verify a single shard before any larger rebuild:
-The two files carry the same extraction-pair ID, which the verifier and oracle
-audit require to match when present.
-
-```bash
-CUDA_VISIBLE_DEVICES=0 \
-/mmu_mllm_hdd_3/liuzihan08/miniconda3/envs/lead/bin/python \
-  scripts/p4/extract_b3a_velocity_features.py \
-  --ckpt-dir outputs/local_training/p5_stepB2_corridor \
-  --manifest outputs/local_training/p5_stepB3a_v2_dense_data/route_split/heldout.jsonl \
-  --nearest-vlm-manifest data/p4/manifest.jsonl \
-  --future-cache-dir outputs/local_training/p5_stepB3a_v2_dense_data/future_actor_cache/heldout_future_actors \
-  --expert-profiles outputs/local_training/p5_stepB3a_v2_dense_data/velocity_vocab/heldout_velocity_profiles.npz \
-  --velocity-vocab outputs/local_training/p5_stepB3a_v2_dense_data/relative_velocity_vocab/relative_velocity_vocab_k64.npy \
-  --output-dir outputs/local_training/p5_stepB3a_v2_scene_scorer/same_pass_pilot/features/heldout \
-  --selected-path-output-dir outputs/local_training/p5_stepB3a_v2_scene_scorer/same_pass_pilot/selected_paths/heldout \
-  --start 0 --end 512 --batch-size 16 --num-workers 0 \
-  --full-profile-reachability --scene-v2
-
-/mmu_mllm_hdd_3/liuzihan08/miniconda3/envs/lead/bin/python \
-  scripts/p4/verify_b3a_selected_paths.py \
-  --features outputs/local_training/p5_stepB3a_v2_scene_scorer/same_pass_pilot/features/heldout \
-  --selected-paths outputs/local_training/p5_stepB3a_v2_scene_scorer/same_pass_pilot/selected_paths/heldout
-```
-
-This preserves all old caches and scorer artifacts. A valid pilot shows only
-internal consistency of the new pair; it does not make its scores identical to
-the old feature cache.
-
 After held-out sidecars pass verification, repeat the oracle on full Paths:
 
 ```bash
