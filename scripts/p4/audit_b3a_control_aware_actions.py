@@ -222,6 +222,11 @@ def main() -> None:
             feature_checkpoint = str(feature_file["source_checkpoint"])
             feature_manifest = str(feature_file["source_manifest"])
             feature_vlm_manifest = str(feature_file["nearest_vlm_manifest"])
+            feature_pair_id = (
+                str(feature_file["extraction_pair_id"])
+                if "extraction_pair_id" in feature_file
+                else None
+            )
         selected_paths = None
         if args.selected_paths is not None:
             path_file = args.selected_paths / path.name.replace(
@@ -232,6 +237,13 @@ def main() -> None:
                     f"missing aligned selected Path shard: {path_file}"
                 )
             with np.load(path_file, allow_pickle=False) as sidecar:
+                sidecar_pair_id = (
+                    str(sidecar["extraction_pair_id"])
+                    if "extraction_pair_id" in sidecar
+                    else None
+                )
+                if feature_pair_id != sidecar_pair_id:
+                    raise ValueError(f"selected Path pair ID mismatch: {path_file}")
                 if not np.array_equal(sidecar["keys"], arrays["keys"]):
                     raise ValueError(f"selected Path keys/order mismatch: {path_file}")
                 if str(sidecar["source_checkpoint"]) != feature_checkpoint:

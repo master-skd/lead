@@ -23,12 +23,24 @@ def verify_shard(feature_path: Path, path_path: Path, samples: int = 128) -> dic
         source = str(feature_file["source_checkpoint"])
         manifest = str(feature_file["source_manifest"])
         vlm_manifest = str(feature_file["nearest_vlm_manifest"])
+        pair_id = (
+            str(feature_file["extraction_pair_id"])
+            if "extraction_pair_id" in feature_file
+            else None
+        )
         rows = np.unique(
             np.linspace(0, len(keys) - 1, min(samples, len(keys)), dtype=int)
         )
         velocities = feature_file["candidate_velocity"][rows, 0].astype(np.float32)
         positions = feature_file["candidate_states"][rows, 0, :, :2].astype(np.float32)
     with np.load(path_path, allow_pickle=False) as sidecar:
+        sidecar_pair_id = (
+            str(sidecar["extraction_pair_id"])
+            if "extraction_pair_id" in sidecar
+            else None
+        )
+        if pair_id != sidecar_pair_id:
+            raise ValueError(f"same-forward pair ID mismatch: {path_path}")
         if not np.array_equal(keys, sidecar["keys"]):
             raise ValueError(f"keys/order mismatch: {path_path}")
         if str(sidecar["source_checkpoint"]) != source:

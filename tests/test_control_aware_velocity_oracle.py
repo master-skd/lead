@@ -9,6 +9,7 @@ from lead.tfv6.control_aware_velocity_oracle import (
     scalar_actions,
 )
 from scripts.p4.audit_b3a_control_aware_actions import evaluate_frame
+from scripts.p4.extract_b3a_velocity_features import _write_selected_path_sidecar
 from scripts.p4.verify_b3a_selected_paths import verify_shard
 
 
@@ -157,6 +158,12 @@ def test_selected_path_verifier_checks_key_and_geometry_alignment(tmp_path):
         selected_path=path[None],
     )
     assert verify_shard(feature, sidecar)["sampled_candidate_point_error_max_m"] < 1e-5
+    with np.load(sidecar, allow_pickle=False) as existing:
+        wrong_pair = {name: existing[name] for name in existing.files}
+    wrong_pair["extraction_pair_id"] = np.array("unpaired_run")
+    np.savez_compressed(sidecar, **wrong_pair)
+    with pytest.raises(ValueError, match="same-forward pair ID mismatch"):
+        verify_shard(feature, sidecar)
     np.savez_compressed(
         sidecar,
         keys=np.array(["wrong_key"]),
@@ -170,3 +177,28 @@ def test_selected_path_verifier_checks_key_and_geometry_alignment(tmp_path):
     )
     with pytest.raises(ValueError, match="keys/order mismatch"):
         verify_shard(feature, sidecar)
+
+
+def test_selected_path_sidecar_writer_preserves_batch_values(tmp_path):
+    output = tmp_path / "paths" / "selected_paths_000000_000001.npz"
+    saved = {
+        "keys": [np.array(["frame_a"])],
+        "selected_path": [np.ones((1, 30, 2), np.float32)],
+        "selected_arm": [np.array([2], np.int8)],
+        "current_speed": [np.array([3.0], np.float32)],
+        "raw_target_speed": [np.array([4.0], np.float32)],
+    }
+    _write_selected_path_sidecar(
+        output,
+        saved,
+        tmp_path / "checkpoint.pth",
+        tmp_path / "manifest.jsonl",
+        None,
+        "same_forward_123",
+    )
+    with np.load(output, allow_pickle=False) as sidecar:
+        for name, batches in saved.items():
+            np.testing.assert_array_equal(sidecar[name], batches[0])
+        assert str(sidecar["source_checkpoint"]) == str(tmp_path / "checkpoint.pth")
+        assert str(sidecar["nearest_vlm_manifest"]) == ""
+        assert str(sidecar["extraction_pair_id"]) == "same_forward_123"

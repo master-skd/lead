@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import sys
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -57,6 +58,37 @@ def _load_profile_cache(path: Path) -> tuple[dict[str, int], dict[str, np.ndarra
     return locations, arrays
 
 
+def _write_selected_path_sidecar(
+    output: Path,
+    saved: dict[str, list[np.ndarray]],
+    checkpoint: Path,
+    manifest: Path,
+    nearest_vlm_manifest: Path | None,
+    extraction_pair_id: str | None = None,
+) -> None:
+    packed = {name: np.concatenate(parts, axis=0) for name, parts in saved.items()}
+    packed.update(
+        source_checkpoint=np.asarray(str(checkpoint.resolve())),
+        source_manifest=np.asarray(str(manifest.resolve())),
+        nearest_vlm_manifest=np.asarray(
+            "" if nearest_vlm_manifest is None else str(nearest_vlm_manifest.resolve())
+        ),
+        coordinate_frame=np.asarray("ego_vehicle"),
+        selection_mode=np.asarray("confidence"),
+    )
+    if extraction_pair_id is not None:
+        packed["extraction_pair_id"] = np.asarray(extraction_pair_id)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(".npz.tmp")
+    with temporary.open("wb") as handle:
+        np.savez_compressed(handle, **packed)
+    os.replace(temporary, output)
+    print(
+        f"wrote {output}: frames={len(packed['keys'])} "
+        f"path_points={packed['selected_path'].shape[1]}"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt-dir", required=True)
@@ -85,10 +117,17 @@ def main() -> None:
         action="store_true",
         help="save full selected Paths without rebuilding velocity labels",
     )
+    parser.add_argument(
+        "--selected-path-output-dir",
+        type=Path,
+        help="also save selected Paths from the same forward pass as velocity features",
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     if args.selected_path_only and args.scene_v2:
         parser.error("--selected-path-only does not need --scene-v2")
+    if args.selected_path_only and args.selected_path_output_dir is not None:
+        parser.error("--selected-path-output-dir requires normal feature extraction")
     if not args.selected_path_only:
         missing = [
             name
@@ -222,7 +261,18 @@ def main() -> None:
         if args.selected_path_only
         else f"velocity_features_{start:06d}_{end:06d}.npz"
     )
+    sidecar_output = (
+        args.selected_path_output_dir / f"selected_paths_{start:06d}_{end:06d}.npz"
+        if args.selected_path_output_dir is not None
+        else None
+    )
+    extraction_pair_id = uuid.uuid4().hex if sidecar_output is not None else None
     if output.exists() and not args.overwrite:
+        if sidecar_output is not None and not sidecar_output.exists():
+            raise FileExistsError(
+                f"{output} already exists but {sidecar_output} does not; "
+                "re-extract both into a new directory or pass --overwrite"
+            )
         print(f"exists, skipping {output}")
         return
     loader_kwargs = {
@@ -334,34 +384,27 @@ def main() -> None:
             .numpy()
         )
 
-        if args.selected_path_only:
-            batch_keys = [
-                entry_by_route_frame[(route_name, frame_name)]["key"]
-                for route_name, frame_name in zip(
-                    data["route_number"], data["frame_number"], strict=True
-                )
-            ]
+        batch_keys = [
+            entry_by_route_frame[(route_name, frame_name)]["key"]
+            for route_name, frame_name in zip(
+                data["route_number"], data["frame_number"], strict=True
+            )
+        ]
+        if args.selected_path_only or sidecar_output is not None:
             path_saved["keys"].append(np.asarray(batch_keys))
             path_saved["selected_path"].append(routes.astype(np.float32))
             path_saved["selected_arm"].append(selected_arm.astype(np.int8))
             path_saved["current_speed"].append(current_speed.astype(np.float32))
             path_saved["raw_target_speed"].append(raw_target_speed.astype(np.float32))
+        if args.selected_path_only:
             continue
 
-        batch_keys = []
         expert_velocity = []
-        for route_name, frame_name in zip(
-            data["route_number"], data["frame_number"], strict=True
-        ):
-            entry = entry_by_route_frame[(route_name, frame_name)]
-            key = entry["key"]
-            batch_keys.append(key)
+        for batch_index, key in enumerate(batch_keys):
             expert_index = profile_location[key]
             expert_velocity.append(expert_cache["profiles"][expert_index])
             cached_speed = max(0.0, float(expert_cache["current_speed"][expert_index]))
-            if not np.isclose(
-                cached_speed, current_speed[len(batch_keys) - 1], atol=1e-3
-            ):
+            if not np.isclose(cached_speed, current_speed[batch_index], atol=1e-3):
                 raise ValueError(f"current-speed mismatch for {key}")
         expert_velocity = np.asarray(expert_velocity, dtype=np.float32)
 
@@ -500,27 +543,14 @@ def main() -> None:
             saved[name].append(values[name])
 
     if args.selected_path_only:
-        packed = {
-            name: np.concatenate(parts, axis=0) for name, parts in path_saved.items()
-        }
-        packed.update(
-            source_checkpoint=np.asarray(str(checkpoint.resolve())),
-            source_manifest=np.asarray(str(Path(args.manifest).resolve())),
-            nearest_vlm_manifest=np.asarray(
-                ""
-                if args.nearest_vlm_manifest is None
-                else str(Path(args.nearest_vlm_manifest).resolve())
-            ),
-            coordinate_frame=np.asarray("ego_vehicle"),
-            selection_mode=np.asarray("confidence"),
-        )
-        temporary = output.with_suffix(".npz.tmp")
-        with temporary.open("wb") as handle:
-            np.savez_compressed(handle, **packed)
-        os.replace(temporary, output)
-        print(
-            f"wrote {output}: frames={len(packed['keys'])} "
-            f"path_points={packed['selected_path'].shape[1]}"
+        _write_selected_path_sidecar(
+            output,
+            path_saved,
+            checkpoint,
+            Path(args.manifest),
+            None
+            if args.nearest_vlm_manifest is None
+            else Path(args.nearest_vlm_manifest),
         )
         return
 
@@ -541,10 +571,23 @@ def main() -> None:
         scene_v2=np.asarray(args.scene_v2),
         full_profile_reachability=np.asarray(args.full_profile_reachability),
     )
+    if extraction_pair_id is not None:
+        packed["extraction_pair_id"] = np.asarray(extraction_pair_id)
     temporary = output.with_suffix(".npz.tmp")
     with temporary.open("wb") as handle:
         np.savez_compressed(handle, **packed)
     os.replace(temporary, output)
+    if sidecar_output is not None:
+        _write_selected_path_sidecar(
+            sidecar_output,
+            path_saved,
+            checkpoint,
+            Path(args.manifest),
+            None
+            if args.nearest_vlm_manifest is None
+            else Path(args.nearest_vlm_manifest),
+            extraction_pair_id,
+        )
     valid_labels = packed["collision"][packed["candidate_valid"]]
     print(
         f"wrote {output}: frames={len(packed['keys'])} "
