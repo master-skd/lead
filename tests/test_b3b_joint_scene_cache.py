@@ -4,7 +4,20 @@ import numpy as np
 import pytest
 import torch
 
-from scripts.p4.extract_b3b_joint_scene import FIELDS, pack_batch, verify_shard
+from scripts.p4.extract_b3b_joint_scene import (
+    FIELDS, pack_batch, parse_intervals, verify_shard,
+)
+
+
+def test_parse_disjoint_persistent_worker_intervals():
+    assert parse_intervals(None, None, "12000:24000,0:12000,36000:48000") == [
+        (0, 12000), (12000, 24000), (36000, 48000),
+    ]
+    assert parse_intervals(0, 512, None) == [(0, 512)]
+    with pytest.raises(ValueError, match="overlap"):
+        parse_intervals(None, None, "0:12000,6000:18000")
+    with pytest.raises(ValueError, match="combined"):
+        parse_intervals(0, 512, "0:512")
 
 
 def test_same_forward_batch_contains_scene_and_paths():

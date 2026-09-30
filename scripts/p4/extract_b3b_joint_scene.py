@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -134,6 +135,29 @@ def verify_shard(path: Path, checkpoint: Path, manifest: Path, nearest: Path,
     return len(keys)
 
 
+def parse_intervals(start: int | None, end: int | None,
+                    encoded: str | None) -> list[tuple[int, int]]:
+    """Accept one legacy shard or a comma-separated list of disjoint shards."""
+    if encoded is not None:
+        if start is not None or end is not None:
+            raise ValueError("--intervals cannot be combined with --start/--end")
+        try:
+            intervals = [tuple(map(int, item.split(":"))) for item in encoded.split(",")]
+        except ValueError as error:
+            raise ValueError("--intervals must be start:end[,start:end...]") from error
+    else:
+        if start is None or end is None:
+            raise ValueError("provide --start/--end or --intervals")
+        intervals = [(start, end)]
+    if not intervals or any(len(item) != 2 or item[0] < 0 or item[1] <= item[0]
+                            for item in intervals):
+        raise ValueError("each interval must be a nonempty nonnegative start:end")
+    intervals = sorted(intervals)
+    if any(left[1] > right[0] for left, right in zip(intervals, intervals[1:])):
+        raise ValueError("intervals overlap")
+    return intervals
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ckpt-dir", type=Path, required=True)
@@ -141,8 +165,9 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--nearest-vlm-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--start", type=int, required=True)
-    parser.add_argument("--end", type=int, required=True)
+    parser.add_argument("--start", type=int)
+    parser.add_argument("--end", type=int)
+    parser.add_argument("--intervals", help="start:end[,start:end...] on one GPU")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--local-offsets", default="-1.5,-0.75,0.75,1.5")
@@ -152,19 +177,28 @@ def main() -> None:
         not np.isfinite(value) or abs(value) > 2 or value == 0 for value in offsets
     ):
         parser.error("expected four unique nonzero local offsets within +/-2 m")
-    if args.start < 0 or args.end <= args.start or args.batch_size < 1 or args.num_workers < 0:
-        parser.error("invalid frame interval, batch size or worker count")
+    try:
+        intervals = parse_intervals(args.start, args.end, args.intervals)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.batch_size < 1 or args.num_workers < 0:
+        parser.error("invalid batch size or worker count")
     checkpoint = args.ckpt_dir / args.ckpt_name
     if not checkpoint.is_file():
         parser.error(f"missing checkpoint: {checkpoint}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    output = args.output_dir / f"joint_scene_{args.start:06d}_{args.end:06d}.npz"
-    if output.exists():
-        count = verify_shard(
-            output, checkpoint, args.manifest, args.nearest_vlm_manifest,
-            args.start, args.end, offsets,
-        )
-        print(f"verified existing {output}: {count} frames; skipping")
+    pending = []
+    for start, end in intervals:
+        output = args.output_dir / f"joint_scene_{start:06d}_{end:06d}.npz"
+        if output.exists():
+            count = verify_shard(
+                output, checkpoint, args.manifest, args.nearest_vlm_manifest,
+                start, end, offsets,
+            )
+            print(f"verified existing {output}: {count} frames; skipping")
+        else:
+            pending.append((start, end, output))
+    if not pending:
         return
 
     from lead.data_loader.carla_dataset import CARLAData
@@ -204,25 +238,20 @@ def main() -> None:
         manifest_path=str(args.manifest), anchor_cache_dir=None,
         nearest_cache_manifest_path=str(args.nearest_vlm_manifest),
     )
-    if args.end > len(dataset.valid_indices):
-        raise ValueError(f"end={args.end} exceeds {len(dataset.valid_indices)} eligible frames")
-    dataset.valid_indices = dataset.valid_indices[args.start:args.end]
-    loader_kwargs = dict(
-        dataset=dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, collate_fn=_collate,
-        pin_memory=device.type == "cuda",
-    )
-    if args.num_workers:
-        loader_kwargs["prefetch_factor"] = 1
-    loader = DataLoader(**loader_kwargs)
-    # A dense split can contain >870k entries. Keep only this shard's keys,
+    if max(end for _, end, _ in pending) > len(dataset.valid_indices):
+        raise ValueError(f"requested interval exceeds {len(dataset.valid_indices)} eligible frames")
+    eligible_indices = dataset.valid_indices
+    # A dense split can contain >870k entries. Keep only this worker's keys,
     # rather than replicating the entire manifest dictionary on every GPU.
     selected_pairs = set()
-    for index in dataset.valid_indices:
-        image_path = str(base.images[index], encoding="utf-8")
-        parts = image_path.split("/")
-        selected_pairs.add((parts[-3], parts[-1].split(".")[0]))
-    if len(selected_pairs) != len(dataset.valid_indices):
+    selected_count = 0
+    for start, end, _ in pending:
+        for index in eligible_indices[start:end]:
+            image_path = str(base.images[index], encoding="utf-8")
+            parts = image_path.split("/")
+            selected_pairs.add((parts[-3], parts[-1].split(".")[0]))
+            selected_count += 1
+    if len(selected_pairs) != selected_count:
         raise ValueError("duplicate route/frame pairs in selected dataset shard")
     key_by_route_frame = {}
     with args.manifest.open() as handle:
@@ -237,49 +266,69 @@ def main() -> None:
                 key_by_route_frame[pair] = entry["key"]
     if len(key_by_route_frame) != len(selected_pairs):
         raise ValueError("manifest does not cover every selected dataset frame")
-    saved: dict[str, list[np.ndarray]] = {name: [] for name in FIELDS}
-    for data in tqdm(loader, desc=f"joint scene {args.start}:{args.end}", unit="batch"):
-        data.pop("anchor", None)  # use anchors predicted by the frozen model
-        with torch.inference_mode(), torch.amp.autocast(
-            device_type=device.type, dtype=config.torch_float_type,
-            enabled=config.use_mixed_precision_training and device.type == "cuda",
-        ):
-            prediction = model(data)
-        keys = [
-            key_by_route_frame[(route, frame)]
-            for route, frame in zip(data["route_number"], data["frame_number"], strict=True)
-        ]
-        batch = pack_batch(
-            prediction, data, keys, offsets,
-            spatial_shape=(config.lidar_vert_anchors, config.lidar_horz_anchors),
-            has_intent_tokens=config.use_control_conditioning,
+    for start, end, output in pending:
+        dataset.valid_indices = eligible_indices[start:end]
+        loader_kwargs = dict(
+            dataset=dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, collate_fn=_collate,
+            pin_memory=device.type == "cuda",
         )
-        for name in FIELDS:
-            saved[name].append(batch[name])
-    packed = {name: np.concatenate(saved[name], axis=0) for name in FIELDS}
-    if len(packed["keys"]) != args.end - args.start:
-        raise RuntimeError("dataset frame count changed during extraction")
-    packed.update(
-        schema_version=np.asarray(SCHEMA_VERSION),
-        same_forward=np.asarray(True),
-        source_checkpoint=np.asarray(str(checkpoint.resolve())),
-        checkpoint_size=np.asarray(checkpoint.stat().st_size),
-        checkpoint_mtime_ns=np.asarray(checkpoint.stat().st_mtime_ns),
-        source_manifest=np.asarray(str(args.manifest.resolve())),
-        nearest_vlm_manifest=np.asarray(str(args.nearest_vlm_manifest.resolve())),
-        start=np.asarray(args.start), end=np.asarray(args.end),
-        original_path_count=np.asarray(packed["route_conf"].shape[1]),
-        local_offsets_m=np.asarray(offsets, dtype=np.float32),
-    )
-    partial = output.with_name(output.name + ".partial.npz")
-    np.savez_compressed(partial, **packed)
-    verify_shard(
-        partial, checkpoint, args.manifest, args.nearest_vlm_manifest,
-        args.start, args.end, offsets,
-    )
-    os.replace(partial, output)
-    print(f"wrote {output}: frames={len(packed['keys'])} "
-          f"scene={packed['scene_tokens'].shape[1:]} paths={packed['routes'].shape[1:]}")
+        if args.num_workers:
+            loader_kwargs["prefetch_factor"] = 1
+        loader = DataLoader(**loader_kwargs)
+        saved: dict[str, list[np.ndarray]] = {name: [] for name in FIELDS}
+        data_wait_s = 0.0
+        forward_pack_s = 0.0
+        last_end = time.perf_counter()
+        for data in tqdm(loader, desc=f"joint scene {start}:{end}", unit="batch"):
+            now = time.perf_counter()
+            data_wait_s += now - last_end
+            data.pop("anchor", None)  # use anchors predicted by the frozen model
+            with torch.inference_mode(), torch.amp.autocast(
+                device_type=device.type, dtype=config.torch_float_type,
+                enabled=config.use_mixed_precision_training and device.type == "cuda",
+            ):
+                prediction = model(data)
+            keys = [
+                key_by_route_frame[(route, frame)]
+                for route, frame in zip(data["route_number"], data["frame_number"], strict=True)
+            ]
+            batch = pack_batch(
+                prediction, data, keys, offsets,
+                spatial_shape=(config.lidar_vert_anchors, config.lidar_horz_anchors),
+                has_intent_tokens=config.use_control_conditioning,
+            )
+            for name in FIELDS:
+                saved[name].append(batch[name])
+            last_end = time.perf_counter()
+            forward_pack_s += last_end - now
+        packed = {name: np.concatenate(saved[name], axis=0) for name in FIELDS}
+        if len(packed["keys"]) != end - start:
+            raise RuntimeError("dataset frame count changed during extraction")
+        packed.update(
+            schema_version=np.asarray(SCHEMA_VERSION),
+            same_forward=np.asarray(True),
+            source_checkpoint=np.asarray(str(checkpoint.resolve())),
+            checkpoint_size=np.asarray(checkpoint.stat().st_size),
+            checkpoint_mtime_ns=np.asarray(checkpoint.stat().st_mtime_ns),
+            source_manifest=np.asarray(str(args.manifest.resolve())),
+            nearest_vlm_manifest=np.asarray(str(args.nearest_vlm_manifest.resolve())),
+            start=np.asarray(start), end=np.asarray(end),
+            original_path_count=np.asarray(packed["route_conf"].shape[1]),
+            local_offsets_m=np.asarray(offsets, dtype=np.float32),
+        )
+        partial = output.with_name(output.name + ".partial.npz")
+        write_start = time.perf_counter()
+        np.savez_compressed(partial, **packed)
+        verify_shard(
+            partial, checkpoint, args.manifest, args.nearest_vlm_manifest,
+            start, end, offsets,
+        )
+        os.replace(partial, output)
+        print(f"wrote {output}: frames={len(packed['keys'])} "
+              f"scene={packed['scene_tokens'].shape[1:]} paths={packed['routes'].shape[1:]} "
+              f"data_wait={data_wait_s:.1f}s forward_pack={forward_pack_s:.1f}s "
+              f"write_verify={time.perf_counter()-write_start:.1f}s")
 
 
 if __name__ == "__main__":

@@ -22,6 +22,14 @@ B3B_JOINT_GPUS=0,1,2,3,4,5,6,7 \
 bash scripts/p4/build_p5_stepB3b_joint_scene_cache.sh both
 ```
 
-默认批量 32、DataLoader workers=0，避免此前 8 卡并发引起 `/dev/shm` Bus error。默认 12000 帧/分片，当前 VLM sparse-cache 可覆盖的 route 上约有 train 869958 帧、held-out 96406 帧，即 73+9 个分片。训练/held-out 严格按 route split，不能把 held-out 的 5000 帧 oracle 用作训练。日志在 `outputs/local_training/p5_stepB3b_joint_scorer/scene_cache/logs/{train,heldout}`，分片在 `.../scene_cache/{train,heldout}`。脚本检测已有分片并续跑，末尾核对数目、key 唯一性、来源和覆盖；若已有分片来源不符，校验会报错，不会悄悄混用。没有 gpu-burn。
+默认批量 64、DataLoader workers=0，避免此前 8 卡并发引起 `/dev/shm` Bus error。默认 12000 帧/分片，当前 VLM sparse-cache 可覆盖的 route 上约有 train 869958 帧、held-out 96406 帧，即 73+9 个分片。训练/held-out 严格按 route split，不能把 held-out 的 5000 帧 oracle 用作训练。每张 GPU 只启动一个持久 Python 进程：模型与密集 CARLA 索引仅加载一次，该进程连续写自己负责的多个原格式分片。日志为 `outputs/local_training/p5_stepB3b_joint_scorer/scene_cache/logs/{train,heldout}/gpu*_persistent.log`，分片仍在 `.../scene_cache/{train,heldout}`。脚本检测已有分片并续跑，末尾核对数目、key 唯一性、来源和覆盖；若已有分片来源不符，校验会报错，不会悄悄混用。没有 gpu-burn。
 
-若显存或 I/O 紧张，可用 `B3B_JOINT_BATCH_SIZE=16` 或减少 `B3B_JOINT_GPUS`；保持输出目录及分片大小不变即可续跑。若 pilot 失败，先查看相应 `.log`，不要直接启动全量。
+若显存或 I/O 紧张，可用 `B3B_JOINT_BATCH_SIZE=32` 或减少 `B3B_JOINT_GPUS`；保持输出目录及分片大小不变即可续跑。`B3B_JOINT_NUM_WORKERS` 默认仍为 0，勿直接在 8 卡同时设为 4。若 pilot 失败，先查看相应 `.log`，不要直接启动全量。旧版单分片产生的 `.npz` 与新版持久 worker 的格式相同，可以保留并续跑；不要删除已完成分片。
+
+每个完成分片的日志末尾会报告 `data_wait`、`forward_pack`、`write_verify` 的耗时，便于判断后续瓶颈。在另一个终端查看 GPU 0 的实时日志：
+
+```bash
+tail -f outputs/local_training/p5_stepB3b_joint_scorer/scene_cache/logs/train/gpu0_persistent.log
+```
+
+如果旧版提取仍在运行，新代码不会改变那个已启动进程；不要同时启动两套任务。确认旧任务停止后重新运行上述全量命令，已完成且文件名匹配的分片会保留并跳过。

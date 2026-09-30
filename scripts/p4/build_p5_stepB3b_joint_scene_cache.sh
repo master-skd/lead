@@ -11,8 +11,9 @@ SPLIT_DIR="${B3B_JOINT_SPLIT_DIR:-${DENSE_ROOT}/route_split}"
 NEAREST_MANIFEST="${B3B_JOINT_NEAREST_MANIFEST:-${REPO_ROOT}/data/p4/manifest.jsonl}"
 OUTPUT_ROOT="${B3B_JOINT_OUTPUT_ROOT:-${REPO_ROOT}/outputs/local_training/p5_stepB3b_joint_scorer/scene_cache}"
 CHUNK_SIZE="${B3B_JOINT_CHUNK_SIZE:-12000}"
-BATCH_SIZE="${B3B_JOINT_BATCH_SIZE:-32}"
+BATCH_SIZE="${B3B_JOINT_BATCH_SIZE:-64}"
 NUM_WORKERS="${B3B_JOINT_NUM_WORKERS:-0}"
+CPU_THREADS="${B3B_JOINT_CPU_THREADS:-4}"
 START="${B3B_JOINT_START:-0}"
 LIMIT="${B3B_JOINT_LIMIT:-0}"
 SPLIT="${1:-both}"
@@ -25,14 +26,14 @@ if [[ ! -x "${LEAD_PYTHON}" || ! -f "${CKPT_DIR}/model_0019.pth" || ! -f "${NEAR
     echo "missing Python, B2 corridor checkpoint, or sparse VLM manifest" >&2
     exit 2
 fi
-for number in "${CHUNK_SIZE}" "${BATCH_SIZE}" "${START}" "${LIMIT}" "${NUM_WORKERS}"; do
+for number in "${CHUNK_SIZE}" "${BATCH_SIZE}" "${START}" "${LIMIT}" "${NUM_WORKERS}" "${CPU_THREADS}"; do
     if [[ ! "${number}" =~ ^[0-9]+$ ]]; then
         echo "chunk/batch/start/limit/workers must be nonnegative integers" >&2
         exit 2
     fi
 done
-if (( CHUNK_SIZE < 1 || BATCH_SIZE < 1 )); then
-    echo "chunk and batch sizes must be positive" >&2
+if (( CHUNK_SIZE < 1 || BATCH_SIZE < 1 || CPU_THREADS < 1 )); then
+    echo "chunk, batch and CPU thread counts must be positive" >&2
     exit 2
 fi
 
@@ -92,36 +93,50 @@ PY
         fi
     done
     echo "${split}: eligible=${total}, interval=[${START},${end_limit}), skipped=${skipped}, pending=${#starts[@]}"
-    for ((offset=0; offset<${#starts[@]}; offset+=${#DEVICES[@]})); do
-        local pids=()
-        local labels=()
-        for ((slot=0; slot<${#DEVICES[@]} && offset+slot<${#starts[@]}; slot++)); do
-            local start=${starts[$((offset+slot))]}
-            local end=$((start + CHUNK_SIZE))
-            if (( end > end_limit )); then end=${end_limit}; fi
-            local log
-            log=$(printf '%s/joint_scene_%06d_%06d.log' "${logs}" "${start}" "${end}")
-            echo "extract ${split} [${start},${end}) on GPU ${DEVICES[$slot]} -> ${log}"
-            CUDA_VISIBLE_DEVICES="${DEVICES[$slot]}" "${LEAD_PYTHON}" \
-                scripts/p4/extract_b3b_joint_scene.py \
-                --ckpt-dir "${CKPT_DIR}" --manifest "${manifest}" \
-                --nearest-vlm-manifest "${NEAREST_MANIFEST}" \
-                --output-dir "${output_dir}" --start "${start}" --end "${end}" \
-                --batch-size "${BATCH_SIZE}" --num-workers "${NUM_WORKERS}" \
-                >"${log}" 2>&1 &
-            pids+=("$!")
-            labels+=("${log}")
-        done
-        local failed=0
-        for ((slot=0; slot<${#pids[@]}; slot++)); do
-            if ! wait "${pids[$slot]}"; then
-                echo "failed: ${labels[$slot]}" >&2
-                tail -n 25 "${labels[$slot]}" >&2
-                failed=1
-            fi
-        done
-        if (( failed )); then return 1; fi
+    # Keep one Python/model/dataset process alive per GPU for all its pending
+    # shards. This avoids rebuilding the dense CARLA index and loading the
+    # checkpoint for every 12k-frame shard.
+    local worker_intervals=()
+    for ((slot=0; slot<${#DEVICES[@]}; slot++)); do worker_intervals+=(""); done
+    for ((i=0; i<${#starts[@]}; i++)); do
+        local slot=$((i % ${#DEVICES[@]}))
+        local start=${starts[$i]}
+        local end=$((start + CHUNK_SIZE))
+        if (( end > end_limit )); then end=${end_limit}; fi
+        if [[ -n "${worker_intervals[$slot]}" ]]; then
+            worker_intervals[$slot]+=","
+        fi
+        worker_intervals[$slot]+="${start}:${end}"
     done
+    local pids=()
+    local labels=()
+    for ((slot=0; slot<${#DEVICES[@]}; slot++)); do
+        if [[ -z "${worker_intervals[$slot]}" ]]; then continue; fi
+        local log="${logs}/gpu${DEVICES[$slot]}_persistent.log"
+        local assigned=()
+        IFS=',' read -r -a assigned <<< "${worker_intervals[$slot]}"
+        echo "GPU ${DEVICES[$slot]}: ${split} ${#assigned[@]} pending shards -> ${log}"
+        CUDA_VISIBLE_DEVICES="${DEVICES[$slot]}" \
+            OMP_NUM_THREADS="${CPU_THREADS}" MKL_NUM_THREADS="${CPU_THREADS}" \
+            OPENBLAS_NUM_THREADS="${CPU_THREADS}" \
+            "${LEAD_PYTHON}" scripts/p4/extract_b3b_joint_scene.py \
+            --ckpt-dir "${CKPT_DIR}" --manifest "${manifest}" \
+            --nearest-vlm-manifest "${NEAREST_MANIFEST}" \
+            --output-dir "${output_dir}" --intervals "${worker_intervals[$slot]}" \
+            --batch-size "${BATCH_SIZE}" --num-workers "${NUM_WORKERS}" \
+            >"${log}" 2>&1 &
+        pids+=("$!")
+        labels+=("${log}")
+    done
+    local failed=0
+    for ((slot=0; slot<${#pids[@]}; slot++)); do
+        if ! wait "${pids[$slot]}"; then
+            echo "failed: ${labels[$slot]}" >&2
+            tail -n 25 "${labels[$slot]}" >&2
+            failed=1
+        fi
+    done
+    if (( failed )); then return 1; fi
     "${LEAD_PYTHON}" scripts/p4/verify_b3b_joint_scene_cache.py \
         --cache-dir "${output_dir}" --ckpt-dir "${CKPT_DIR}" \
         --manifest "${manifest}" --nearest-vlm-manifest "${NEAREST_MANIFEST}" \
