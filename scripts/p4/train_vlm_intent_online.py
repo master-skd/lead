@@ -28,13 +28,23 @@ from lead.tfv6.vlm_intent_decoder import VLMIntentDecoder
 class OnlineIntentDataset(Dataset):
     """Only RGB and precomputed lane-graph labels; no CARLA sensor/bucket cache."""
 
-    def __init__(self, manifest: Path, label_dir: Path, limit: int = 0):
+    def __init__(
+        self, manifest: Path, label_dir: Path, limit: int = 0,
+        rgb_root: Path | None = None,
+    ):
         self.samples = []
         with manifest.open() as stream:
             for line in stream:
                 entry = json.loads(line)
                 label = label_dir / entry["scenario"] / entry["route"] / (entry["frame"] + ".npy")
-                self.samples.append((Path(entry["src"]), label))
+                image = Path(entry["src"])
+                if rgb_root is not None:
+                    prefix = Path("data/carla_leaderboard2/data")
+                    try:
+                        image = rgb_root / image.relative_to(prefix)
+                    except ValueError as exc:
+                        raise ValueError(f"RGB path is outside {prefix}: {image}") from exc
+                self.samples.append((image, label))
                 if limit and len(self.samples) >= limit:
                     break
         if not self.samples:
@@ -107,6 +117,8 @@ def main() -> None:
     parser.add_argument("--val-manifest", type=Path, required=True)
     parser.add_argument("--split-metadata", type=Path, required=True)
     parser.add_argument("--lanegraph-label-dir", type=Path, required=True)
+    parser.add_argument("--rgb-root", type=Path,
+                        help="replace the manifest's data/carla_leaderboard2/data prefix")
     parser.add_argument("--logdir", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=256, help="global decoder batch")
     parser.add_argument("--qwen-batch-size", type=int, default=4, help="Qwen forward microbatch")
@@ -128,8 +140,12 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
 
-    train_ds = OnlineIntentDataset(args.train_manifest, args.lanegraph_label_dir, args.limit_train)
-    val_ds = OnlineIntentDataset(args.val_manifest, args.lanegraph_label_dir, args.limit_val)
+    train_ds = OnlineIntentDataset(
+        args.train_manifest, args.lanegraph_label_dir, args.limit_train, args.rgb_root,
+    )
+    val_ds = OnlineIntentDataset(
+        args.val_manifest, args.lanegraph_label_dir, args.limit_val, args.rgb_root,
+    )
     split = json.loads(args.split_metadata.read_text())
     if split["route_overlap"] or (
         not args.limit_train and len(train_ds) != split["train_frames"]

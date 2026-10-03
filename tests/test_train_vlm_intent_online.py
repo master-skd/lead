@@ -31,6 +31,25 @@ def test_online_dataset_reads_only_rgb_and_lanegraph_label(tmp_path: Path):
     assert sample_label.dtype == torch.float32
 
 
+def test_online_dataset_remaps_rgb_root(tmp_path: Path):
+    rgb_root = tmp_path / "elsewhere" / "data" / "carla_leaderboard2" / "data"
+    image = rgb_root / "scenario" / "route" / "rgb" / "0001.jpg"
+    image.parent.mkdir(parents=True)
+    Image.new("RGB", (1152, 384)).save(image)
+    labels = tmp_path / "labels" / "scenario" / "route"
+    labels.mkdir(parents=True)
+    np.save(labels / "0001.npy", np.zeros((1, 320, 384), dtype=np.float16))
+    manifest = tmp_path / "train.jsonl"
+    manifest.write_text(json.dumps({
+        "src": "data/carla_leaderboard2/data/scenario/route/rgb/0001.jpg",
+        "scenario": "scenario", "route": "route", "frame": "0001",
+    }) + "\n")
+
+    dataset = OnlineIntentDataset(manifest, tmp_path / "labels", rgb_root=rgb_root)
+    assert dataset.samples[0][0] == image
+    assert dataset[0][0].size == (1152, 384)
+
+
 def test_online_qwen_tokens_keep_only_image_positions_and_fp16_boundary():
     class Inputs(dict):
         def to(self, _device):
