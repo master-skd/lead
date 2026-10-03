@@ -13,6 +13,7 @@ Or directly:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -30,6 +31,10 @@ def main() -> None:
     ap.add_argument("--manifest", default=None,
                     help="extraction manifest; if given, cache membership is tested in "
                          "memory instead of one os.path.exists per frame (avoids a stat storm)")
+    ap.add_argument("--val-manifest", default=None,
+                    help="optional route-disjoint heldout manifest for validation")
+    ap.add_argument("--split-metadata", default=None,
+                    help="assert the dataset matches the route-disjoint split counts")
     ap.add_argument("--logdir", default="outputs/local_training/vlm_intent_p4a")
     ap.add_argument("--batch-size", type=int, default=128, help="GLOBAL batch size (split across GPUs)")
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -84,6 +89,20 @@ def main() -> None:
 
     carla_ds = CARLAData(root=config.carla_data, config=config)
     vlm_ds = VLMIntentDataset(carla_ds, vlm_cache_dir=args.vlm_cache, manifest_path=args.manifest)
+    val_ds = (
+        VLMIntentDataset(carla_ds, vlm_cache_dir=args.vlm_cache, manifest_path=args.val_manifest)
+        if args.val_manifest else None
+    )
+    if len(vlm_ds) == 0 or (val_ds is not None and len(val_ds) == 0):
+        raise ValueError("train or heldout manifest has no frames in CARLAData")
+    if args.split_metadata:
+        with open(args.split_metadata) as stream:
+            split = json.load(stream)
+        if len(vlm_ds) != split["train_frames"] or val_ds is None or len(val_ds) != split["heldout_frames"]:
+            raise ValueError(
+                f"intent dataset/split mismatch: train={len(vlm_ds)}/{split['train_frames']} "
+                f"heldout={len(val_ds) if val_ds is not None else 0}/{split['heldout_frames']}"
+            )
 
     per_gpu_bs = max(1, args.batch_size // world_size)
     sampler = DistributedSampler(vlm_ds, shuffle=True) if is_ddp else None
@@ -97,9 +116,20 @@ def main() -> None:
         pin_memory=True,
         drop_last=True,
     )
+    val_sampler = (
+        DistributedSampler(val_ds, shuffle=False) if is_ddp and val_ds is not None else None
+    )
+    val_loader = (
+        DataLoader(
+            val_ds, batch_size=per_gpu_bs, shuffle=False, sampler=val_sampler,
+            num_workers=args.num_workers, collate_fn=vlm_intent_collate_fn,
+            pin_memory=True, drop_last=False,
+        ) if val_ds is not None else None
+    )
     if is_main:
         print(f"world_size={world_size}, per_gpu_bs={per_gpu_bs}, "
-              f"{len(vlm_ds)} samples, {len(loader)} batches/epoch/gpu")
+              f"train={len(vlm_ds)} val={len(val_ds) if val_ds is not None else 0} "
+              f"samples, {len(loader)} train batches/epoch/gpu")
 
     # Model
     model = VLMIntentDecoder(config).to(device)
@@ -114,21 +144,24 @@ def main() -> None:
 
     # Resume
     start_epoch = 0
+    best_val_loss = float("inf")
     if args.resume and os.path.exists(args.resume):
         ckpt = torch.load(args.resume, map_location=device)
         core.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt["epoch"] + 1
+        best_val_loss = ckpt.get("best_val_loss", best_val_loss)
         if is_main:
             print(f"Resumed from {args.resume}, starting epoch {start_epoch}")
 
     # Training loop
-    model.train()
     for epoch in range(start_epoch, args.epochs):
+        model.train()
         if sampler is not None:
             sampler.set_epoch(epoch)
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", disable=not is_main)
         epoch_loss = 0.0
+        train_count = 0
         for batch in pbar:
             vlm_hidden = batch["vlm_hidden"].to(device)
             for k in ["visual_intent_label", "route"]:
@@ -145,26 +178,64 @@ def main() -> None:
             loss.backward()
             optimizer.step()
 
-            epoch_loss += loss.item()
+            n = vlm_hidden.shape[0]
+            epoch_loss += loss.item() * n
+            train_count += n
             if is_main:
                 pbar.set_postfix(loss=loss.item())
 
-        avg_loss = epoch_loss / len(loader)
+        totals = torch.tensor([epoch_loss, train_count], dtype=torch.float64, device=device)
+        if is_ddp:
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        avg_loss = (totals[0] / totals[1]).item()
+
+        val_loss = None
+        if val_loader is not None:
+            model.eval()
+            val_sum = val_count = 0
+            with torch.inference_mode():
+                for batch in tqdm(val_loader, desc=f"Val {epoch}", disable=not is_main):
+                    vlm_hidden = batch["vlm_hidden"].to(device)
+                    for key in ("visual_intent_label", "route"):
+                        if key in batch:
+                            batch[key] = batch[key].to(device)
+                    pred_intent = model(vlm_hidden)
+                    loss_dict, log_dict = {}, {}
+                    core.compute_loss(pred_intent, batch, loss_dict, log_dict)
+                    n = vlm_hidden.shape[0]
+                    val_sum += loss_dict["loss_visual_intent"].item() * n
+                    val_count += n
+            totals = torch.tensor([val_sum, val_count], dtype=torch.float64, device=device)
+            if is_ddp:
+                dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+            val_loss = (totals[0] / totals[1]).item()
+
         if is_main:
-            print(f"Epoch {epoch}: avg loss = {avg_loss:.4f}")
-            if (epoch + 1) % 5 == 0 or epoch == args.epochs - 1:
+            print(f"Epoch {epoch}: train={avg_loss:.4f}"
+                  + (f" val={val_loss:.4f}" if val_loss is not None else ""))
+            improved = val_loss is not None and val_loss < best_val_loss
+            if improved:
+                best_val_loss = val_loss
+            if val_loader is not None or (epoch + 1) % 5 == 0 or epoch == args.epochs - 1:
                 ckpt_path = os.path.join(args.logdir, f"model_{epoch:04d}.pth")
-                torch.save(
-                    {"epoch": epoch, "model": core.state_dict(),
-                     "optimizer": optimizer.state_dict(), "loss": avg_loss},
-                    ckpt_path,
-                )
+                checkpoint = {
+                    "epoch": epoch, "model": core.state_dict(),
+                    "optimizer": optimizer.state_dict(), "loss": avg_loss,
+                    "val_loss": val_loss, "best_val_loss": best_val_loss,
+                }
+                torch.save(checkpoint, ckpt_path + ".tmp")
+                os.replace(ckpt_path + ".tmp", ckpt_path)
                 print(f"Saved {ckpt_path}")
+                if improved:
+                    best_path = os.path.join(args.logdir, "model_best.pth")
+                    torch.save(checkpoint, best_path + ".tmp")
+                    os.replace(best_path + ".tmp", best_path)
+                    print(f"Saved best heldout checkpoint: {best_path}")
 
     if is_ddp:
         dist.destroy_process_group()
     if is_main:
-        print(f"✓ P4a training done. Checkpoints in {args.logdir}")
+        print(f"VLM intent training done. Checkpoints in {args.logdir}")
 
 
 if __name__ == "__main__":

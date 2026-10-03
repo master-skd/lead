@@ -94,12 +94,12 @@ class VLMIntentDecoder(nn.Module):
 
         Reuses IntentDecoder.compute_loss logic: BCE + pos_weight.
         """
-        from lead.tfv6.intent_decoder import rasterize_waypoints_to_bev
-
         # Get or build visual_intent_label (P1 precomputed it in dataloader if available)
         if "visual_intent_label" in data:
             target = data["visual_intent_label"]  # (B, 1, H, W)
         else:
+            from lead.tfv6.intent_decoder import rasterize_waypoints_to_bev
+
             # Fallback: rasterize expert route on-the-fly
             target = rasterize_waypoints_to_bev(
                 data["route"],  # (B, num_route_pts, 3)

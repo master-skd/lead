@@ -15,8 +15,36 @@ Run (lead env), sharded:
      --num-shards 8 --shard $i &
 """
 from __future__ import annotations
-import argparse, glob, json, math, os
+import argparse, glob, json, math, os, tempfile
 import numpy as np
+
+
+def valid_npy(path: str, shape: tuple[int, ...]) -> bool:
+    try:
+        array = np.load(path, mmap_mode="r", allow_pickle=False)
+        return (
+            isinstance(array, np.memmap)
+            and array.shape == shape
+            and array.dtype == np.dtype("float16")
+            and os.path.getsize(path) == array.offset + array.nbytes
+        )
+    except (OSError, ValueError, EOFError):
+        return False
+
+
+def atomic_save_npy(path: str, array: np.ndarray) -> None:
+    parent = os.path.dirname(path)
+    os.makedirs(parent, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".lanegraph_", suffix=".npy.tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            np.save(stream, array, allow_pickle=False)
+        if not valid_npy(temporary, array.shape):
+            raise ValueError(f"invalid lane-graph array written to {temporary}")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def main():
@@ -66,7 +94,7 @@ def main():
         sc, rt, fr = e["scenario"], e["route"], e["frame"]
         lab_p = os.path.join(args.out_label, sc, rt, fr + ".npy")
         anc_p = os.path.join(args.out_anchor, sc, rt, fr + ".npy")
-        if os.path.exists(lab_p) and os.path.exists(anc_p):
+        if valid_npy(lab_p, (1, H, W)) and valid_npy(anc_p, (K_MAX, 5)):
             skipped += 1; continue
         meta_p = os.path.join(os.path.dirname(os.path.dirname(e["src"])), "metas", fr + ".pkl")
         try:
@@ -110,10 +138,8 @@ def main():
         if label.max() > 0:
             label /= label.max()
 
-        os.makedirs(os.path.dirname(lab_p), exist_ok=True)
-        os.makedirs(os.path.dirname(anc_p), exist_ok=True)
-        np.save(lab_p, label[None].astype(np.float16))          # (1,H,W)
-        np.save(anc_p, anchors.astype(np.float16))              # (K_MAX,5)
+        atomic_save_npy(lab_p, label[None].astype(np.float16))  # (1,H,W)
+        atomic_save_npy(anc_p, anchors.astype(np.float16))      # (K_MAX,5)
         done += 1
         if done <= 3 or done % 2000 == 0:
             print(f"[shard {args.shard}] {done} {sc}/{fr} arms={ai} town={town}", flush=True)
