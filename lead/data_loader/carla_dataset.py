@@ -471,7 +471,32 @@ class CARLAData(Dataset):
             # P5b: attach the cached (frozen) VLM hidden states for this frame so the
             # model can feed them through the frozen VLM intent head. The dataset is
             # already restricted to cached frames in shuffle(), so the .npy exists.
-            if self.config.use_vlm_intent and not getattr(
+            if self.config.use_vlm_intent and getattr(
+                self.config, "online_joint_training", False
+            ):
+                # This is the exact unperturbed 3-camera strip used by P6 intent
+                # training. The lead-env trainer asks a live Qwen service for its
+                # hidden states; no VLM feature .npy is read or written.
+                from PIL import Image
+
+                with Image.open(str(self.images[index], encoding="utf-8")) as source:
+                    data["vlm_rgb"] = np.asarray(source.convert("RGB")).copy()
+                if data["vlm_rgb"].shape != (384, 1152, 3):
+                    raise ValueError("online joint Qwen input must be the full 3-cam strip")
+                from lead.data_loader.future_actor_cache import (
+                    pack_future_actor_frames, parse_future_actor_frame,
+                )
+
+                future = np.asarray(meta["future_positions"], dtype=np.float32)
+                if future.ndim != 2 or future.shape[0] <= 40:
+                    raise ValueError(f"incomplete future ego poses: {measurement_file}")
+                data["joint_ego_future"] = future[np.arange(5, 41, 5), :2]
+                actors = parse_future_actor_frame(common_utils.read_pickle(box_path))
+                packed = pack_future_actor_frames([actors], ["frame"])
+                for field in ("positions", "yaws", "extents", "z", "valid",
+                              "class_ids", "ego_extent", "counts"):
+                    data[f"joint_actor_{field}"] = packed[field][0]
+            elif self.config.use_vlm_intent and not getattr(
                 self.config, "defer_vlm_inputs_to_wrapper", False
             ):
                 p = str(self.images[index], encoding="utf-8").split("/")
@@ -1236,9 +1261,9 @@ class CARLAData(Dataset):
             indices = np.arange(len(self.images))
             rng.shuffle(indices)
 
-            # P5b: restrict to frames that have a cached VLM feature (the ~96k stride-10
-            # subset). Membership is tested against the extraction manifest in memory
-            # (no per-frame os.path.exists -> avoids a metadata storm on shared storage).
+            # Restrict to manifest keys. Legacy runs use their sparse VLM-cache
+            # manifest; online joint training uses the full, route-separated
+            # train/held-out manifests and never checks for feature files.
             if self.config.use_vlm_intent:
                 if not hasattr(self, "_vlm_cached_keys"):
                     import json as _json
@@ -1254,6 +1279,9 @@ class CARLAData(Dataset):
                     return (q[-4], q[-3], q[-1].split(".")[0]) in self._vlm_cached_keys
 
                 indices = np.array([i for i in indices if _cached(i)], dtype=indices.dtype)
+                if self.rank == 0 and self.config.online_joint_training:
+                    LOG.info("Online joint manifest selected %d / %d CARLA frames",
+                             len(indices), len(self.images))
 
             if self.config.carla_num_samples > 0:
                 if self.config.carla_num_samples <= len(indices):

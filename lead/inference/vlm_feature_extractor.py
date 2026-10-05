@@ -124,3 +124,40 @@ def extract_vlm_hidden(
             f"token/grid mismatch: {img_hs.shape[0]} image tokens vs {h2}x{w2} grid"
         )
     return img_hs.reshape(h2, w2, -1).to(torch.float16).cpu().numpy()
+
+
+@torch.no_grad()
+def extract_vlm_hidden_batch(
+    images: list[Image.Image], model, processor, image_token_id: int, merge: int,
+    *, prompt_mode: str = "3cam_drivable", device: str = "cuda:0",
+) -> npt.NDArray:
+    """One Qwen prefill for an equal-sized batch, matching the P6 fp16 cache boundary."""
+    if not images:
+        raise ValueError("empty VLM image batch")
+    if prompt_mode != "3cam_drivable":
+        raise ValueError("batched extraction currently supports 3cam_drivable only")
+    conversations = [
+        [{"role": "user", "content": [
+            {"type": "text", "text": PROMPT_3CAM_DRIVABLE},
+            {"type": "image", "image": image},
+        ]}]
+        for image in images
+    ]
+    inputs = processor.apply_chat_template(
+        conversations[0] if len(images) == 1 else conversations,
+        tokenize=True, add_generation_prompt=True,
+        return_dict=True, return_tensors="pt",
+        processor_kwargs={"padding": len(images) > 1},
+    ).to(device)
+    output = model(**inputs, output_hidden_states=True, use_cache=False)
+    hidden = output.hidden_states[-1]
+    if len(inputs["image_grid_thw"]) != len(images):
+        raise ValueError("Qwen image grid count does not match request")
+    features = []
+    for i, grid in enumerate(inputs["image_grid_thw"].tolist()):
+        h, w = grid[1] // merge, grid[2] // merge
+        tokens = hidden[i][inputs["input_ids"][i] == image_token_id]
+        if (h, w, tokens.shape[0]) != (12, 36, 432):
+            raise ValueError(f"unexpected image-token grid: {(h, w, tokens.shape[0])}")
+        features.append(tokens.reshape(h, w, -1).to(torch.float16).cpu().numpy())
+    return np.stack(features)

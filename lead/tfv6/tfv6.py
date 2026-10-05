@@ -109,6 +109,13 @@ class TFv6(nn.Module):
                 config=self.config,
                 device=self.device,
             ).to(self.device)
+            if self.config.joint_scorer_replaces_conf:
+                from lead.tfv6.joint_trajectory_scorer import JointTrajectorySceneScorer
+
+                self.joint_scorer = JointTrajectorySceneScorer(
+                    scene_dim=self.config.transfuser_token_dim,
+                    hidden_dim=128, num_heads=8,
+                ).to(self.device)
 
         if self.config.use_intent_decoder:
             from lead.tfv6.intent_decoder import IntentDecoder
@@ -134,6 +141,14 @@ class TFv6(nn.Module):
             self.vlm_intent_decoder.load_state_dict(ckpt["model"])
             self.vlm_intent_decoder.eval()
             self.vlm_intent_decoder.requires_grad_(False)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # nn.Module.train() recursively toggles child BatchNorm layers. Frozen
+        # intent must keep the running statistics learned by the full-data run.
+        if getattr(self.config, "use_vlm_intent", False):
+            self.vlm_intent_decoder.eval()
+        return self
 
     def _anchors_from_blob(self, intent_logits):
         """Closed-loop anchor: extract skeleton anchors from the pred blob and pack to the
@@ -237,6 +252,10 @@ class TFv6(nn.Module):
                     # deterministic) pred blob with the SAME extractor used to build the
                     # training cache, so train/eval anchors are identical.
                     planner_anchor = self._anchors_from_blob(pred_visual_intent)
+                if self.config.online_joint_training and planner_anchor is not None:
+                    # Same predicted anchors in train and closed loop. No disk
+                    # anchor cache or GT lane-graph anchor is consumed here.
+                    data["anchor"] = planner_anchor
             (
                 pred_route,
                 pred_future_waypoints,
@@ -257,6 +276,47 @@ class TFv6(nn.Module):
             # ego-status and (when enabled) radar tokens.  Keeping this optional
             # makes the addition inference/backward compatible with old callers.
             pred_scene_tokens = self.planning_decoder.kv
+
+            if self.config.joint_scorer_replaces_conf:
+                from lead.tfv6.joint_online_training import compose_route_states
+                from lead.tfv6.trajectory_scene_scorer import compress_planner_scene_tokens
+
+                routes = data["route_multimodal"]
+                valid = data["anchor"][..., 3].to(routes.device) > 0.5
+                # The extractor can occasionally produce no arm. Reserve slot 0
+                # as a fallback so loss and selection remain well-defined.
+                empty = ~valid.any(dim=1)
+                if empty.any():
+                    valid = valid.clone()
+                    valid[empty, 0] = True
+                    data["anchor"] = data["anchor"].clone()
+                    data["anchor"][empty, 0, 3] = 1.0
+                states = compose_route_states(
+                    routes, data["speed"].to(routes.device), pred_target_speed_scalar,
+                )
+                scene = compress_planner_scene_tokens(
+                    pred_scene_tokens.detach().float(),
+                    spatial_shape=(self.config.lidar_vert_anchors,
+                                   self.config.lidar_horz_anchors),
+                    has_intent_tokens=self.config.use_control_conditioning,
+                )
+                logits = self.joint_scorer(states.detach(), scene.detach(), valid)
+                data["joint_score_logits"] = logits
+                data["joint_candidate_states"] = states
+                data["joint_candidate_valid"] = valid
+                if not self.training:
+                    # A learned route utility replaces WTA confidence. Safety
+                    # calibration/thresholding remains a separate held-out task.
+                    scores = {name: torch.sigmoid(value) for name, value in logits.items()}
+                    utility = (
+                        2 * scores["collision_free"] + scores["ttc"]
+                        + scores["drivable"] + scores["task"]
+                        + 0.5 * scores["progress"] + 0.25 * scores["comfort"]
+                        + 0.5 * scores["imitation"]
+                    )
+                    pred_route_selected_idx = utility.masked_fill(~valid, -1e9).argmax(1)
+                    rows = torch.arange(len(valid), device=routes.device)
+                    pred_route = routes[rows, pred_route_selected_idx]
 
         # Semantic segmentation forward pass
         if self.config.use_carla_data and self.config.use_semantic:
@@ -477,6 +537,21 @@ class TFv6(nn.Module):
                 loss=loss,
                 log=self.log,
             )
+            if self.config.joint_scorer_replaces_conf:
+                from lead.tfv6.joint_online_training import build_same_pass_labels
+                from lead.tfv6.joint_trajectory_scorer import joint_score_loss
+
+                targets = build_same_pass_labels(
+                    data["joint_candidate_states"], data["joint_candidate_valid"],
+                    data, self.config,
+                )
+                scorer_loss, details = joint_score_loss(
+                    data["joint_score_logits"], targets, data["joint_candidate_valid"],
+                )
+                loss["loss_joint_scorer"] = scorer_loss
+                for name, value in details.items():
+                    if name != "total":
+                        self.log[f"joint/{name}"] = value.detach()
 
         # Visual-intent loss
         if self.config.use_intent_decoder:

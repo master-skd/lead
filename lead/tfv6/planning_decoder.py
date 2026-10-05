@@ -74,7 +74,8 @@ class PlanningDecoder(nn.Module):
                 self.anchor_embed = nn.Sequential(
                     nn.Linear(4, D), nn.GELU(), nn.Linear(D, D),
                 )
-                self.conf_decoder = nn.Linear(D, 1)
+                if not self.config.joint_scorer_replaces_conf:
+                    self.conf_decoder = nn.Linear(D, 1)
         if self.config.predict_temporal_spatial_waypoints:
             self.wp_decoder = nn.Linear(config.transfuser_token_dim, 2)
             if self.config.use_navsim_data:
@@ -186,11 +187,15 @@ class PlanningDecoder(nn.Module):
                 # frozen representation for a per-arm dynamic-risk head.  Storing it in the
                 # transient batch dict adds no checkpoint parameters and changes no B2 loss.
                 route_features = route_q.mean(dim=2)  # (B,K,D)
-                conf = self.conf_decoder(route_features).squeeze(-1)  # (B,K)
+                conf = (
+                    self.conf_decoder(route_features).squeeze(-1)
+                    if not self.config.joint_scorer_replaces_conf else None
+                )
                 # Bypass via `data` (NOT `log`: logger scalar-reduces every log entry and
                 # would choke on these tensors). compute_loss reads them from data.
                 data["route_multimodal"] = route_all
-                data["route_conf"] = conf
+                if conf is not None:
+                    data["route_conf"] = conf
                 if not self.training:
                     data["route_features"] = route_features
                 # Which arm goes to the single-route consumers (closed-loop control reads
@@ -278,7 +283,7 @@ class PlanningDecoder(nn.Module):
         near-weighted L1. Confidence target: winner=1, other valid=0, padding=0.
         """
         route_all = data["route_multimodal"].float()  # (B,K,n,2)
-        conf = data["route_conf"].float()             # (B,K)
+        conf = data.get("route_conf")
         B, K, n, _ = route_all.shape
         gt = route_label.float()                     # (B,n,2)
         valid = data["anchor"].to(self.device).float()[:, :, 3]  # (B,K)
@@ -299,10 +304,12 @@ class PlanningDecoder(nn.Module):
         loss["loss_spatial_route"] += F.l1_loss(win_route[:, -1], gt[:, -1])  # FDE
 
         # confidence BCE: winner=1, others 0; mask padding out of the mean
-        conf_tgt = torch.zeros_like(conf)
-        conf_tgt[torch.arange(B), winner] = 1.0
-        bce = F.binary_cross_entropy_with_logits(conf, conf_tgt, reduction="none")  # (B,K)
-        loss["loss_route_conf"] = (bce * valid).sum() / valid.sum().clamp(min=1.0)
+        if not self.config.joint_scorer_replaces_conf:
+            conf = conf.float()
+            conf_tgt = torch.zeros_like(conf)
+            conf_tgt[torch.arange(B), winner] = 1.0
+            bce = F.binary_cross_entropy_with_logits(conf, conf_tgt, reduction="none")
+            loss["loss_route_conf"] = (bce * valid).sum() / valid.sum().clamp(min=1.0)
 
         # B2 anti-collapse (term 3): push each NON-winner valid arm toward its OWN anchor
         # BRANCH, so the K arms diverge instead of collapsing onto the winner (pure WTA
@@ -380,7 +387,7 @@ class PlanningDecoder(nn.Module):
         # checking the valid flag would happily steer down one. Supervising them here makes
         # confidence self-sufficient instead of relying on every consumer to mask correctly.
         pad = 1.0 - valid  # (B,K)
-        if self.config.route_pad_conf_loss_weight > 0:
+        if not self.config.joint_scorer_replaces_conf and self.config.route_pad_conf_loss_weight > 0:
             pad_bce = F.binary_cross_entropy_with_logits(
                 conf, torch.zeros_like(conf), reduction="none",
             )  # (B,K)

@@ -463,7 +463,7 @@ class TrainingConfig(BaseConfig):
     def use_color_aug(self):
         """If true apply image color based augmentations."""
         # If true apply image color based augmentations
-        return not self.visualize_dataset
+        return not self.visualize_dataset and not self.online_joint_validation
 
     @property
     def use_color_aug_prob(self):
@@ -941,6 +941,14 @@ class TrainingConfig(BaseConfig):
     vlm_intent_ckpt = None
     vlm_cache_dir = "data/p5/vlm_cache"
     vlm_manifest = "data/p4/manifest.jsonl"
+    # P6 joint run: Qwen features are fetched from a per-rank live service instead
+    # of a persistent VLM cache. The manifest restricts CARLAData to train routes.
+    online_joint_training = False
+    online_joint_validation = False
+    online_vlm_socket_dir = "/tmp/lead_joint_vlm"
+    joint_val_manifest = None
+    joint_val_max_frames = 5000
+    joint_dataloader_workers = 2
     # Offline feature extractors may wrap CARLAData with VLMIntentDataset, which
     # supplies exact/nearest cached VLM inputs itself.  In that case the base
     # dataset must not also require sparse-only VLM, anchor or lanegraph files.
@@ -974,6 +982,8 @@ class TrainingConfig(BaseConfig):
     # conditioned on a skeleton anchor), plus a per-mode confidence. False = single route
     # (StepA/B1/B1'). K_max slots; per-frame valid arms come from the anchor cache.
     multimodal_planner = False
+    # When true, the scene-interacting multi-head scorer replaces route_conf.
+    joint_scorer_replaces_conf = False
     multimodal_planner_k = 6  # K_MAX, must match anchor_extraction.K_MAX
     # B2: anchor cache dir (precomputed skeleton anchors, (K_MAX,5) per frame).
     anchor_cache_dir = "data/p6/anchor_cache"
@@ -1199,7 +1209,10 @@ class TrainingConfig(BaseConfig):
             },
         )
         # B2: per-mode confidence BCE (only active in multimodal planner mode).
-        weights["loss_route_conf"] = 1.0 if self.multimodal_planner else 0.0
+        weights["loss_route_conf"] = (
+            1.0 if self.multimodal_planner and not self.joint_scorer_replaces_conf else 0.0
+        )
+        weights["loss_joint_scorer"] = 1.0 if self.joint_scorer_replaces_conf else 0.0
         # B2 anti-collapse: non-winner arms are pushed toward their own anchor BRANCH
         # (loose hinges, not endpoint L1) so the K arms diverge. Weight tunable; too high
         # overrides winner-vs-expert fidelity.
@@ -1220,7 +1233,8 @@ class TrainingConfig(BaseConfig):
         )
         # B2 term 6: push padding arms' confidence to 0.
         weights["loss_route_pad_conf"] = (
-            self.route_pad_conf_loss_weight if self.multimodal_planner else 0.0
+            self.route_pad_conf_loss_weight
+            if self.multimodal_planner and not self.joint_scorer_replaces_conf else 0.0
         )
 
         # Disable planning losses during pretraining

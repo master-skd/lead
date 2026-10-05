@@ -1,5 +1,8 @@
 import logging
 import os
+import copy
+import math
+from pathlib import Path
 import sys
 import traceback
 import warnings
@@ -107,6 +110,35 @@ class Trainer:
             dataloader=self.dataloader,
             total_gradient_steps=self.total_gradient_steps,
         )
+        self.online_vlm_client = None
+        if self.config.online_joint_training:
+            from lead.inference.vlm_client import VLMServiceClient
+
+            socket_path = Path(self.config.online_vlm_socket_dir) / (
+                f"rank{self.config.local_rank}.sock"
+            )
+            self.online_vlm_client = VLMServiceClient(str(socket_path), timeout=600)
+        self.joint_val_loader = None
+        self.best_joint_val = float("inf")
+        if self.config.online_joint_training and self.config.joint_val_manifest:
+            from lead.data_loader.carla_dataset import CARLAData
+            from lead.training.mixed_training_utils import mixed_data_collate_fn
+
+            val_config = copy.copy(self.config)
+            val_config.vlm_manifest = self.config.joint_val_manifest
+            val_config.online_joint_validation = True
+            val_config.carla_num_samples = -1
+            val_dataset = CARLAData(root=val_config.carla_data, config=val_config)
+            val_sampler = torch.utils.data.DistributedSampler(
+                val_dataset, num_replicas=self.config.world_size,
+                rank=self.config.rank, shuffle=False,
+            )
+            self.joint_val_loader = torch.utils.data.DataLoader(
+                val_dataset, sampler=val_sampler,
+                batch_size=max(1, self.config.batch_size // self.config.world_size),
+                num_workers=1, pin_memory=True, prefetch_factor=1,
+                persistent_workers=True, collate_fn=mixed_data_collate_fn,
+            )
 
     @beartype
     def schedule_loss_weights(self, epoch: int):
@@ -150,6 +182,9 @@ class Trainer:
             # Training
             rfm_score = self.train()
 
+            if self.joint_val_loader is not None:
+                self.validate_joint_online(epoch)
+
             # Save model
             if self.config.rank == 0:
                 self.save(rfm_score)
@@ -158,6 +193,43 @@ class Trainer:
                 torch.distributed.barrier()  # Ensure all processes sync here before next epoch
 
             self.cur_epoch += 1
+
+    def validate_joint_online(self, epoch: int):
+        """Select a checkpoint on held-out routes, not the falling train loss."""
+        self.model.eval()
+        per_gpu_batch = max(1, self.config.batch_size // self.config.world_size)
+        max_batches = math.ceil(
+            self.config.joint_val_max_frames / (self.config.world_size * per_gpu_batch)
+        )
+        total = count = 0.0
+        with torch.inference_mode():
+            for data in islice(self.joint_val_loader, max_batches):
+                rgb = data.pop("vlm_rgb")
+                hidden = self.online_vlm_client.extract_batch(rgb.numpy())
+                data["vlm_hidden"] = torch.from_numpy(hidden.copy()).to(self.config.device)
+                with torch.amp.autocast(
+                    device_type="cuda", dtype=self.config.torch_float_type,
+                    enabled=self.config.use_mixed_precision_training,
+                ):
+                    prediction = self.model(data=data)
+                    losses, _ = self.model.compute_loss(prediction, data)
+                metric = losses["loss_joint_scorer"] + losses["loss_spatial_route"]
+                total += float(metric.item()) * len(rgb)
+                count += len(rgb)
+        sums = torch.tensor([total, count], device=self.config.device, dtype=torch.float64)
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(sums)
+        value = float(sums[0] / sums[1].clamp_min(1))
+        if self.config.rank == 0:
+            LOG.info("joint held-out epoch=%d frames=%d scorer+route=%.5f",
+                     epoch, int(sums[1]), value)
+            if value < self.best_joint_val:
+                self.best_joint_val = value
+                path = Path(self.config.logdir) / "model_best_joint.pth"
+                tmp = path.with_suffix(".tmp.pth")
+                torch.save(self.model.state_dict(), tmp)
+                os.replace(tmp, path)
+                LOG.info("saved best joint model: %s", path)
 
     @beartype
     def train(self) -> float | None:
@@ -171,6 +243,14 @@ class Trainer:
                 disable=self.config.rank != 0,
             ),
         ):
+            if self.online_vlm_client is not None:
+                rgb = data.pop("vlm_rgb")
+                hidden = self.online_vlm_client.extract_batch(rgb.numpy())
+                # np.frombuffer in the socket client is read-only; copy before
+                # making a Tensor, then transfer just this mini-batch to the GPU.
+                data["vlm_hidden"] = torch.from_numpy(hidden.copy()).to(
+                    self.config.device, non_blocking=True,
+                )
             loss = torch.zeros(
                 1,
                 dtype=self.config.torch_float_type,

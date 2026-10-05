@@ -100,6 +100,9 @@ def initialize_torch(config: TrainingConfig) -> int:
     ngpus_per_node = torch.cuda.device_count()
     ncpus_per_node = config.assigned_cpu_cores
     num_workers = int(ncpus_per_node / ngpus_per_node) * config.workers_per_cpu_cores
+    if config.online_joint_training:
+        # Online RGB/actor samples are much larger than ordinary LEAD samples.
+        num_workers = max(1, min(num_workers, config.joint_dataloader_workers))
 
     if torch.cuda.device_count() > 1:
         torch.distributed.init_process_group(

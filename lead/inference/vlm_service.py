@@ -48,7 +48,9 @@ def main() -> None:
     args = ap.parse_args()
 
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    from lead.inference.vlm_feature_extractor import extract_vlm_hidden, load_qwen_vl
+    from lead.inference.vlm_feature_extractor import (
+        extract_vlm_hidden, extract_vlm_hidden_batch, load_qwen_vl,
+    )
 
     print(f"[vlm_service] loading Qwen-VL from {args.model} ...", flush=True)
     model, processor, image_token_id, merge = load_qwen_vl(args.model, device=args.device)
@@ -68,6 +70,21 @@ def main() -> None:
             while True:
                 header = _recv_exact(conn, 8)
                 h, w = struct.unpack("<II", header)
+                if h == 0:
+                    count = w
+                    h, w = struct.unpack("<II", _recv_exact(conn, 8))
+                    if not (1 <= count <= 256 and h == 384 and w == 1152):
+                        raise ValueError(f"invalid batch request: {count}x{h}x{w}")
+                    raw = _recv_exact(conn, count * h * w * 3)
+                    images = np.frombuffer(raw, dtype=np.uint8).reshape(count, h, w, 3)
+                    feat = extract_vlm_hidden_batch(
+                        [Image.fromarray(image, "RGB") for image in images],
+                        model, processor, image_token_id, merge,
+                        prompt_mode=args.prompt_mode, device=args.device,
+                    )
+                    _, fh, fw, fd = feat.shape
+                    conn.sendall(struct.pack("<IIII", count, fh, fw, fd) + feat.tobytes())
+                    continue
                 img_bytes = _recv_exact(conn, h * w * 3)
                 img = np.frombuffer(img_bytes, dtype=np.uint8).reshape(h, w, 3)
                 front = Image.fromarray(img, "RGB")

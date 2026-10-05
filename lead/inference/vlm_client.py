@@ -51,6 +51,23 @@ class VLMServiceClient:
         data = self._recv_exact(fh * fw * fd * 2)  # float16 = 2 bytes
         return np.frombuffer(data, dtype=np.float16).reshape(fh, fw, fd)
 
+    def extract_batch(self, rgb: npt.NDArray) -> npt.NDArray:
+        """Request one batched Qwen forward; input [B,H,W,3], output [B,12,36,D].
+
+        The zero-height marker keeps the existing single-image closed-loop wire
+        protocol unchanged. A training service handles this new request type.
+        """
+        images = np.ascontiguousarray(rgb, dtype=np.uint8)
+        if images.ndim != 4 or images.shape[-1] != 3 or not len(images):
+            raise ValueError("rgb must have shape [B,H,W,3] with B>0")
+        count, h, w, _ = images.shape
+        self.sock.sendall(struct.pack("<IIII", 0, count, h, w) + images.tobytes())
+        returned, fh, fw, fd = struct.unpack("<IIII", self._recv_exact(16))
+        if returned != count:
+            raise ValueError(f"VLM service returned {returned} features for {count} images")
+        data = self._recv_exact(returned * fh * fw * fd * 2)
+        return np.frombuffer(data, dtype=np.float16).reshape(returned, fh, fw, fd)
+
     def close(self) -> None:
         try:
             self.sock.close()
