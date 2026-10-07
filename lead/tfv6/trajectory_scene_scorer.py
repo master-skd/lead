@@ -186,6 +186,9 @@ class TrajectorySceneScorer(nn.Module):
             temporal_layer,
             num_layers=self.temporal_layers,
             norm=nn.LayerNorm(self.hidden_dim),
+            # norm_first=True already disables the nested-tensor fast path.
+            # Be explicit because training treats PyTorch warnings as errors.
+            enable_nested_tensor=False,
         )
         self.scene_projection = (
             nn.Identity()
