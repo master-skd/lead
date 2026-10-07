@@ -1388,6 +1388,12 @@ def smooth_path(
     indices = np.sort(indices)
     indices = np.array(indices).astype(int)
     route = route[indices]
+    if len(route) and np.linalg.norm(route[0]) > 2 * target_first_distance:
+        # The legacy iterator consumes one source waypoint per output waypoint.
+        # If the first source point is far from ego, it can exhaust the source
+        # before reaching it and then extrapolate from an unrelated final edge.
+        # Resample the ego-to-route polyline by distance for these rare gaps.
+        return interpolate_distant_start_route(config, route, target_first_distance)
     interpolated_route_points = iterative_line_interpolation(
         config,
         route,
@@ -1395,6 +1401,39 @@ def smooth_path(
     )
 
     return interpolated_route_points
+
+
+@beartype
+def interpolate_distant_start_route(
+    config: TrainingConfig,
+    route: jt.Float[npt.NDArray, "N 2"],
+    target_first_distance: float,
+) -> jt.Float[npt.NDArray, "N 2"]:
+    """Resample a route with a distant first waypoint, starting at the ego origin."""
+    points = np.concatenate((np.zeros((1, 2)), route), axis=0)
+    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    keep = np.concatenate(([True], segment_lengths > 1e-6))
+    points = points[keep]
+    if len(points) < 2 or not np.all(np.isfinite(points)):
+        raise ValueError("Cannot interpolate a route without finite, distinct points")
+
+    cumulative = np.concatenate(
+        ([0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
+    )
+    distances = target_first_distance + np.arange(config.num_route_points_smoothing)
+    result = np.column_stack(
+        (
+            np.interp(distances, cumulative, points[:, 0]),
+            np.interp(distances, cumulative, points[:, 1]),
+        )
+    )
+    beyond_end = distances > cumulative[-1]
+    if np.any(beyond_end):
+        last_direction = (points[-1] - points[-2]) / (cumulative[-1] - cumulative[-2])
+        result[beyond_end] = points[-1] + (
+            distances[beyond_end] - cumulative[-1]
+        )[:, None] * last_direction
+    return result
 
 
 @jt.jaxtyped(typechecker=beartype)
