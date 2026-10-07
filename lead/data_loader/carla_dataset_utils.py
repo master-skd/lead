@@ -1566,7 +1566,15 @@ def iterative_line_interpolation(
             add_point = True
         else:  # 0 Intersection
             add_point = False
-            raise Exception("No intersection found. This should never occur.")
+            raise ValueError(
+                "No route interpolation intersection: "
+                f"output_point={len(interpolated_route_points)}, "
+                f"input_point={current_route_index}/{len(route)}, "
+                f"radius={min_distance if not first_iteration else target_first_distance}, "
+                f"center={last_interpolated_point.tolist()}, "
+                f"line_start={last_point.tolist()}, "
+                f"line_end={current_point.tolist()}"
+            )
 
         if add_point:
             last_interpolated_point = intersection_point

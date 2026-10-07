@@ -410,11 +410,21 @@ class CARLAData(Dataset):
                 yaw_perturbation=perturbation_rotation,
             )
             if self.config.smooth_route:
-                route = carla_dataset_utils.smooth_path(
-                    self.config,
-                    route,
-                    target_first_distance=2.5,
-                )
+                try:
+                    route = carla_dataset_utils.smooth_path(
+                        self.config,
+                        route,
+                        target_first_distance=2.5,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Route smoothing failed for "
+                        f"meta={measurement_file}, dataset_index={index}, "
+                        f"global_index={global_index}, "
+                        f"perturbation_rotation={perturbation_rotation}, "
+                        f"perturbation_translation={perturbation_translation}, "
+                        f"route={np.array2string(route, threshold=route.size)}"
+                    ) from exc
 
             # Meta data for route
             data["brake"] = meta["brake"]
