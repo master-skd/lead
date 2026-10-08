@@ -11,8 +11,27 @@ PRETRAIN="${P6_JOINT_PRETRAIN:-outputs/local_training/pretrain/model_0030.pth}"
 INTENT="${P6_JOINT_INTENT:-outputs/local_training/vlm_intent_p6_online_full_b32_w4/model_best.pth}"
 SPLIT="${P6_JOINT_SPLIT:-outputs/local_training/p5_stepB3a_v2_dense_data/route_split}"
 LOGDIR="${P6_JOINT_LOGDIR:-outputs/local_training/p6_joint_online}"
+FULL_DATA="${P6_JOINT_FULL_DATA:-0}"
+BATCH_SIZE="${P6_JOINT_BATCH_SIZE:-64}"
+WORKERS="${P6_JOINT_WORKERS:-2}"
+PREFETCH="${P6_JOINT_PREFETCH_FACTOR:-2}"
 GPUS="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 IFS=',' read -r -a DEVICES <<< "$GPUS"
+
+[[ "$FULL_DATA" == 0 || "$FULL_DATA" == 1 ]] || {
+    echo "P6_JOINT_FULL_DATA must be 0 or 1" >&2
+    exit 1
+}
+for value in "$BATCH_SIZE" "$WORKERS" "$PREFETCH"; do
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
+        echo "Batch size, workers, and prefetch factor must be positive integers" >&2
+        exit 1
+    }
+done
+(( BATCH_SIZE % ${#DEVICES[@]} == 0 )) || {
+    echo "P6_JOINT_BATCH_SIZE must be divisible by the GPU count" >&2
+    exit 1
+}
 
 [[ -x "$LEAD_PYTHON" && -x "$QWEN_PYTHON" && -d "$QWEN_MODEL" \
    && -f "$PRETRAIN" && -f "$(dirname "$PRETRAIN")/config.json" \
@@ -47,6 +66,24 @@ print("joint data preflight passed:", route)
 PY
 
 mkdir -p "$LOGDIR"
+if [[ "$FULL_DATA" == 1 ]]; then
+    [[ -f "$SPLIT/heldout.jsonl" && -f "$SPLIT/metadata.json" ]] || {
+        echo "Full-data mode requires train, heldout, and metadata files in $SPLIT" >&2
+        exit 1
+    }
+    TRAIN_MANIFEST="$LOGDIR/all_frames.jsonl"
+    "$LEAD_PYTHON" scripts/p4/build_p6_joint_all_manifest.py \
+        --split "$SPLIT" --out "$TRAIN_MANIFEST"
+    VAL_CONFIG=""
+    echo "P6 full-data training: all manifest frames; no overlapping held-out validation"
+else
+    [[ -f "$SPLIT/heldout.jsonl" ]] || {
+        echo "Missing heldout manifest: $SPLIT/heldout.jsonl" >&2
+        exit 1
+    }
+    TRAIN_MANIFEST="$SPLIT/train.jsonl"
+    VAL_CONFIG="joint_val_manifest=$SPLIT/heldout.jsonl joint_val_max_frames=${P6_JOINT_VAL_FRAMES:-5000}"
+fi
 socket_dir=$(mktemp -d "${TMPDIR:-/tmp}/lead_joint_vlm.XXXXXX")
 service_pids=()
 cleanup() {
@@ -90,8 +127,7 @@ export LEAD_TRAINING_CONFIG="logdir=$LOGDIR \
 load_file=$PRETRAIN image_encoder_pretrained=false \
 use_planning_decoder=true use_vlm_intent=true vlm_intent_ckpt=$INTENT \
 online_joint_training=true online_vlm_socket_dir=$socket_dir \
-vlm_manifest=$SPLIT/train.jsonl joint_val_manifest=$SPLIT/heldout.jsonl \
-joint_val_max_frames=${P6_JOINT_VAL_FRAMES:-5000} \
+vlm_manifest=$TRAIN_MANIFEST $VAL_CONFIG \
 lanegraph_label_dir=data/p6/lanegraph_label \
 use_multimodal_intent=true multimodal_planner=true multimodal_planner_k=6 \
 joint_scorer_replaces_conf=true route_select_by_conf=false \
@@ -100,9 +136,9 @@ route_near_points=10 route_far_weight=0.3 \
 use_control_conditioning=true use_route_corridor_loss=true \
 use_collision_cost=true use_sensor_perburtation=false vlm_3cam=true \
 use_persistent_cache=false use_training_session_cache=false \
-prefetch_factor=2 joint_dataloader_workers=${P6_JOINT_WORKERS:-2} \
+prefetch_factor=$PREFETCH joint_dataloader_workers=$WORKERS \
 carla_num_samples=${P6_JOINT_TRAIN_FRAMES:-0} \
-batch_size=${P6_JOINT_BATCH_SIZE:-64} lr=${P6_JOINT_LR:-0.0003} \
+batch_size=$BATCH_SIZE lr=${P6_JOINT_LR:-0.0003} \
 epochs=${P6_JOINT_EPOCHS:-20}"
 
 CUDA_VISIBLE_DEVICES="$GPUS" "$(dirname "$LEAD_PYTHON")/torchrun" \
