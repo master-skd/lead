@@ -1,12 +1,12 @@
-import logging
-import os
 import copy
+import logging
 import math
-from pathlib import Path
+import os
 import sys
 import traceback
 import warnings
 from itertools import islice
+from pathlib import Path
 
 import matplotlib
 import torch
@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 from lead.common.constants import SourceDataset
 from lead.common.logging_config import setup_logging
+from lead.common.stage_timing import StageTimingRecorder
 from lead.data_loader.waymo_e2e_dataset import evaluate_waymo_e2e
 from lead.training import training_utils
 from lead.training.logger import Logger
@@ -60,6 +61,9 @@ warnings.filterwarnings(
 class Trainer:
     def __init__(self):
         self.config = training_utils.initialize_config()
+        self.timing = StageTimingRecorder.from_environment(
+            "train", self.config.rank, self.config.device,
+        )
 
         self.ssd_cache = training_utils.initialize_training_session_cache(self.config)
         self.num_worker = training_utils.initialize_torch(self.config)
@@ -171,27 +175,32 @@ class Trainer:
 
     def train_loop(self):
         for epoch in range(self.cur_epoch, self.config.epochs):
-            self.dataloader.dataset.shuffle(epoch)
-
-            # Update sampler epoch
-            self.sampler.update_batch_sizes(epoch)
-
-            # Update loss weights
-            self.schedule_loss_weights(epoch)
-
-            # Training
-            rfm_score = self.train()
+            timing = self.timing.start("epoch", epoch=epoch)
+            with timing.phase("setup"):
+                setup = self.timing.start("epoch_setup", epoch=epoch)
+                with setup.phase("dataset_shuffle"):
+                    self.dataloader.dataset.shuffle(epoch)
+                with setup.phase("sampler_and_loss_schedule"):
+                    self.sampler.update_batch_sizes(epoch)
+                    self.schedule_loss_weights(epoch)
+                setup.finish()
+            with timing.phase("training"):
+                rfm_score = self.train()
 
             if self.joint_val_loader is not None:
-                self.validate_joint_online(epoch)
+                with timing.phase("validation"):
+                    self.validate_joint_online(epoch)
 
             # Save model
             if self.config.rank == 0:
-                self.save(rfm_score)
+                with timing.phase("checkpoint_save"):
+                    self.save(rfm_score)
 
             if torch.distributed.is_initialized():
-                torch.distributed.barrier()  # Ensure all processes sync here before next epoch
+                with timing.phase("epoch_barrier"):
+                    torch.distributed.barrier()
 
+            timing.finish()
             self.cur_epoch += 1
 
     def validate_joint_online(self, epoch: int):
@@ -235,22 +244,40 @@ class Trainer:
     def train(self) -> float | None:
         self.model_wrapper.train()
 
-        # Train loop
-        for epoch_iteration, data in enumerate(
-            tqdm(
-                islice(self.dataloader, self.gradient_steps_per_epoch),
-                total=self.gradient_steps_per_epoch,
-                disable=self.config.rank != 0,
-            ),
+        # Separate iterator creation/reset and next() waiting from GPU work.
+        iterator_timing = self.timing.start("loader_iterator", epoch=self.cur_epoch)
+        with iterator_timing.phase("create_or_reset_iterator"):
+            batches = iter(self.dataloader)
+        iterator_timing.finish()
+        for epoch_iteration in tqdm(
+            range(self.gradient_steps_per_epoch), disable=self.config.rank != 0,
         ):
+            request_index = (
+                self.online_vlm_client.batch_requests
+                if self.online_vlm_client is not None else self.step
+            )
+            timing = self.timing.start(
+                "train_step", index=request_index, force=epoch_iteration < 5,
+                epoch=self.cur_epoch, step=epoch_iteration,
+                global_step=self.cur_epoch * self.gradient_steps_per_epoch + epoch_iteration,
+                request_index=request_index if self.online_vlm_client is not None else None,
+            )
+            with timing.phase("data_wait"):
+                try:
+                    data = next(batches)
+                except StopIteration:
+                    timing.finish(status="loader_exhausted")
+                    break
             if self.online_vlm_client is not None:
                 rgb = data.pop("vlm_rgb")
-                hidden = self.online_vlm_client.extract_batch(rgb.numpy())
+                with timing.phase("qwen_request"):
+                    hidden = self.online_vlm_client.extract_batch(rgb.numpy())
                 # np.frombuffer in the socket client is read-only; copy before
                 # making a Tensor, then transfer just this mini-batch to the GPU.
-                data["vlm_hidden"] = torch.from_numpy(hidden.copy()).to(
-                    self.config.device, non_blocking=True,
-                )
+                with timing.phase("hidden_to_gpu", gpu=True):
+                    data["vlm_hidden"] = torch.from_numpy(hidden.copy()).to(
+                        self.config.device, non_blocking=True,
+                    )
             loss = torch.zeros(
                 1,
                 dtype=self.config.torch_float_type,
@@ -264,52 +291,57 @@ class Trainer:
                 enabled=self.config.use_mixed_precision_training,
             ):
                 # Forward pass
-                predictions = self.model_wrapper(data=data)
-                losses, log = self.model.compute_loss(
-                    predictions=predictions,
-                    data=data,
-                )
+                with timing.phase("model_forward", gpu=True):
+                    predictions = self.model_wrapper(data=data)
+                with timing.phase("loss_and_labels", gpu=True):
+                    losses, log = self.model.compute_loss(
+                        predictions=predictions,
+                        data=data,
+                    )
                 self.step += 1
 
                 # Sum up losses
-                for key, value in losses.items():
-                    loss += self.detailed_loss_weights[key] * value.reshape(
-                        1,
-                    )  # Reshape as sanity check if the loss is a scalar
-                scaled_loss = {
-                    key: self.detailed_loss_weights[key] * value
-                    for key, value in losses.items()
-                }
+                with timing.phase("loss_weighting", gpu=True):
+                    for key, value in losses.items():
+                        loss += self.detailed_loss_weights[key] * value.reshape(1)
+                    scaled_loss = {
+                        key: self.detailed_loss_weights[key] * value
+                        for key, value in losses.items()
+                    }
             # Important to backprop outside the autocast context
-            self.scaler.scale(loss).backward()
+            with timing.phase("backward_ddp", gpu=True):
+                self.scaler.scale(loss).backward()
 
             # Gradient step
-            scale_before = self.scaler.get_scale()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.gradient_steps_skipped += int(
-                scale_before > self.scaler.get_scale(),
-            )  # Count how many times the scale changed
-            if not (scale_before > self.scaler.get_scale()):
-                self.scheduler.step(
-                    self.gradient_steps_per_epoch * self.cur_epoch + epoch_iteration,
+            with timing.phase("optimizer_and_scheduler", gpu=True):
+                scale_before = self.scaler.get_scale()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.gradient_steps_skipped += int(
+                    scale_before > self.scaler.get_scale(),
                 )
-            if self.scaler.get_scale() > self.config.grad_scaler_max_grad_scale:
-                self.scaler.update(new_scale=self.config.grad_scaler_max_grad_scale)
+                if not (scale_before > self.scaler.get_scale()):
+                    self.scheduler.step(
+                        self.gradient_steps_per_epoch * self.cur_epoch + epoch_iteration,
+                    )
+                if self.scaler.get_scale() > self.config.grad_scaler_max_grad_scale:
+                    self.scaler.update(new_scale=self.config.grad_scaler_max_grad_scale)
 
-            self.logger.log_train(
-                epoch_iteration=epoch_iteration,
-                cur_epoch=self.cur_epoch,
-                unscaled_loss=losses,
-                scaled_loss=scaled_loss,
-                data=data,
-                step=int(self.cur_epoch * self.gradient_steps_per_epoch)
-                + epoch_iteration,
-                gradient_steps_skipped=self.gradient_steps_skipped,
-                log=log,
-                predictions=predictions,
-            )
-            self.optimizer.zero_grad(set_to_none=True)
+            with timing.phase("logging_and_zero_grad", gpu=True):
+                self.logger.log_train(
+                    epoch_iteration=epoch_iteration,
+                    cur_epoch=self.cur_epoch,
+                    unscaled_loss=losses,
+                    scaled_loss=scaled_loss,
+                    data=data,
+                    step=int(self.cur_epoch * self.gradient_steps_per_epoch)
+                    + epoch_iteration,
+                    gradient_steps_skipped=self.gradient_steps_skipped,
+                    log=log,
+                    predictions=predictions,
+                )
+                self.optimizer.zero_grad(set_to_none=True)
+            timing.finish()
         self.optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast(

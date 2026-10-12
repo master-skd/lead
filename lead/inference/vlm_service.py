@@ -49,11 +49,18 @@ def main() -> None:
 
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     from lead.inference.vlm_feature_extractor import (
-        extract_vlm_hidden, extract_vlm_hidden_batch, load_qwen_vl,
+        extract_vlm_hidden,
+        extract_vlm_hidden_batch,
+        load_qwen_vl,
     )
 
     print(f"[vlm_service] loading Qwen-VL from {args.model} ...", flush=True)
     model, processor, image_token_id, merge = load_qwen_vl(args.model, device=args.device)
+    from lead.common.stage_timing import StageTimingRecorder
+
+    recorder = StageTimingRecorder.from_environment(
+        "qwen", int(os.environ.get("LEAD_TIMING_RANK", "0")), args.device,
+    )
     print("[vlm_service] model loaded", flush=True)
 
     if os.path.exists(args.socket):
@@ -66,24 +73,35 @@ def main() -> None:
     while True:
         conn, _ = srv.accept()
         print("[vlm_service] client connected", flush=True)
+        request_index = 0
         try:
             while True:
                 header = _recv_exact(conn, 8)
                 h, w = struct.unpack("<II", header)
                 if h == 0:
                     count = w
-                    h, w = struct.unpack("<II", _recv_exact(conn, 8))
-                    if not (1 <= count <= 256 and h == 384 and w == 1152):
-                        raise ValueError(f"invalid batch request: {count}x{h}x{w}")
-                    raw = _recv_exact(conn, count * h * w * 3)
-                    images = np.frombuffer(raw, dtype=np.uint8).reshape(count, h, w, 3)
+                    timing = recorder.start(
+                        "qwen_batch", index=request_index,
+                        request_index=request_index, batch_size=count,
+                    )
+                    request_index += 1
+                    with timing.phase("receive_payload"):
+                        h, w = struct.unpack("<II", _recv_exact(conn, 8))
+                        if not (1 <= count <= 256 and h == 384 and w == 1152):
+                            raise ValueError(f"invalid batch request: {count}x{h}x{w}")
+                        raw = _recv_exact(conn, count * h * w * 3)
+                    with timing.phase("image_decode"):
+                        images = np.frombuffer(raw, dtype=np.uint8).reshape(count, h, w, 3)
+                        pil_images = [Image.fromarray(image, "RGB") for image in images]
                     feat = extract_vlm_hidden_batch(
-                        [Image.fromarray(image, "RGB") for image in images],
+                        pil_images,
                         model, processor, image_token_id, merge,
-                        prompt_mode=args.prompt_mode, device=args.device,
+                        prompt_mode=args.prompt_mode, device=args.device, timing=timing,
                     )
                     _, fh, fw, fd = feat.shape
-                    conn.sendall(struct.pack("<IIII", count, fh, fw, fd) + feat.tobytes())
+                    with timing.phase("send_reply"):
+                        conn.sendall(struct.pack("<IIII", count, fh, fw, fd) + feat.tobytes())
+                    timing.finish()
                     continue
                 img_bytes = _recv_exact(conn, h * w * 3)
                 img = np.frombuffer(img_bytes, dtype=np.uint8).reshape(h, w, 3)

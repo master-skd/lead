@@ -10,6 +10,8 @@ so the exact prompt / crop / token-grab logic never drifts between train and eva
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import numpy as np
 import numpy.typing as npt
 import torch
@@ -129,7 +131,7 @@ def extract_vlm_hidden(
 @torch.no_grad()
 def extract_vlm_hidden_batch(
     images: list[Image.Image], model, processor, image_token_id: int, merge: int,
-    *, prompt_mode: str = "3cam_drivable", device: str = "cuda:0",
+    *, prompt_mode: str = "3cam_drivable", device: str = "cuda:0", timing=None,
 ) -> npt.NDArray:
     """One Qwen prefill for an equal-sized batch, matching the P6 fp16 cache boundary."""
     if not images:
@@ -143,21 +145,29 @@ def extract_vlm_hidden_batch(
         ]}]
         for image in images
     ]
-    inputs = processor.apply_chat_template(
-        conversations[0] if len(images) == 1 else conversations,
-        tokenize=True, add_generation_prompt=True,
-        return_dict=True, return_tensors="pt",
-        processor_kwargs={"padding": len(images) > 1},
-    ).to(device)
-    output = model(**inputs, output_hidden_states=True, use_cache=False)
-    hidden = output.hidden_states[-1]
-    if len(inputs["image_grid_thw"]) != len(images):
-        raise ValueError("Qwen image grid count does not match request")
-    features = []
-    for i, grid in enumerate(inputs["image_grid_thw"].tolist()):
-        h, w = grid[1] // merge, grid[2] // merge
-        tokens = hidden[i][inputs["input_ids"][i] == image_token_id]
-        if (h, w, tokens.shape[0]) != (12, 36, 432):
-            raise ValueError(f"unexpected image-token grid: {(h, w, tokens.shape[0])}")
-        features.append(tokens.reshape(h, w, -1).to(torch.float16).cpu().numpy())
-    return np.stack(features)
+    def phase(name, gpu=False):
+        return timing.phase(name, gpu=gpu) if timing is not None else nullcontext()
+
+    with phase("preprocess"):
+        inputs = processor.apply_chat_template(
+            conversations[0] if len(images) == 1 else conversations,
+            tokenize=True, add_generation_prompt=True,
+            return_dict=True, return_tensors="pt",
+            processor_kwargs={"padding": len(images) > 1},
+        )
+    with phase("inputs_to_gpu", gpu=True):
+        inputs = inputs.to(device)
+    with phase("qwen_forward", gpu=True):
+        output = model(**inputs, output_hidden_states=True, use_cache=False)
+    with phase("extract_and_to_cpu", gpu=True):
+        hidden = output.hidden_states[-1]
+        if len(inputs["image_grid_thw"]) != len(images):
+            raise ValueError("Qwen image grid count does not match request")
+        features = []
+        for i, grid in enumerate(inputs["image_grid_thw"].tolist()):
+            h, w = grid[1] // merge, grid[2] // merge
+            tokens = hidden[i][inputs["input_ids"][i] == image_token_id]
+            if (h, w, tokens.shape[0]) != (12, 36, 432):
+                raise ValueError(f"unexpected image-token grid: {(h, w, tokens.shape[0])}")
+            features.append(tokens.reshape(h, w, -1).to(torch.float16).cpu().numpy())
+        return np.stack(features)

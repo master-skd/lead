@@ -24,6 +24,7 @@ class VLMServiceClient:
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.settimeout(timeout)
         self.sock.connect(socket_path)
+        self.batch_requests = 0
 
     def _recv_exact(self, n: int) -> bytes:
         buf = bytearray()
@@ -61,6 +62,7 @@ class VLMServiceClient:
         if images.ndim != 4 or images.shape[-1] != 3 or not len(images):
             raise ValueError("rgb must have shape [B,H,W,3] with B>0")
         count, h, w, _ = images.shape
+        self.batch_requests += 1
         self.sock.sendall(struct.pack("<IIII", 0, count, h, w) + images.tobytes())
         returned, fh, fw, fd = struct.unpack("<IIII", self._recv_exact(16))
         if returned != count:

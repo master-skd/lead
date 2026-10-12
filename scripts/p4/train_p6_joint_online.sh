@@ -8,6 +8,24 @@ LEAD_PYTHON="${P6_JOINT_LEAD_PYTHON:-/mmu_mllm_hdd_3/liuzihan08/miniconda3/envs/
 QWEN_PYTHON="${P6_JOINT_QWEN_PYTHON:-/mmu_mllm_hdd_3/liuzihan08/miniconda3/envs/qwenvl/bin/python}"
 QWEN_MODEL="${P6_JOINT_QWEN_MODEL:-/mmu_mllm_hdd_3/liuzihan08/vla/models/Qwen3-VL-4B-Instruct}"
 PRETRAIN="${P6_JOINT_PRETRAIN:-outputs/local_training/pretrain/model_0030.pth}"
+RESUME="${P6_JOINT_RESUME:-}"
+LOAD_FILE="${RESUME:-$PRETRAIN}"
+RESUME_CONFIG=""
+if [[ -n "$RESUME" ]]; then
+    state_suffix="${RESUME##*/}"
+    [[ "$state_suffix" =~ ^model_[0-9]+\.pth$ ]] || {
+        echo "P6_JOINT_RESUME must point to a completed model_NNNN.pth checkpoint" >&2
+        exit 1
+    }
+    state_suffix="${state_suffix#model_}"
+    for state_kind in optimizer scheduler scaler; do
+        [[ -f "$(dirname "$RESUME")/${state_kind}_${state_suffix}" ]] || {
+            echo "Missing resume state: $(dirname "$RESUME")/${state_kind}_${state_suffix}" >&2
+            exit 1
+        }
+    done
+    RESUME_CONFIG="continue_failed_training=true"
+fi
 INTENT="${P6_JOINT_INTENT:-outputs/local_training/vlm_intent_p6_online_full_b32_w4/model_best.pth}"
 SPLIT="${P6_JOINT_SPLIT:-outputs/local_training/p5_stepB3a_v2_dense_data/route_split}"
 LOGDIR="${P6_JOINT_LOGDIR:-outputs/local_training/p6_joint_online}"
@@ -34,7 +52,7 @@ done
 }
 
 [[ -x "$LEAD_PYTHON" && -x "$QWEN_PYTHON" && -d "$QWEN_MODEL" \
-   && -f "$PRETRAIN" && -f "$(dirname "$PRETRAIN")/config.json" \
+   && -f "$LOAD_FILE" && -f "$(dirname "$LOAD_FILE")/config.json" \
    && -f "$INTENT" && -f "$SPLIT/train.jsonl" \
    && -d data/p6/lanegraph_label && -d data/carla_leaderboard2/data \
    && -d data/carla_leaderboard2/buckets ]] || {
@@ -99,10 +117,15 @@ trap cleanup EXIT INT TERM
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 WANDB_MODE=disabled
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1
+export LEAD_TRAIN_TIMING="${P6_JOINT_TIMING:-0}"
+export LEAD_TIMING_EVERY="${P6_JOINT_TIMING_EVERY:-20}"
+export LEAD_TIMING_SYNC="${P6_JOINT_TIMING_SYNC:-1}"
+export LEAD_TIMING_DIR="$LOGDIR/timing"
+export LEAD_TIMING_RUN_ID="$(date -u +%Y%m%dT%H%M%S)_$$"
 export NCCL_P2P_DISABLE=1 NCCL_P2P_LEVEL=NVL
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 for ((i=0; i<${#DEVICES[@]}; i++)); do
-    CUDA_VISIBLE_DEVICES="${DEVICES[$i]}" "$QWEN_PYTHON" -u -m lead.inference.vlm_service \
+    CUDA_VISIBLE_DEVICES="${DEVICES[$i]}" LEAD_TIMING_RANK="$i" "$QWEN_PYTHON" -u -m lead.inference.vlm_service \
         --model "$QWEN_MODEL" --socket "$socket_dir/rank$i.sock" \
         --prompt-mode 3cam_drivable --device cuda:0 \
         > "$LOGDIR/qwen_rank$i.log" 2>&1 &
@@ -124,7 +147,7 @@ done
 
 export LEAD_PROJECT_ROOT="$PWD"
 export LEAD_TRAINING_CONFIG="logdir=$LOGDIR \
-load_file=$PRETRAIN image_encoder_pretrained=false \
+load_file=$LOAD_FILE $RESUME_CONFIG image_encoder_pretrained=false \
 use_planning_decoder=true use_vlm_intent=true vlm_intent_ckpt=$INTENT \
 online_joint_training=true online_vlm_socket_dir=$socket_dir \
 vlm_manifest=$TRAIN_MANIFEST $VAL_CONFIG \
