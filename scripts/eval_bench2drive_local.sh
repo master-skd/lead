@@ -19,6 +19,7 @@ TAG="${3:-run}"
 # scores ZERO, since merge_route_json.py divides by a hardcoded 220 rather than by the
 # number of routes actually completed (~0.43 DS per lost route).
 ROUTE_TIMEOUT="${ROUTE_TIMEOUT:-1500}"
+LEAD_PYTHON="${B2D_LEAD_PYTHON:-python}"
 ROUTES_DIR="data/benchmark_routes/bench2drive"
 LOGDIR="/tmp/b2d_${TAG}"
 # Per-model output root so two models can eval the SAME 220 route ids simultaneously
@@ -95,9 +96,16 @@ worker() {
       fi
     fi
     echo "[gpu$gpu] route $id (carla up on $port) ..."
-    if CUDA_VISIBLE_DEVICES=$gpu timeout "$ROUTE_TIMEOUT" python -m lead \
+    local training_config="${LEAD_TRAINING_CONFIG:-}"
+    if [[ -n "${B2D_QWEN_SOCKET_DIR:-}" ]]; then
+      training_config="${training_config} vlm_service_socket=${B2D_QWEN_SOCKET_DIR}/gpu${gpu}.sock"
+    fi
+    if CUDA_VISIBLE_DEVICES=$gpu LEAD_TRAINING_CONFIG="$training_config" \
+      LD_LIBRARY_PATH="${B2D_LEAD_LIBRARY_PATH:-${LD_LIBRARY_PATH:-}}" \
+      timeout "$ROUTE_TIMEOUT" "$LEAD_PYTHON" -m lead \
         --checkpoint "$CKPT" --routes "$xml" --bench2drive \
         --output-dir "$OUTROOT/$id" \
+        --gpu "$gpu" \
         --port $port --traffic-manager-port $tm \
         >"$LOGDIR/route_${id}.log" 2>&1; then ok=$((ok+1))
     else
