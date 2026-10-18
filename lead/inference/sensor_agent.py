@@ -33,6 +33,10 @@ from lead.inference.closed_loop_inference import (
 )
 from lead.inference.config_closed_loop import ClosedLoopConfig
 from lead.inference.infraction_recorder import InfractionRecorder
+from lead.inference.p6_candidate_diagnostics import (
+    build_p6_candidate_record,
+    driving_lane_fractions,
+)
 from lead.inference.route2129_capture import build_route2129_capture_record
 from lead.inference.velocity_diagnostics import build_velocity_diagnostic_record
 from lead.inference.video_recorder import VideoRecorder
@@ -125,6 +129,9 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         self.local_path_shadow_failed = False
         self.route2129_capture_file: typing.TextIO | None = None
         self.route2129_capture_failed = False
+        self.p6_candidate_trace_file: typing.TextIO | None = None
+        self.p6_candidate_trace_failed = False
+        self.p6_candidate_trace_map = None
 
         # Infraction tracking
         self.infraction_recorder = InfractionRecorder(
@@ -362,6 +369,69 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         except Exception:
             self.local_path_shadow_failed = True
             LOG.exception("Disabling local-Path shadow logging after failure")
+
+    def save_p6_candidate_trace(
+        self, data: dict, prediction: ClosedLoopPrediction, current_speed_mps: float
+    ) -> None:
+        """Opt-in read-only trace of candidate generation, selection, and control."""
+        if os.getenv("P6_B2D_TRACE") != "1" or self.p6_candidate_trace_failed:
+            return
+        save_path = self.config_closed_loop.save_path
+        if save_path is None:
+            return
+        try:
+            every = max(int(os.getenv("P6_B2D_TRACE_EVERY", "1")), 1)
+            if self.step % every:
+                return
+            predictions = self.closed_loop_inference.predictions
+            if len(predictions) != 1:
+                raise ValueError("P6 candidate trace requires exactly one model")
+            raw = predictions[0]
+            transform = self._vehicle.get_transform()
+            location = transform.location
+            pose = (location.x, location.y, location.z, transform.rotation.yaw)
+            lane_fraction = None
+            map_every = max(int(os.getenv("P6_B2D_TRACE_MAP_EVERY", "5")), 1)
+            if self.step % map_every == 0 and raw.pred_route_multimodal is not None:
+                try:
+                    if self.p6_candidate_trace_map is None:
+                        self.p6_candidate_trace_map = self._world.get_map()
+                    carla_map = self.p6_candidate_trace_map
+                    lane_fraction = driving_lane_fractions(
+                        raw.pred_route_multimodal, location.x, location.y,
+                        transform.rotation.yaw,
+                        lambda x, y: carla_map.get_waypoint(
+                            carla.Location(x=x, y=y, z=location.z),
+                            project_to_road=False, lane_type=carla.LaneType.Driving,
+                        ) is not None,
+                    )
+                except Exception:
+                    # A map diagnostic must never change the agent's route/control.
+                    LOG.exception("Skipping P6 driving-lane sample at step %s", self.step)
+            record = build_p6_candidate_record(
+                step=self.step,
+                route_id=str(self.config_closed_loop.route_id),
+                game_time_s=self._world.get_snapshot().timestamp.elapsed_seconds,
+                ego_world=pose,
+                current_speed_mps=current_speed_mps,
+                data=data,
+                prediction=raw,
+                closed_loop_prediction=prediction,
+                control=self.control,
+                stuck_detector=self.force_move_post_processor.stuck_detector,
+                force_move_remaining=self.force_move_post_processor.force_move,
+                driving_lane_fraction=lane_fraction,
+            )
+            if self.p6_candidate_trace_file is None:
+                self.p6_candidate_trace_file = (
+                    save_path / "p6_candidate_trace.jsonl"
+                ).open("w", encoding="utf-8", buffering=1)
+            self.p6_candidate_trace_file.write(
+                json.dumps(record, allow_nan=False, separators=(",", ":")) + "\n"
+            )
+        except Exception:
+            self.p6_candidate_trace_failed = True
+            LOG.exception("Disabling P6 candidate trace after a logging failure")
 
     @beartype
     def set_target_points(self, input_data: dict, pop_distance: float):
@@ -719,6 +789,11 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             current_speed_mps=float(input_data["speed"].item()),
         )
         self.save_local_path_shadow(closed_loop_prediction)
+        self.save_p6_candidate_trace(
+            input_data_tensors,
+            closed_loop_prediction,
+            current_speed_mps=float(input_data["speed"].item()),
+        )
 
         # Check for infractions at this step
         self.check_infractions()
@@ -843,6 +918,10 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         if capture_file is not None:
             capture_file.close()
             self.route2129_capture_file = None
+        p6_trace_file = getattr(self, "p6_candidate_trace_file", None)
+        if p6_trace_file is not None:
+            p6_trace_file.close()
+            self.p6_candidate_trace_file = None
 
         # Clean up video recorder
         if hasattr(self, "video_recorder"):

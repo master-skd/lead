@@ -455,7 +455,7 @@ class LeaderboardWrapper:
         # Add debug checkpoint if not autopilot
         if leaderboard_type != LeaderboardType.AUTOPILOT:
             cmd.extend(
-                ["--debug-checkpoint", str(debug_checkpoint_path), "--record", "None"],
+                ["--debug-checkpoint", str(debug_checkpoint_path)],
             )
 
         LOG.info("\n" + "=" * 80)
