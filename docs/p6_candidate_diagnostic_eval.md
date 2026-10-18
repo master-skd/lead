@@ -56,3 +56,47 @@ The generic LEAD evaluator previously passed the literal string `--record None`,
 which Bench2Drive treated as a truthy recording directory and called
 `start_recorder()`. This revision omits the option, leaving the evaluator's
 empty default and avoiding that unrelated recorder request.
+
+## Same-frame visual-intent parity capture
+
+The candidate trace stores only the fraction of intent pixels above 0.5. It
+cannot distinguish a weak but nonempty probability map from a Qwen feature or
+decoder mismatch. To collect only three frames from route 3904 without changing
+the policy, rerun with a fresh tag:
+
+```bash
+export P6_B2D_DIAGNOSTIC_ROUTES=3904
+export P6_INTENT_CAPTURE_STEPS=20,100,200
+bash scripts/p4/eval_p6_diagnostic_routes.sh "$CKPT" "0" p6_intent_parity_3904
+```
+
+This writes `p6_intent_step_00020.npz`, `...00100.npz`, and `...00200.npz`
+under `outputs/local_evaluation_p6_intent_parity_3904/3904/`. Each archive
+contains the exact same-frame RGB strip, fp16 Qwen image-token hidden states,
+and fp32 decoder logits consumed by the agent. The total is bounded to the
+listed steps; leave `P6_INTENT_CAPTURE_STEPS` unset during ordinary evaluation.
+
+The LEAD environment can replay the decoder on the captured hidden states:
+
+```bash
+CAP=outputs/local_evaluation_p6_intent_parity_3904/3904/p6_intent_step_00200.npz
+"$P6_B2D_LEAD_PYTHON" scripts/p4/check_p6_intent_capture.py "$CAP" \
+  --intent-checkpoint outputs/local_training/vlm_intent_p6_online_full_b32_w4/model_best.pth
+```
+
+To compare the service's Qwen output against a direct forward on the exact
+captured RGB, run the same capture through each available Qwen environment
+after the evaluation service has stopped (the model needs GPU memory):
+
+```bash
+"$P6_B2D_QWEN_PYTHON" scripts/p4/check_p6_intent_capture.py "$CAP" \
+  --qwen-model "$P6_B2D_QWEN_MODEL"
+```
+
+If the original intent-training Qwen environment is available, repeat the last
+command with that Python executable. Compare MAE/cosine for the saved vs
+re-extracted hidden states, then the captured vs replayed logits. A small
+decoder-replay error with a sparse captured map points upstream or to
+distribution shift; a large decoder-replay error points to a checkpoint or
+runtime mismatch. The script also reports map coverage at 0.25/0.35/0.5/0.65
+and the number of anchors at 0.5, so threshold effects are visible.

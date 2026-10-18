@@ -132,6 +132,7 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         self.p6_candidate_trace_file: typing.TextIO | None = None
         self.p6_candidate_trace_failed = False
         self.p6_candidate_trace_map = None
+        self.p6_intent_capture_failed = False
 
         # Infraction tracking
         self.infraction_recorder = InfractionRecorder(
@@ -433,6 +434,38 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             self.p6_candidate_trace_failed = True
             LOG.exception("Disabling P6 candidate trace after a logging failure")
 
+    def save_p6_intent_capture(self, rgb: np.ndarray | None, data: dict) -> None:
+        """Opt-in, bounded same-frame RGB/Qwen/intent capture for parity checks."""
+        requested = os.getenv("P6_INTENT_CAPTURE_STEPS", "")
+        if not requested or self.p6_intent_capture_failed or rgb is None:
+            return
+        try:
+            steps = {int(part.strip()) for part in requested.split(",") if part.strip()}
+            if self.step not in steps:
+                return
+            save_path = self.config_closed_loop.save_path
+            if save_path is None or "vlm_hidden" not in data:
+                return
+            predictions = self.closed_loop_inference.predictions
+            if len(predictions) != 1 or predictions[0].pred_visual_intent is None:
+                return
+            destination = save_path / f"p6_intent_step_{self.step:05d}.npz"
+            if destination.exists():
+                return
+            logits = predictions[0].pred_visual_intent.detach().float()[0, 0].cpu().numpy()
+            hidden = data["vlm_hidden"].detach()[0].to(torch.float16).cpu().numpy()
+            np.savez_compressed(
+                destination,
+                rgb=np.ascontiguousarray(rgb, dtype=np.uint8),
+                vlm_hidden=hidden,
+                intent_logits=logits,
+                step=np.int64(self.step),
+            )
+            LOG.info("Saved P6 intent parity capture: %s", destination)
+        except Exception:
+            self.p6_intent_capture_failed = True
+            LOG.exception("Disabling P6 intent capture after a logging failure")
+
     @beartype
     def set_target_points(self, input_data: dict, pop_distance: float):
         """Defines local planning signals based on the input data.
@@ -732,6 +765,10 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         # Forward pass
         closed_loop_prediction: ClosedLoopPrediction = (
             self.closed_loop_inference.forward(data=input_data_tensors)
+        )
+        self.save_p6_intent_capture(
+            cam_rgb if self.vlm_client is not None else None,
+            input_data_tensors,
         )
         # Update bounding boxes
         if (
