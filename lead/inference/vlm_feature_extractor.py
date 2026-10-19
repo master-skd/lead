@@ -68,6 +68,60 @@ def crop_front(image: Image.Image, front_frac: tuple[float, float]) -> Image.Ima
     return image.crop((int(w * f0), 0, int(w * f1), h))
 
 
+def prepare_p6_batch_prompt(processor) -> str:
+    """Render the fixed P6 chat prompt once; image pixels are supplied separately."""
+    return processor.apply_chat_template(
+        [{"role": "user", "content": [
+            {"type": "text", "text": PROMPT_3CAM_DRIVABLE},
+            {"type": "image"},
+        ]}],
+        tokenize=False, add_generation_prompt=True,
+    )
+
+
+def prepare_p6_batch_inputs(
+    images: list[Image.Image], processor, *, prompt: str | None = None,
+    image_device: str | None = None,
+):
+    """Prepare a P6 batch, preserving the original template path as the reference."""
+    if prompt is not None:
+        kwargs = {"padding": len(images) > 1, "return_tensors": "pt"}
+        if image_device is not None:
+            kwargs["images_kwargs"] = {"device": image_device}
+        return processor(text=[prompt] * len(images), images=images, **kwargs)
+
+    conversations = [
+        [{"role": "user", "content": [
+            {"type": "text", "text": PROMPT_3CAM_DRIVABLE},
+            {"type": "image", "image": image},
+        ]}]
+        for image in images
+    ]
+    return processor.apply_chat_template(
+        conversations[0] if len(images) == 1 else conversations,
+        tokenize=True, add_generation_prompt=True,
+        return_dict=True, return_tensors="pt",
+        processor_kwargs={"padding": len(images) > 1},
+    )
+
+
+def check_p6_batch_input_parity(reference, candidate) -> None:
+    """Fail closed if a faster processor path changes Qwen's model inputs."""
+    if set(reference) != set(candidate):
+        raise ValueError(f"Qwen input keys differ: {set(reference)} != {set(candidate)}")
+    for key in reference:
+        left, right = reference[key], candidate[key]
+        if left.shape != right.shape or left.dtype != right.dtype:
+            raise ValueError(f"Qwen {key} shape/dtype differs")
+        right = right.to(left.device)
+        if key == "pixel_values":
+            if not torch.allclose(left, right, atol=1e-6, rtol=0):
+                error = (left - right).abs().max().item()
+                raise ValueError(f"Qwen pixel_values differ: max_abs_error={error}")
+        elif not torch.equal(left, right):
+            raise ValueError(f"Qwen {key} differs")
+
+
 @torch.no_grad()
 def extract_vlm_hidden(
     front_image: Image.Image,
@@ -132,28 +186,20 @@ def extract_vlm_hidden(
 def extract_vlm_hidden_batch(
     images: list[Image.Image], model, processor, image_token_id: int, merge: int,
     *, prompt_mode: str = "3cam_drivable", device: str = "cuda:0", timing=None,
+    prepared_prompt: str | None = None, image_preprocess_device: str | None = None,
 ) -> npt.NDArray:
     """One Qwen prefill for an equal-sized batch, matching the P6 fp16 cache boundary."""
     if not images:
         raise ValueError("empty VLM image batch")
     if prompt_mode != "3cam_drivable":
         raise ValueError("batched extraction currently supports 3cam_drivable only")
-    conversations = [
-        [{"role": "user", "content": [
-            {"type": "text", "text": PROMPT_3CAM_DRIVABLE},
-            {"type": "image", "image": image},
-        ]}]
-        for image in images
-    ]
     def phase(name, gpu=False):
         return timing.phase(name, gpu=gpu) if timing is not None else nullcontext()
 
-    with phase("preprocess"):
-        inputs = processor.apply_chat_template(
-            conversations[0] if len(images) == 1 else conversations,
-            tokenize=True, add_generation_prompt=True,
-            return_dict=True, return_tensors="pt",
-            processor_kwargs={"padding": len(images) > 1},
+    with phase("preprocess", gpu=image_preprocess_device is not None):
+        inputs = prepare_p6_batch_inputs(
+            images, processor, prompt=prepared_prompt,
+            image_device=image_preprocess_device,
         )
     with phase("inputs_to_gpu", gpu=True):
         inputs = inputs.to(device)

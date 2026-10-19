@@ -6,6 +6,8 @@ only detached candidate trajectories and detached planner scene tokens.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import torch
 
@@ -14,23 +16,42 @@ from lead.tfv6.future_collision import future_collision_label
 from lead.tfv6.trajectory_scene_scorer import build_trajectory_candidate_states
 
 
+def select_route_speed_pair(routes, speed_logits, speeds, selected):
+    """Gather one complete candidate; never select path and speed independently."""
+    if speed_logits.shape[:2] != routes.shape[:2] or speeds.shape != routes.shape[:2]:
+        raise ValueError("route and speed candidates must share [B,K] dimensions")
+    rows = torch.arange(routes.shape[0], device=routes.device)
+    return routes[rows, selected], speed_logits[rows, selected], speeds[rows, selected]
+
+
 def compose_route_states(
     routes: torch.Tensor, current_speed: torch.Tensor, target_speed: torch.Tensor,
+    *, steps: int = 8,
 ) -> torch.Tensor:
-    """Expand K spatial arms with the planner's single speed into 2 s trajectories."""
+    """Expand K arms using paired [B,K] speeds (legacy shared [B] also accepted)."""
     if routes.ndim != 4 or routes.shape[-1] != 2:
         raise ValueError("routes must be [B,K,P,2]")
     batch, arms, points, _ = routes.shape
     now = current_speed.reshape(batch).float().clamp_min(0)
-    target = target_speed.reshape(batch).float().clamp_min(0)
-    fraction = torch.arange(1, 9, device=routes.device, dtype=torch.float32) / 8
-    velocity = now[:, None] + (target - now)[:, None] * fraction[None]
-    velocity = velocity[:, None].expand(-1, arms, -1).reshape(batch * arms, 1, 8)
+    if target_speed.shape == (batch,):
+        target = target_speed[:, None].expand(-1, arms)
+    elif target_speed.shape == (batch, arms):
+        target = target_speed
+    else:
+        raise ValueError("target_speed must be [B] or [B,K]")
+    target = target.float().clamp_min(0)
+    if not 1 <= steps <= 8:
+        raise ValueError("scorer steps must be between 1 and 8")
+    # Target speed retains its original 2 s meaning. A shorter scorer window
+    # observes the first part of that ramp, not a faster ramp to the target.
+    fraction = torch.arange(1, steps + 1, device=routes.device, dtype=torch.float32) / 8
+    velocity = now[:, None, None] + (target - now[:, None])[..., None] * fraction
+    velocity = velocity.reshape(batch * arms, 1, steps)
     states = build_trajectory_candidate_states(
         routes.detach().float().reshape(batch * arms, points, 2), velocity,
         now[:, None].expand(-1, arms).reshape(-1),
     )
-    return states.reshape(batch, arms, 8, 6).detach()
+    return states.reshape(batch, arms, steps, 6).detach()
 
 
 def _actors_from_batch(data: dict, index: int) -> FutureActorFrame:
@@ -58,17 +79,27 @@ def build_same_pass_labels(
     values = states.detach().float().cpu().numpy()
     active = valid.detach().bool().cpu().numpy()
     batch, arms, steps, _ = values.shape
-    if steps != 8:
-        raise ValueError("joint scorer requires eight 4 Hz trajectory states")
+    expected_steps = int(getattr(config, "joint_scorer_steps", 8))
+    if steps != expected_steps or not 1 <= steps <= 8:
+        raise ValueError(f"joint scorer requires {expected_steps} 4 Hz trajectory states")
+    horizon_s = steps * 0.25
+    times_s = np.arange(1, steps + 1, dtype=np.float32) * 0.25
     labels = {name: np.zeros((batch, arms), dtype=np.float32) for name in (
         "collision_free", "ttc", "drivable", "task", "progress", "comfort", "imitation",
     )}
-    gt_future = data["joint_ego_future"].cpu().numpy()
+    gt_future = data["joint_ego_future"][:, :steps].cpu().numpy()
     nav_route = data["route"].cpu().numpy()
     corridor = data["visual_intent_label"].cpu().numpy()
     ppm = float(config.pixels_per_meter)
     for b in range(batch):
         actors = _actors_from_batch(data, b)
+        if steps < 8:
+            actors = replace(
+                actors,
+                positions=actors.positions[:, :steps],
+                yaws=actors.yaws[:, :steps],
+                valid=actors.valid[:, :steps],
+            )
         map_image = corridor[b, 0]
         nav_angle = np.arctan2(nav_route[b, -1, 1], nav_route[b, -1, 0])
         for k in np.flatnonzero(active[b]):
@@ -77,10 +108,10 @@ def build_same_pass_labels(
             yaw = np.arctan2(candidate[:, 2], candidate[:, 3])
             collision = future_collision_label(
                 xy, yaw, actors, safety_margin_m=0.2,
-                include_class_ids=(1, 2),
+                include_class_ids=(1, 2), times_s=times_s,
             )
             labels["collision_free"][b, k] = float(not collision.collision)
-            labels["ttc"][b, k] = min(collision.ttc_s / 2, 1.0)
+            labels["ttc"][b, k] = min(collision.ttc_s / horizon_s, 1.0)
             col = np.rint((xy[:, 0] - config.min_x_meter) * ppm).astype(int)
             row = np.rint((xy[:, 1] - config.min_y_meter) * ppm).astype(int)
             inside = (row >= 0) & (row < map_image.shape[0]) & (col >= 0) & (col < map_image.shape[1])
@@ -91,7 +122,7 @@ def build_same_pass_labels(
             angle_error = np.arctan2(np.sin(end_angle - nav_angle), np.cos(end_angle - nav_angle))
             labels["task"][b, k] = float(np.exp(-0.5 * (angle_error / np.deg2rad(35)) ** 2))
             nav_unit = nav_route[b, -1] / max(np.linalg.norm(nav_route[b, -1]), 1e-3)
-            expected_distance = max(float(candidate[:, 4].mean()) * 2.0, 0.5)
+            expected_distance = max(float(candidate[:, 4].mean()) * horizon_s, 0.5)
             progress_m = float(np.dot(xy[-1], nav_unit))
             labels["progress"][b, k] = float(np.clip(progress_m / expected_distance, 0, 1))
             yaw_delta = np.arctan2(np.sin(np.diff(yaw)), np.cos(np.diff(yaw)))

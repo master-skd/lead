@@ -110,11 +110,20 @@ class TFv6(nn.Module):
                 device=self.device,
             ).to(self.device)
             if self.config.joint_scorer_replaces_conf:
+                scorer_steps = int(self.config.joint_scorer_steps)
+                if not 1 <= scorer_steps <= 8 or (
+                    self.config.num_route_points_prediction <= 10 and scorer_steps > 4
+                ):
+                    raise ValueError(
+                        "10-point routes require at most four 4 Hz scorer states; "
+                        "joint_scorer_steps must be between 1 and 8"
+                    )
                 from lead.tfv6.joint_trajectory_scorer import JointTrajectorySceneScorer
 
                 self.joint_scorer = JointTrajectorySceneScorer(
                     scene_dim=self.config.transfuser_token_dim,
                     hidden_dim=128, num_heads=8,
+                    profile_steps=scorer_steps,
                 ).to(self.device)
 
         if self.config.use_intent_decoder:
@@ -279,7 +288,9 @@ class TFv6(nn.Module):
 
             if self.config.joint_scorer_replaces_conf:
                 from lead.tfv6.joint_online_training import compose_route_states
-                from lead.tfv6.trajectory_scene_scorer import compress_planner_scene_tokens
+                from lead.tfv6.trajectory_scene_scorer import (
+                    compress_planner_scene_tokens,
+                )
 
                 routes = data["route_multimodal"]
                 valid = data["anchor"][..., 3].to(routes.device) > 0.5
@@ -292,7 +303,10 @@ class TFv6(nn.Module):
                     data["anchor"] = data["anchor"].clone()
                     data["anchor"][empty, 0, 3] = 1.0
                 states = compose_route_states(
-                    routes, data["speed"].to(routes.device), pred_target_speed_scalar,
+                    routes, data["speed"].to(routes.device),
+                    data["target_speed_multimodal_scalar"]
+                    if self.config.multimodal_target_speed else pred_target_speed_scalar,
+                    steps=self.config.joint_scorer_steps,
                 )
                 scene = compress_planner_scene_tokens(
                     pred_scene_tokens.detach().float(),
@@ -317,6 +331,15 @@ class TFv6(nn.Module):
                     pred_route_selected_idx = utility.masked_fill(~valid, -1e9).argmax(1)
                     rows = torch.arange(len(valid), device=routes.device)
                     pred_route = routes[rows, pred_route_selected_idx]
+                    if self.config.multimodal_target_speed:
+                        from lead.tfv6.joint_online_training import (
+                            select_route_speed_pair,
+                        )
+
+                        pred_route, pred_target_speed_distribution, pred_target_speed_scalar = select_route_speed_pair(
+                            routes, data["target_speed_multimodal_distribution"],
+                            data["target_speed_multimodal_scalar"], pred_route_selected_idx,
+                        )
 
         # Semantic segmentation forward pass
         if self.config.use_carla_data and self.config.use_semantic:
@@ -436,6 +459,8 @@ class TFv6(nn.Module):
             pred_future_waypoints=pred_future_waypoints,
             pred_target_speed_distribution=pred_target_speed_distribution,
             pred_target_speed_scalar=pred_target_speed_scalar,
+            pred_target_speed_multimodal_distribution=data.get("target_speed_multimodal_distribution"),
+            pred_target_speed_multimodal_scalar=data.get("target_speed_multimodal_scalar"),
             pred_route=pred_route,
             # CARLA perception prediction
             pred_semantic=pred_semantic,
@@ -611,3 +636,5 @@ class Prediction:
     pred_route_collision_risk: torch.Tensor | None = None
     # Planner context memory exposed for candidate-scene cross attention.
     pred_scene_tokens: torch.Tensor | None = None
+    pred_target_speed_multimodal_distribution: torch.Tensor | None = None
+    pred_target_speed_multimodal_scalar: torch.Tensor | None = None

@@ -33,6 +33,7 @@ from lead.inference.closed_loop_inference import (
 )
 from lead.inference.config_closed_loop import ClosedLoopConfig
 from lead.inference.infraction_recorder import InfractionRecorder
+from lead.inference.vlm_image_preprocess import carla_bgr_to_vlm_rgb
 from lead.inference.p6_candidate_diagnostics import (
     build_p6_candidate_record,
     driving_lane_fractions,
@@ -435,7 +436,7 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
             LOG.exception("Disabling P6 candidate trace after a logging failure")
 
     def save_p6_intent_capture(self, rgb: np.ndarray | None, data: dict) -> None:
-        """Opt-in, bounded same-frame RGB/Qwen/intent capture for parity checks."""
+        """Capture the exact RGB sent to Qwen, its hidden states, and intent logits."""
         requested = os.getenv("P6_INTENT_CAPTURE_STEPS", "")
         if not requested or self.p6_intent_capture_failed or rgb is None:
             return
@@ -726,13 +727,15 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 dtype=torch.float32,
             )[None]
 
-        # P5b: get vlm_hidden from the Qwen-VL service (qwenvl env) over the socket. The
-        # front crop is done here (numpy) to match the offline extractor exactly; only
-        # the Qwen forward runs remotely. original_rgb is the (H, W, C) multi-camera
-        # strip, still BGR (copied before the BGR->RGB conversion in tick), so flip
-        # channels to the RGB the extractor expects.
+        # P5b/P6: training Qwen sees the JPEG saved by expert_data (full BGR
+        # strip, cv2.imwrite) and read by PIL as RGB. Reproduce that boundary
+        # before sending the image to the Qwen service. The planner's own JPEG
+        # path and original_rgb for other consumers are unchanged.
         if self.vlm_client is not None:
-            strip_rgb = input_data["original_rgb"].astype(np.uint8)[..., ::-1]
+            strip_rgb = carla_bgr_to_vlm_rgb(
+                input_data["original_rgb"].astype(np.uint8),
+                self.config_closed_loop.vlm_jpeg_quality,
+            )
             h, w = strip_rgb.shape[:2]
             if getattr(self.training_config, "vlm_3cam", False):
                 # P6: feed the full 3-camera strip (service uses 3cam_drivable prompt).

@@ -49,9 +49,12 @@ def main() -> None:
 
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     from lead.inference.vlm_feature_extractor import (
+        check_p6_batch_input_parity,
         extract_vlm_hidden,
         extract_vlm_hidden_batch,
         load_qwen_vl,
+        prepare_p6_batch_inputs,
+        prepare_p6_batch_prompt,
     )
 
     print(f"[vlm_service] loading Qwen-VL from {args.model} ...", flush=True)
@@ -62,6 +65,15 @@ def main() -> None:
         "qwen", int(os.environ.get("LEAD_TIMING_RANK", "0")), args.device,
     )
     print("[vlm_service] model loaded", flush=True)
+
+    fast_preprocess = os.environ.get("LEAD_QWEN_FAST_PREPROCESS", "1") == "1"
+    prepared_prompt = prepare_p6_batch_prompt(processor) if fast_preprocess else None
+    image_preprocess_device = (
+        args.device
+        if fast_preprocess and os.environ.get("LEAD_QWEN_IMAGE_PREPROCESS_DEVICE", "cpu") == "cuda"
+        else None
+    )
+    parity_checked = False
 
     if os.path.exists(args.socket):
         os.remove(args.socket)
@@ -93,10 +105,45 @@ def main() -> None:
                     with timing.phase("image_decode"):
                         images = np.frombuffer(raw, dtype=np.uint8).reshape(count, h, w, 3)
                         pil_images = [Image.fromarray(image, "RGB") for image in images]
+                    if fast_preprocess and not parity_checked:
+                        try:
+                            reference = prepare_p6_batch_inputs(pil_images, processor)
+                            candidate = prepare_p6_batch_inputs(
+                                pil_images, processor, prompt=prepared_prompt,
+                                image_device=image_preprocess_device,
+                            )
+                            check_p6_batch_input_parity(reference, candidate)
+                            print("[vlm_service] fast P6 preprocessing parity passed", flush=True)
+                        except Exception as exc:
+                            if image_preprocess_device is not None:
+                                print(
+                                    f"[vlm_service] CUDA image preprocessing failed parity: "
+                                    f"{exc}; retrying cached prompt on CPU", flush=True,
+                                )
+                                image_preprocess_device = None
+                                try:
+                                    candidate = prepare_p6_batch_inputs(
+                                        pil_images, processor, prompt=prepared_prompt,
+                                    )
+                                    check_p6_batch_input_parity(reference, candidate)
+                                except Exception as cpu_exc:
+                                    exc = cpu_exc
+                                    fast_preprocess = False
+                            else:
+                                fast_preprocess = False
+                            if not fast_preprocess:
+                                prepared_prompt = None
+                                print(
+                                    f"[vlm_service] fast P6 preprocessing disabled; "
+                                    f"reference path retained: {exc}", flush=True,
+                                )
+                        parity_checked = True
                     feat = extract_vlm_hidden_batch(
                         pil_images,
                         model, processor, image_token_id, merge,
                         prompt_mode=args.prompt_mode, device=args.device, timing=timing,
+                        prepared_prompt=prepared_prompt,
+                        image_preprocess_device=image_preprocess_device,
                     )
                     _, fh, fw, fd = feat.shape
                     with timing.phase("send_reply"):

@@ -59,6 +59,7 @@ def test_vlm_batch_wire_protocol_preserves_fp16():
     client_socket, server_socket = socket.socketpair()
     client = object.__new__(VLMServiceClient)
     client.sock = client_socket
+    client.batch_requests = 0
     images = np.arange(2 * 3 * 4 * 3, dtype=np.uint8).reshape(2, 3, 4, 3)
     expected = np.arange(2 * 2 * 3 * 4, dtype=np.float16).reshape(2, 2, 3, 4)
 
@@ -83,7 +84,8 @@ def test_vlm_batch_wire_protocol_preserves_fp16():
 def test_scorer_gradient_does_not_reach_planner_routes_or_scene():
     routes = torch.randn(1, 2, 30, 2, requires_grad=True)
     scene = torch.randn(1, 8, 256, requires_grad=True)
-    states = compose_route_states(routes, torch.tensor([2.0]), torch.tensor([3.0]))
+    speeds = torch.tensor([[3.0, 4.0]], requires_grad=True)
+    states = compose_route_states(routes, torch.tensor([2.0]), speeds)
     scorer = JointTrajectorySceneScorer(
         hidden_dim=32, num_heads=4, temporal_layers=1, interaction_layers=1,
     )
@@ -93,6 +95,7 @@ def test_scorer_gradient_does_not_reach_planner_routes_or_scene():
     loss, _ = joint_score_loss(logits, targets, valid)
     loss.backward()
     assert routes.grad is None
+    assert speeds.grad is None
     assert scene.grad is None
     assert scorer.heads["task"][-1].weight.grad is not None
 
@@ -120,3 +123,62 @@ def test_multimodal_planner_keeps_geometry_loss_without_confidence_loss():
     assert "loss_route_anchor" in loss
     assert "loss_route_conf" not in loss
     assert "loss_route_pad_conf" not in loss
+
+
+def test_short_route_uses_one_second_scorer_and_matching_actor_window():
+    points = torch.arange(1, 11, dtype=torch.float32)
+    routes = torch.stack((points, torch.zeros_like(points)), dim=-1)[None, None]
+    states = compose_route_states(routes, torch.tensor([4.0]), torch.tensor([4.0]), steps=4)
+    assert states.shape == (1, 1, 4, 6)
+    torch.testing.assert_close(states[0, 0, -1, 0], torch.tensor(4.0))
+    accelerating = compose_route_states(
+        routes, torch.tensor([4.0]), torch.tensor([8.0]), steps=4,
+    )
+    torch.testing.assert_close(accelerating[0, 0, -1, 4], torch.tensor(6.0))
+
+    data = {
+        "joint_actor_counts": torch.tensor([1]),
+        "joint_actor_positions": torch.zeros(1, 1, 8, 2),
+        "joint_actor_yaws": torch.zeros(1, 1, 8),
+        "joint_actor_extents": torch.tensor([[[1.0, 0.5, 0.5]]]),
+        "joint_actor_z": torch.zeros(1, 1),
+        "joint_actor_valid": torch.zeros(1, 1, 8, dtype=torch.bool),
+        "joint_actor_class_ids": torch.ones(1, 1, dtype=torch.uint8),
+        "joint_actor_ego_extent": torch.tensor([[2.45, 0.95, 0.75]]),
+        "joint_ego_future": torch.zeros(1, 8, 2),
+        "route": routes[:, 0],
+        "visual_intent_label": torch.ones(1, 1, 320, 384),
+    }
+    config = SimpleNamespace(
+        pixels_per_meter=4.0, min_x_meter=-32.0, min_y_meter=-40.0,
+        joint_scorer_steps=4,
+    )
+    data["joint_actor_positions"][0, 0, 6] = states[0, 0, -1, :2]
+    data["joint_actor_valid"][0, 0, 6] = True
+    valid = torch.ones(1, 1, dtype=torch.bool)
+    assert build_same_pass_labels(states, valid, data, config)["collision_free"].item() == 1.0
+    data["joint_actor_positions"][0, 0, 2] = states[0, 0, 2, :2]
+    data["joint_actor_valid"][0, 0, 2] = True
+    assert build_same_pass_labels(states, valid, data, config)["collision_free"].item() == 0.0
+
+
+def test_ten_meter_anchor_reach_is_capped_at_supervised_endpoint():
+    decoder = object.__new__(PlanningDecoder)
+    torch.nn.Module.__init__(decoder)
+    decoder.device = torch.device("cpu")
+    decoder.config = SimpleNamespace(
+        joint_scorer_replaces_conf=True, route_near_points=10,
+        route_far_weight=0.3, route_anchor_tol_deg=25.0,
+        route_anchor_min_reach_frac=0.5, use_collision_cost=False,
+        use_route_corridor_loss=False,
+    )
+    points = torch.arange(1, 11, dtype=torch.float32)
+    gt = torch.stack((points, torch.zeros_like(points)), dim=-1)[None]
+    routes = gt[:, None].repeat(1, 2, 1, 1)
+    data = {
+        "route_multimodal": routes,
+        "anchor": torch.tensor([[[0., 1., 1., 1.], [0., 1., 1., 1.]]]),
+    }
+    loss = {}
+    decoder._multimodal_route_loss(gt, data, loss, {})
+    assert loss["loss_route_anchor"].item() == 0.0

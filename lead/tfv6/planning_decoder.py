@@ -37,6 +37,13 @@ class PlanningDecoder(nn.Module):
         # route query gets an anchor embedding added to break symmetry.
         self.mm = self.config.multimodal_planner
         self.K = self.config.multimodal_planner_k if self.mm else 1
+        self.mm_speed = self.config.multimodal_target_speed
+        if self.mm_speed and not (
+            self.mm and self.config.predict_spatial_path
+            and self.config.predict_target_speed and self.config.joint_scorer_replaces_conf
+            and not self.config.route_select_by_conf
+        ):
+            raise ValueError("multimodal_target_speed requires multi-route joint scorer selection without confidence")
         num_queries = 0
         if self.config.predict_spatial_path:
             num_queries += self.config.num_route_points_prediction * self.K
@@ -148,8 +155,8 @@ class PlanningDecoder(nn.Module):
 
         # Build the decoder input queries. In multimodal mode, add a per-mode anchor
         # embedding to each mode's route queries (before cross-attention) to break the
-        # symmetry between the K route arms; otherwise K identical query blocks would
-        # collapse to one under WTA. Waypoint/speed queries are untouched.
+        # symmetry between the K route arms. The global waypoint/speed queries
+        # stay unchanged; paired speed decoding also consumes each route arm token.
         query_in = self.query.repeat(bs, 1, 1)  # (B, K*route + wp + speed, D)
         if self.mm and self.config.predict_spatial_path:
             n_route = self.config.num_route_points_prediction
@@ -256,7 +263,22 @@ class PlanningDecoder(nn.Module):
 
         if self.config.predict_target_speed:
             target_speed_query = queries[:, query_idx]
-            target_speed_dist = self.target_speed_decoder(target_speed_query)
+            if self.mm_speed:
+                # Each route token already carries its anchor and scene context.
+                # Keep the global speed query as shared ego/dynamics context, but
+                # predict each speed from its OWN route features (no new queries).
+                speed_features = route_features + target_speed_query[:, None]
+                speed_all = self.target_speed_decoder(speed_features)
+                speed_prob = torch.softmax(speed_all.float(), dim=-1)
+                scalar_all = decode_two_hot(
+                    speed_prob.reshape(bs * self.K, -1),
+                    self.config.target_speed_classes, self.device,
+                ).reshape(bs, self.K)
+                data["target_speed_multimodal_distribution"] = speed_all
+                data["target_speed_multimodal_scalar"] = scalar_all
+                target_speed_dist = speed_all[:, 0]  # paired placeholder until scorer selects
+            else:
+                target_speed_dist = self.target_speed_decoder(target_speed_query)
 
             with torch.amp.autocast(device_type="cuda", enabled=False):
                 target_speed_softmax = torch.softmax(target_speed_dist.float(), dim=-1)
@@ -274,6 +296,15 @@ class PlanningDecoder(nn.Module):
             headings.squeeze(-1) if headings is not None else None,
         )
 
+    def _route_winner(self, route_label, data):
+        """One masked geometric WTA assignment shared by route AND speed loss."""
+        routes = data["route_multimodal"].float()
+        valid = data["anchor"].to(routes.device)[..., 3] > 0.5
+        # Joint forward reserves valid slot 0 for empty-anchor frames. Legacy
+        # callers retain their previous slot-0 fallback when every arm is padding.
+        distance = torch.linalg.norm(routes - route_label.float()[:, None], dim=-1).mean(-1)
+        return distance.masked_fill(~valid, float("inf")).argmin(1)
+
     def _multimodal_route_loss(self, route_label, data, loss, log):
         """B2 winner-take-all route loss + confidence BCE over K arms.
 
@@ -289,9 +320,7 @@ class PlanningDecoder(nn.Module):
         valid = data["anchor"].to(self.device).float()[:, :, 3]  # (B,K)
 
         # per-arm mean-L2 to GT; invalid arms get +inf so they never win
-        d = torch.linalg.norm(route_all - gt[:, None], dim=-1).mean(dim=2)  # (B,K)
-        d_masked = d + (1.0 - valid) * 1e9
-        winner = d_masked.argmin(dim=1)              # (B,)
+        winner = self._route_winner(gt, data)
 
         # near-weighted L1 on the winner arm
         near = self.config.route_near_points or n
@@ -336,7 +365,15 @@ class PlanningDecoder(nn.Module):
 
         # (b) one-sided reach hinge, normalised by 30 m so it is scale-comparable to (a).
         min_reach = reach_m * self.config.route_anchor_min_reach_frac
-        reach_hinge = F.relu(min_reach - pred_norm) / 30.0  # (B,K)
+        reach_scale = 30.0
+        if n <= 10:
+            # A 10 m planner cannot satisfy a reach target derived from a
+            # 30 m intent arm. Keep the bearing target, but cap distance at
+            # the supervised route endpoint for this frame.
+            gt_reach = torch.linalg.vector_norm(gt[:, -1], dim=-1)[:, None]
+            min_reach = torch.minimum(min_reach, gt_reach)
+            reach_scale = float(n)
+        reach_hinge = F.relu(min_reach - pred_norm) / reach_scale  # (B,K)
 
         nonwin = valid.clone()
         nonwin[torch.arange(B), winner] = 0.0  # exclude winner (it regresses expert)
@@ -441,8 +478,13 @@ class PlanningDecoder(nn.Module):
                     self.config.target_speed_classes,
                     brake=brake_label,
                 )
+                speed_logits = predictions.pred_target_speed_distribution
+                if self.config.multimodal_target_speed:
+                    winner = self._route_winner(data["route"].to(self.device), data)
+                    rows = torch.arange(len(winner), device=winner.device)
+                    speed_logits = data["target_speed_multimodal_distribution"][rows, winner]
                 loss["loss_target_speed"] = F.cross_entropy(
-                    predictions.pred_target_speed_distribution.float(),
+                    speed_logits.float(),
                     target_speed_distribution,
                 )
 
@@ -542,18 +584,23 @@ class PlanningDecoder(nn.Module):
                     self.config.target_speed_classes,
                     self.device,
                 )
+                metric_speed = predictions.pred_target_speed_scalar
+                if self.config.multimodal_target_speed and self.training:
+                    winner = self._route_winner(data["route"].to(self.device), data)
+                    rows = torch.arange(len(winner), device=winner.device)
+                    metric_speed = data["target_speed_multimodal_scalar"][rows, winner]
                 log.update(
                     {
                         "metric/target_speed_error": torch.mean(
                             torch.abs(
-                                predictions.pred_target_speed_scalar
+                                metric_speed
                                 - target_speed_labels,
                             ),
                         ).item(),
                         "metric/target_speed_correlation": torch.corrcoef(
                             torch.stack(
                                 [
-                                    predictions.pred_target_speed_scalar,
+                                    metric_speed,
                                     target_speed_labels,
                                 ],
                             ),

@@ -10,6 +10,7 @@ See vlm_service.py for the wire protocol.
 from __future__ import annotations
 
 import socket
+from concurrent.futures import ThreadPoolExecutor
 import struct
 
 import numpy as np
@@ -75,3 +76,49 @@ class VLMServiceClient:
             self.sock.close()
         except OSError:
             pass
+
+
+class OnlineVLMPrefetcher:
+    """Keep at most one next-batch VLM request in flight during planner training.
+
+    The socket is owned by the single executor thread, so requests remain ordered.
+    Only the next DataLoader batch is retained; no epoch-wide feature cache is made.
+    """
+
+    def __init__(self, client: VLMServiceClient):
+        self.client = client
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vlm-prefetch")
+        self.current_data = None
+        self.current_future = None
+        self.current_request_index = None
+
+    def _extract(self, data):
+        return self.client.extract_batch(data["vlm_rgb"].numpy())
+
+    def advance(self, batches):
+        """Load and submit the following batch, or mark the iterator exhausted."""
+        try:
+            data = next(batches)
+        except StopIteration:
+            self.current_data = None
+            self.current_future = None
+            self.current_request_index = None
+            return False
+        self.current_data = data
+        self.current_request_index = self.client.batch_requests
+        self.current_future = self.executor.submit(self._extract, data)
+        return True
+
+    def result(self):
+        if self.current_future is None:
+            raise RuntimeError("No VLM batch has been prefetched")
+        return self.current_future.result()
+
+    def close(self):
+        self.executor.shutdown(wait=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()

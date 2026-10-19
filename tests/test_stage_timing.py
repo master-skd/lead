@@ -6,7 +6,12 @@ import torch
 from PIL import Image
 
 from lead.common.stage_timing import StageTimingRecorder
-from lead.inference.vlm_feature_extractor import extract_vlm_hidden_batch
+from lead.inference.vlm_feature_extractor import (
+    check_p6_batch_input_parity,
+    extract_vlm_hidden_batch,
+    prepare_p6_batch_inputs,
+    prepare_p6_batch_prompt,
+)
 from scripts.p4.summarize_p6_joint_timing import select_records
 
 
@@ -97,3 +102,35 @@ def test_feature_timing_preserves_batch_output(tmp_path):
         "qwen_forward",
         "extract_and_to_cpu",
     }
+
+
+def test_fast_p6_input_path_checks_against_reference():
+    class Processor:
+        def apply_chat_template(self, *args, tokenize=True, **kwargs):
+            if not tokenize:
+                return "rendered prompt"
+            return {"input_ids": torch.ones(2, 3, dtype=torch.long),
+                    "pixel_values": torch.ones(2, 4)}
+
+        def __call__(self, *, text, images, **kwargs):
+            assert text == ["rendered prompt"] * 2
+            assert len(images) == 2
+            assert kwargs["images_kwargs"] == {"device": "cuda:0"}
+            return {"input_ids": torch.ones(2, 3, dtype=torch.long),
+                    "pixel_values": torch.ones(2, 4)}
+
+    processor = Processor()
+    images = [Image.new("RGB", (1152, 384)) for _ in range(2)]
+    prompt = prepare_p6_batch_prompt(processor)
+    reference = prepare_p6_batch_inputs(images, processor)
+    candidate = prepare_p6_batch_inputs(
+        images, processor, prompt=prompt, image_device="cuda:0",
+    )
+    check_p6_batch_input_parity(reference, candidate)
+    candidate["pixel_values"][0, 0] = 0
+    try:
+        check_p6_batch_input_parity(reference, candidate)
+    except ValueError as exc:
+        assert "pixel_values differ" in str(exc)
+    else:
+        raise AssertionError("changed image pixels must fail parity")

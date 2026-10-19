@@ -25,6 +25,9 @@ class ClosedLoopConfig(OpenLoopConfig):
     # --- Image Processing ---
     # JPEG quality used in inference (0-100)
     jpeg_quality = 90
+    # CARLA intent training reads the saved three-camera JPEGs (quality 30).
+    # Keep this separate from the planner's legacy JPEG quality above.
+    vlm_jpeg_quality = 30
 
     # --- Control which output is used for controlling ---
     # Modality used for steering control

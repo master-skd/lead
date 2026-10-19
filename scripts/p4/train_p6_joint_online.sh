@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Train a fresh multi-arm planner and scene-interacting scorer from LEAD pretrain.
+# Fine-tune a multi-arm planner and scene-interacting scorer from LEAD posttrain.
 # Qwen runs live in one qwenvl service per training GPU; no vlm_cache is used.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -7,7 +7,7 @@ cd "$(dirname "$0")/../.."
 LEAD_PYTHON="${P6_JOINT_LEAD_PYTHON:-/mmu_mllm_hdd_3/liuzihan08/miniconda3/envs/lead/bin/python}"
 QWEN_PYTHON="${P6_JOINT_QWEN_PYTHON:-/mmu_mllm_hdd_3/liuzihan08/miniconda3/envs/qwenvl/bin/python}"
 QWEN_MODEL="${P6_JOINT_QWEN_MODEL:-/mmu_mllm_hdd_3/liuzihan08/vla/models/Qwen3-VL-4B-Instruct}"
-PRETRAIN="${P6_JOINT_PRETRAIN:-outputs/local_training/pretrain/model_0030.pth}"
+PRETRAIN="${P6_JOINT_PRETRAIN:-outputs/local_training/posttrain/model_0030.pth}"
 RESUME="${P6_JOINT_RESUME:-}"
 LOAD_FILE="${RESUME:-$PRETRAIN}"
 RESUME_CONFIG=""
@@ -50,7 +50,26 @@ done
     echo "P6_JOINT_BATCH_SIZE must be divisible by the GPU count" >&2
     exit 1
 }
+MULTIMODAL_SPEED="${P6_JOINT_MULTIMODAL_SPEED:-false}"
+[[ "$MULTIMODAL_SPEED" == true || "$MULTIMODAL_SPEED" == false ]] || {
+    echo "P6_JOINT_MULTIMODAL_SPEED must be true or false" >&2
+    exit 1
+}
 
+ROUTE_POINTS="${P6_JOINT_ROUTE_POINTS:-30}"
+if [[ "$ROUTE_POINTS" == 10 ]]; then
+    SCORER_STEPS="${P6_JOINT_SCORER_STEPS:-4}"
+else
+    SCORER_STEPS="${P6_JOINT_SCORER_STEPS:-8}"
+fi
+[[ "$ROUTE_POINTS" =~ ^[1-9][0-9]*$ && "$SCORER_STEPS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "P6_JOINT_ROUTE_POINTS and P6_JOINT_SCORER_STEPS must be positive integers" >&2
+    exit 1
+}
+if (( ROUTE_POINTS < 2 || SCORER_STEPS > 8 || (ROUTE_POINTS <= 10 && SCORER_STEPS > 4) )); then
+    echo "10 m routes require at most four 4 Hz scorer states; route needs at least two points" >&2
+    exit 1
+fi
 [[ -x "$LEAD_PYTHON" && -x "$QWEN_PYTHON" && -d "$QWEN_MODEL" \
    && -f "$LOAD_FILE" && -f "$(dirname "$LOAD_FILE")/config.json" \
    && -f "$INTENT" && -f "$SPLIT/train.jsonl" \
@@ -59,6 +78,17 @@ done
     echo "Missing joint training Python, model, pretrain/config, intent, split, or CARLA data" >&2
     exit 1
 }
+
+if [[ -n "$RESUME" ]]; then
+    "$LEAD_PYTHON" - "$(dirname "$RESUME")/config.json" "$MULTIMODAL_SPEED" <<'PY'
+import json
+import sys
+with open(sys.argv[1]) as stream:
+    saved = json.load(stream)
+if bool(saved.get("multimodal_target_speed", False)) != (sys.argv[2] == "true"):
+    raise SystemExit("Cannot change multimodal_target_speed during resume; start a new run from pretrain with a new logdir")
+PY
+fi
 
 "$LEAD_PYTHON" - "$SPLIT/train.jsonl" <<'PY'
 import json
@@ -146,6 +176,10 @@ done
 [[ "$ready" -eq "${#DEVICES[@]}" ]] || { echo "Qwen service startup timed out" >&2; exit 1; }
 
 export LEAD_PROJECT_ROOT="$PWD"
+export LEAD_QWEN_PREFETCH="${P6_JOINT_QWEN_PREFETCH:-0}"
+[[ "$LEAD_QWEN_PREFETCH" == 0 || "$LEAD_QWEN_PREFETCH" == 1 ]] || {
+    echo "P6_JOINT_QWEN_PREFETCH must be 0 or 1" >&2; exit 1
+}
 export LEAD_TRAINING_CONFIG="logdir=$LOGDIR \
 load_file=$LOAD_FILE $RESUME_CONFIG image_encoder_pretrained=false \
 use_planning_decoder=true use_vlm_intent=true vlm_intent_ckpt=$INTENT \
@@ -154,8 +188,10 @@ vlm_manifest=$TRAIN_MANIFEST $VAL_CONFIG \
 lanegraph_label_dir=data/p6/lanegraph_label \
 use_multimodal_intent=true multimodal_planner=true multimodal_planner_k=6 \
 joint_scorer_replaces_conf=true route_select_by_conf=false \
-num_route_points_smoothing=40 num_route_points_prediction=30 \
+multimodal_target_speed=$MULTIMODAL_SPEED \
+num_route_points_smoothing=40 num_route_points_prediction=$ROUTE_POINTS \
 route_near_points=10 route_far_weight=0.3 \
+joint_scorer_steps=$SCORER_STEPS \
 use_control_conditioning=true use_route_corridor_loss=true \
 use_collision_cost=true use_sensor_perburtation=false vlm_3cam=true \
 use_persistent_cache=false use_training_session_cache=false \
@@ -164,6 +200,14 @@ carla_num_samples=${P6_JOINT_TRAIN_FRAMES:-0} \
 batch_size=$BATCH_SIZE lr=${P6_JOINT_LR:-0.0003} \
 epochs=${P6_JOINT_EPOCHS:-20}"
 
-CUDA_VISIBLE_DEVICES="$GPUS" "$(dirname "$LEAD_PYTHON")/torchrun" \
+LEAD_LIBNVRTC_DIR="${P6_JOINT_LEAD_LIBNVRTC_DIR:-$("$LEAD_PYTHON" -c 'import pathlib, sysconfig; print(pathlib.Path(sysconfig.get_paths()["purelib"]) / "nvidia/cuda_nvrtc/lib")')}"
+if [[ -f "$LEAD_LIBNVRTC_DIR/libnvrtc.so.12" ]]; then
+    LEAD_LIBRARY_PATH="$LEAD_LIBNVRTC_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    echo "LEAD libnvrtc: $LEAD_LIBNVRTC_DIR/libnvrtc.so.12"
+else
+    LEAD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+    echo "Warning: LEAD libnvrtc.so.12 not found in $LEAD_LIBNVRTC_DIR" >&2
+fi
+CUDA_VISIBLE_DEVICES="$GPUS" LD_LIBRARY_PATH="$LEAD_LIBRARY_PATH" "$(dirname "$LEAD_PYTHON")/torchrun" \
     --standalone --nnodes=1 --nproc_per_node="${#DEVICES[@]}" \
     --max_restarts=0 --no-python "$LEAD_PYTHON" lead/training/train.py

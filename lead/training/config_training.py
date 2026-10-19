@@ -986,6 +986,11 @@ class TrainingConfig(BaseConfig):
     joint_scorer_replaces_conf = False
     multimodal_planner_k = 6  # K_MAX, must match anchor_extraction.K_MAX
     # B2: anchor cache dir (precomputed skeleton anchors, (K_MAX,5) per frame).
+    # Eight 4 Hz states cover 2 s for long routes. A 10 m route uses four
+    # states (1 s) so the scorer does not routinely extrapolate beyond it.
+    joint_scorer_steps = 8
+    # Route-conditioned K speed distributions; old checkpoints/configs keep one speed.
+    multimodal_target_speed = False
     anchor_cache_dir = "data/p6/anchor_cache"
     # P5+: if set, use_multimodal_intent reads the clean lane-graph corridor label from this
     # cache instead of the mushy flood-fill blob. None = old blob behaviour.

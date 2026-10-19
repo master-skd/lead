@@ -114,6 +114,7 @@ class Trainer:
             dataloader=self.dataloader,
             total_gradient_steps=self.total_gradient_steps,
         )
+        self.online_vlm_prefetch = os.environ.get("LEAD_QWEN_PREFETCH", "0") == "1"
         self.online_vlm_client = None
         if self.config.online_joint_training:
             from lead.inference.vlm_client import VLMServiceClient
@@ -121,6 +122,8 @@ class Trainer:
             socket_path = Path(self.config.online_vlm_socket_dir) / (
                 f"rank{self.config.local_rank}.sock"
             )
+            if self.online_vlm_prefetch:
+                LOG.info("Online VLM one-batch lookahead enabled on rank %d", self.config.rank)
             self.online_vlm_client = VLMServiceClient(str(socket_path), timeout=600)
         self.joint_val_loader = None
         self.best_joint_val = float("inf")
@@ -248,14 +251,22 @@ class Trainer:
         iterator_timing = self.timing.start("loader_iterator", epoch=self.cur_epoch)
         with iterator_timing.phase("create_or_reset_iterator"):
             batches = iter(self.dataloader)
+        prefetch = None
+        if self.online_vlm_client is not None and self.online_vlm_prefetch:
+            from lead.inference.vlm_client import OnlineVLMPrefetcher
+
+            prefetch = OnlineVLMPrefetcher(self.online_vlm_client)
+            prefetch.advance(batches)
         iterator_timing.finish()
         for epoch_iteration in tqdm(
             range(self.gradient_steps_per_epoch), disable=self.config.rank != 0,
         ):
-            request_index = (
-                self.online_vlm_client.batch_requests
-                if self.online_vlm_client is not None else self.step
-            )
+            if prefetch is not None:
+                request_index = prefetch.current_request_index
+            elif self.online_vlm_client is not None:
+                request_index = self.online_vlm_client.batch_requests
+            else:
+                request_index = self.step
             timing = self.timing.start(
                 "train_step", index=request_index, force=epoch_iteration < 5,
                 epoch=self.cur_epoch, step=epoch_iteration,
@@ -263,15 +274,28 @@ class Trainer:
                 request_index=request_index if self.online_vlm_client is not None else None,
             )
             with timing.phase("data_wait"):
-                try:
-                    data = next(batches)
-                except StopIteration:
+                if prefetch is not None:
+                    data = prefetch.current_data
+                else:
+                    try:
+                        data = next(batches)
+                    except StopIteration:
+                        data = None
+                if data is None:
                     timing.finish(status="loader_exhausted")
                     break
             if self.online_vlm_client is not None:
-                rgb = data.pop("vlm_rgb")
-                with timing.phase("qwen_request"):
-                    hidden = self.online_vlm_client.extract_batch(rgb.numpy())
+                with timing.phase("qwen_wait" if prefetch is not None else "qwen_request"):
+                    if prefetch is not None:
+                        hidden = prefetch.result()
+                    else:
+                        rgb = data.pop("vlm_rgb")
+                        hidden = self.online_vlm_client.extract_batch(rgb.numpy())
+                if prefetch is not None:
+                    data.pop("vlm_rgb")
+                    # Qwen starts on batch t+1 while the planner trains on batch t.
+                    with timing.phase("next_batch_prefetch"):
+                        prefetch.advance(batches)
                 # np.frombuffer in the socket client is read-only; copy before
                 # making a Tensor, then transfer just this mini-batch to the GPU.
                 with timing.phase("hidden_to_gpu", gpu=True):
@@ -342,6 +366,8 @@ class Trainer:
                 )
                 self.optimizer.zero_grad(set_to_none=True)
             timing.finish()
+        if prefetch is not None:
+            prefetch.close()
         self.optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast(
