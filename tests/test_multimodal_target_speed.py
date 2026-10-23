@@ -157,7 +157,8 @@ def test_joint_scorer_choice_survives_legacy_route_selector(monkeypatch):
     nn.Module.__init__(model)
     model.device = torch.device("cpu")
     model.config = SimpleNamespace(
-        use_carla_data=False, radar_detection=False, use_vlm_intent=False,
+        use_carla_data=False, radar_detection=False, use_radar_detection=False,
+        use_vlm_intent=False,
         use_intent_decoder=False, use_planning_decoder=True,
         multimodal_planner=True, use_control_conditioning=False,
         online_joint_training=True, joint_scorer_replaces_conf=True,
