@@ -377,9 +377,9 @@ class TFv6(nn.Module):
                     self.log,
                 )
 
-        # B2c late route resolution. It is inference-only and intentionally runs after
-        # BEV semantics: collision comes from the predicted current-scene occupancy and
-        # corridor support comes from the predicted intent blob, matching closed loop.
+        # Expose all candidates for diagnostics and optional downstream safety gates.
+        # The joint scorer has already selected a complete route/speed pair above;
+        # the legacy selector must not overwrite just its route here.
         if self.config.multimodal_planner and not self.training:
             pred_route_multimodal = data.get("route_multimodal")
             pred_route_conf = data.get("route_conf")
@@ -389,7 +389,13 @@ class TFv6(nn.Module):
                 if planner_anchor is not None and pred_route_conf is not None
                 else planner_anchor
             )
-            if pred_route_multimodal is not None and pred_route_conf is not None:
+            # B2c late route resolution is only for models without a joint scorer.
+            # It runs after BEV semantics so safety_rescore can inspect occupancy.
+            if (
+                not self.config.joint_scorer_replaces_conf
+                and pred_route_multimodal is not None
+                and pred_route_conf is not None
+            ):
                 mode = resolve_route_selection_mode(self.config)
                 valid = (
                     planner_anchor[..., 3].to(pred_route_conf.device) > 0.5

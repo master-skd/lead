@@ -8,6 +8,7 @@ from torch import nn
 
 from lead.tfv6.joint_online_training import compose_route_states, select_route_speed_pair
 from lead.tfv6.planning_decoder import PlanningDecoder
+from lead.tfv6.tfv6 import TFv6
 
 
 def bare_decoder():
@@ -113,3 +114,72 @@ def test_forward_emits_k_route_conditioned_speed_distributions():
     assert data["target_speed_multimodal_scalar"].shape == (1, 2)
     logits[:, 1].sum().backward()
     assert decoder.anchor_embed.weight.grad is not None
+
+
+def test_joint_scorer_choice_survives_legacy_route_selector(monkeypatch):
+    """Closed loop must keep the scorer's route and its paired target speed."""
+    routes = torch.zeros(1, 2, 10, 2)
+    routes[0, 1, :, 1] = 5.0
+    speeds = torch.tensor([[2.0, 7.0]])
+    distributions = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+
+    class Backbone(nn.Module):
+        def forward(self, data):
+            return torch.zeros(1, 4, 1, 1), None
+
+        def top_down(self, features):
+            return features
+
+    class Planner(nn.Module):
+        kv = torch.zeros(1, 1, 4)
+
+        def forward(self, bev, radar_features, radar_predictions, data, log, **kwargs):
+            data["route_multimodal"] = routes
+            data["route_conf"] = torch.tensor([[0.9, 0.1]])
+            data["route_features"] = torch.zeros(1, 2, 4)
+            data["target_speed_multimodal_distribution"] = distributions
+            data["target_speed_multimodal_scalar"] = speeds
+            return routes[:, 0], None, distributions[:, 0], speeds[:, 0], None
+
+    class Scorer(nn.Module):
+        def forward(self, states, scene, valid):
+            names = (
+                "collision_free", "ttc", "drivable", "task", "progress",
+                "comfort", "imitation",
+            )
+            return {name: torch.tensor([[0.0, 10.0]]) for name in names}
+
+    monkeypatch.setattr(
+        "lead.tfv6.trajectory_scene_scorer.compress_planner_scene_tokens",
+        lambda *args, **kwargs: torch.zeros(1, 1, 4),
+    )
+    model = object.__new__(TFv6)
+    nn.Module.__init__(model)
+    model.device = torch.device("cpu")
+    model.config = SimpleNamespace(
+        use_carla_data=False, radar_detection=False, use_vlm_intent=False,
+        use_intent_decoder=False, use_planning_decoder=True,
+        multimodal_planner=True, use_control_conditioning=False,
+        online_joint_training=True, joint_scorer_replaces_conf=True,
+        multimodal_target_speed=True, joint_scorer_steps=4,
+        lidar_vert_anchors=1, lidar_horz_anchors=1, use_semantic=False,
+        use_depth=False, detect_boxes=False, use_bev_semantic=False,
+        use_navsim_data=False, route_speed_safety_gate=False,
+        route_selection_mode="legacy", route_select_by_conf=False,
+    )
+    model.backbone = Backbone()
+    model.planning_decoder = Planner()
+    model.joint_scorer = Scorer()
+    model.eval()
+    prediction = model({
+        "anchor": torch.tensor([[[0., 1., 1., 1.], [0., 1., 1., 1.]]]),
+        "speed": torch.tensor([3.0]),
+    })
+
+    assert prediction.pred_route_selected_idx.tolist() == [1]
+    torch.testing.assert_close(prediction.pred_route, routes[:, 1])
+    torch.testing.assert_close(prediction.pred_target_speed_scalar, speeds[:, 1])
+    torch.testing.assert_close(
+        prediction.pred_target_speed_distribution, distributions[:, 1],
+    )
+    torch.testing.assert_close(prediction.pred_route_multimodal, routes)

@@ -57,12 +57,14 @@ def test_p6_b2d_preflight_exposes_exactly_one_model(tmp_path):
     assert (eval_dir / "model.pth").resolve() == checkpoint
 
 
-def test_p6_b2d_preflight_rejects_k_speed_checkpoint(tmp_path):
+def test_p6_b2d_preflight_accepts_k_speed_checkpoint(tmp_path):
     checkpoint, env = _fixture(tmp_path, multimodal_speed=True)
     result = subprocess.run(
-        ["bash", str(SCRIPT), str(checkpoint), "0", "wrong_model"],
+        ["bash", str(SCRIPT), str(checkpoint), "0", "k_speed"],
         cwd=ROOT, env=env, capture_output=True, text=True, check=False,
     )
-    assert result.returncode != 0
-    assert "K-route/one-speed" in result.stderr
-    assert not (tmp_path / "eval/wrong_model").exists()
+    assert result.returncode == 0, result.stderr
+    assert "K-route/K-speed" in result.stdout
+    assert sorted(p.name for p in (tmp_path / "eval/k_speed").iterdir()) == [
+        "config.json", "model.pth",
+    ]

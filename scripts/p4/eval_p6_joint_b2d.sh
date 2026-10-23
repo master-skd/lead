@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Evaluate one P6 K-route/shared-speed checkpoint on Bench2Drive.
+# Evaluate one P6 joint-scorer checkpoint (shared speed or per-route speed).
 # Usage: bash scripts/p4/eval_p6_joint_b2d.sh <model_NNNN.pth> "0 1 2 3 4 5 6 7" <tag>
 set -euo pipefail
 
@@ -39,16 +39,16 @@ with open(sys.argv[1], encoding="utf-8") as stream:
 required = {
     "use_vlm_intent": True, "vlm_3cam": True,
     "multimodal_planner": True, "joint_scorer_replaces_conf": True,
-    "multimodal_target_speed": False,
 }
 bad = {key: (cfg.get(key), value) for key, value in required.items()
        if cfg.get(key, False) is not value}
 if bad:
-    raise SystemExit(f"This evaluator is for P6 K-route/one-speed checkpoints: {bad}")
+    raise SystemExit(f"This evaluator requires a P6 joint-scorer checkpoint: {bad}")
 intent = cfg.get("vlm_intent_ckpt")
 if not intent or not Path(intent).is_file():
     raise SystemExit(f"Frozen intent checkpoint is missing: {intent}")
-print("P6 K-route/one-speed checkpoint config verified")
+speed_mode = "K-speed" if cfg.get("multimodal_target_speed", False) else "shared-speed"
+print(f"P6 K-route/{speed_mode} checkpoint config verified")
 PY
 
 read -r -a GPUS <<< "${GPU_LIST//,/ }"
