@@ -68,3 +68,14 @@ def test_p6_b2d_preflight_accepts_k_speed_checkpoint(tmp_path):
     assert sorted(p.name for p in (tmp_path / "eval/k_speed").iterdir()) == [
         "config.json", "model.pth",
     ]
+
+
+def test_p6_b2d_preflight_accepts_slot0_ablation(tmp_path):
+    checkpoint, env = _fixture(tmp_path, multimodal_speed=True)
+    env["P6_B2D_ROUTE_MODE"] = "slot0"
+    result = subprocess.run(
+        ["bash", str(SCRIPT), str(checkpoint), "0", "slot0_ablation"],
+        cwd=ROOT, env=env, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "P6 evaluation route selection: slot0" in result.stdout

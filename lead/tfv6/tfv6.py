@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import typing
 from dataclasses import dataclass
 
@@ -328,7 +329,14 @@ class TFv6(nn.Module):
                         + 0.5 * scores["progress"] + 0.25 * scores["comfort"]
                         + 0.5 * scores["imitation"]
                     )
-                    pred_route_selected_idx = utility.masked_fill(~valid, -1e9).argmax(1)
+                    # Evaluation-only ablation: keep candidate 0 and its own speed,
+                    # regardless of the scorer's utility. Training is unchanged.
+                    if os.environ.get("P6_EVAL_FORCE_SLOT0") == "1":
+                        pred_route_selected_idx = torch.zeros(
+                            routes.shape[0], dtype=torch.long, device=routes.device,
+                        )
+                    else:
+                        pred_route_selected_idx = utility.masked_fill(~valid, -1e9).argmax(1)
                     rows = torch.arange(len(valid), device=routes.device)
                     pred_route = routes[rows, pred_route_selected_idx]
                     if self.config.multimodal_target_speed:

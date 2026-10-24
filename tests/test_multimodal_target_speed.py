@@ -116,8 +116,15 @@ def test_forward_emits_k_route_conditioned_speed_distributions():
     assert decoder.anchor_embed.weight.grad is not None
 
 
-def test_joint_scorer_choice_survives_legacy_route_selector(monkeypatch):
-    """Closed loop must keep the scorer's route and its paired target speed."""
+@pytest.mark.parametrize("force_slot0, expected_index", [(False, 1), (True, 0)])
+def test_joint_scorer_choice_survives_legacy_route_selector(
+    monkeypatch, force_slot0, expected_index,
+):
+    """Scorer and slot-0 ablation both keep route and speed paired."""
+    if force_slot0:
+        monkeypatch.setenv("P6_EVAL_FORCE_SLOT0", "1")
+    else:
+        monkeypatch.delenv("P6_EVAL_FORCE_SLOT0", raising=False)
     routes = torch.zeros(1, 2, 10, 2)
     routes[0, 1, :, 1] = 5.0
     speeds = torch.tensor([[2.0, 7.0]])
@@ -177,10 +184,10 @@ def test_joint_scorer_choice_survives_legacy_route_selector(monkeypatch):
         "speed": torch.tensor([3.0]),
     })
 
-    assert prediction.pred_route_selected_idx.tolist() == [1]
-    torch.testing.assert_close(prediction.pred_route, routes[:, 1])
-    torch.testing.assert_close(prediction.pred_target_speed_scalar, speeds[:, 1])
+    assert prediction.pred_route_selected_idx.tolist() == [expected_index]
+    torch.testing.assert_close(prediction.pred_route, routes[:, expected_index])
+    torch.testing.assert_close(prediction.pred_target_speed_scalar, speeds[:, expected_index])
     torch.testing.assert_close(
-        prediction.pred_target_speed_distribution, distributions[:, 1],
+        prediction.pred_target_speed_distribution, distributions[:, expected_index],
     )
     torch.testing.assert_close(prediction.pred_route_multimodal, routes)

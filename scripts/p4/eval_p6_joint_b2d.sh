@@ -7,6 +7,16 @@ CKPT_FILE="${1:?provide one completed P6 model_NNNN.pth checkpoint}"
 GPU_LIST="${2:-0}"
 TAG="${3:?provide a unique output tag}"
 [[ "$TAG" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "tag must use letters, digits, _ or -" >&2; exit 1; }
+ROUTE_MODE="${P6_B2D_ROUTE_MODE:-scorer}"
+[[ "$ROUTE_MODE" == scorer || "$ROUTE_MODE" == slot0 ]] || {
+    echo "P6_B2D_ROUTE_MODE must be scorer or slot0" >&2; exit 1
+}
+if [[ "$ROUTE_MODE" == slot0 ]]; then
+    export P6_EVAL_FORCE_SLOT0=1
+else
+    export P6_EVAL_FORCE_SLOT0=0
+fi
+echo "P6 evaluation route selection: $ROUTE_MODE"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
