@@ -186,7 +186,10 @@ From the LEAD project root, download the route archives and buckets from `master
 
 ```bash
 hf download master-skd/visual-intent-training-data \
-  --repo-type dataset --include 'zip/**' 'buckets/**' \
+  --repo-type dataset --include '*/*.zip' \
+  --local-dir data/carla_leaderboard2/zip
+hf download master-skd/visual-intent-training-data \
+  --repo-type dataset --include 'buckets/*' \
   --local-dir data/carla_leaderboard2
 python scripts/unpack_carla_training_zips.py
 ```
