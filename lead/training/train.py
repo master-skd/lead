@@ -127,6 +127,7 @@ class Trainer:
             )
             self.p7_intent_client = QwenDriveIntentClient(str(socket_path), timeout=1800)
         self.online_vlm_prefetch = os.environ.get("LEAD_QWEN_PREFETCH", "0") == "1"
+        self.p7_intent_prefetch = os.environ.get("P7_INTENT_PREFETCH", "0") == "1"
         if self.config.online_joint_training:
             from lead.inference.vlm_client import VLMServiceClient
 
@@ -262,13 +263,20 @@ class Trainer:
         iterator_timing = self.timing.start("loader_iterator", epoch=self.cur_epoch)
         with iterator_timing.phase("create_or_reset_iterator"):
             batches = iter(self.dataloader)
+        iterator_timing.finish()
         prefetch = None
         if self.online_vlm_client is not None and self.online_vlm_prefetch:
             from lead.inference.vlm_client import OnlineVLMPrefetcher
 
             prefetch = OnlineVLMPrefetcher(self.online_vlm_client)
             prefetch.advance(batches)
-        iterator_timing.finish()
+        p7_prefetch = None
+        if self.p7_intent_client is not None and self.p7_intent_prefetch:
+            from lead.inference.qwendrive_intent_client import QwenDriveIntentPrefetcher
+
+            p7_prefetch = QwenDriveIntentPrefetcher(self.p7_intent_client)
+            p7_prefetch.advance(batches)
+            LOG.info("P7 Qwen-Drive one-batch lookahead enabled on rank %d", self.config.rank)
         for epoch_iteration in tqdm(
             range(self.gradient_steps_per_epoch), disable=self.config.rank != 0,
         ):
@@ -287,6 +295,8 @@ class Trainer:
             with timing.phase("data_wait"):
                 if prefetch is not None:
                     data = prefetch.current_data
+                elif p7_prefetch is not None:
+                    data = p7_prefetch.current_data
                 else:
                     try:
                         data = next(batches)
@@ -314,17 +324,27 @@ class Trainer:
                         self.config.device, non_blocking=True,
                     )
             if self.p7_intent_client is not None:
-                with timing.phase("qwendrive_intent"):
-                    from lead.inference.qwendrive_intent_client import NAV_COMMANDS
-                    from lead.tfv6.semantic_intent_slots import service_results_to_tensors
+                from lead.inference.qwendrive_intent_client import NAV_COMMANDS
+                from lead.tfv6.semantic_intent_slots import service_results_to_tensors
 
-                    paths = data.pop("p7_image_path")
+                paths = data.pop("p7_image_path")
+                if p7_prefetch is not None:
+                    navigation = p7_prefetch.current_navigation
+                    with timing.phase("qwendrive_wait"):
+                        results = p7_prefetch.result()
+                    # Start Qwen on batch t+1 before training the current batch.
+                    with timing.phase("next_batch_prefetch"):
+                        p7_prefetch.advance(batches)
+                else:
                     command = data["command"]
                     if command.ndim != 2 or command.shape[1] != 6 or not (command.sum(1) == 1).all():
                         raise ValueError("P7 requires six-way one-hot navigation commands")
                     navigation = [NAV_COMMANDS[index] for index in command.argmax(1).tolist()]
-                    speeds = data["speed"].tolist()
-                    results = self.p7_intent_client.generate_batch(paths, navigation, speeds)
+                    with timing.phase("qwendrive_intent"):
+                        results = self.p7_intent_client.generate_batch(
+                            paths, navigation, data["speed"].tolist(),
+                        )
+                with timing.phase("qwendrive_parse"):
                     semantic = service_results_to_tensors(
                         results, navigation, capacity=self.config.multimodal_planner_k,
                     )
@@ -409,6 +429,8 @@ class Trainer:
             timing.finish()
         if prefetch is not None:
             prefetch.close()
+        if p7_prefetch is not None:
+            p7_prefetch.close()
         self.optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast(

@@ -37,6 +37,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
+export P7_INTENT_PREFETCH=${P7_INTENT_PREFETCH:-1}
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 for ((i=0; i<${#DEVICES[@]}; i++)); do
     CUDA_VISIBLE_DEVICES="${DEVICES[$i]}" "$QWEN_PYTHON" -u -m lead.inference.qwendrive_intent_service \

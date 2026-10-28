@@ -6,6 +6,7 @@ import json
 import socket
 import struct
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 
 
 NAV_COMMANDS = (
@@ -69,3 +70,54 @@ class QwenDriveIntentClient:
 
     def close(self) -> None:
         self.sock.close()
+
+
+class QwenDriveIntentPrefetcher:
+    """Keep one ordered Qwen-Drive request in flight beside planner training."""
+
+    def __init__(self, client: QwenDriveIntentClient):
+        self.client = client
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="p7-intent")
+        self.current_data = None
+        self.current_paths = None
+        self.current_navigation = None
+        self.current_future = None
+
+    def advance(self, batches) -> bool:
+        """Read one DataLoader batch and submit its VQA request."""
+        try:
+            data = next(batches)
+        except StopIteration:
+            self.current_data = None
+            self.current_paths = None
+            self.current_navigation = None
+            self.current_future = None
+            return False
+        command = data["command"]
+        if command.ndim != 2 or command.shape[1] != 6 or not (command.sum(1) == 1).all():
+            raise ValueError("P7 requires six-way one-hot navigation commands")
+        paths = list(data["p7_image_path"])
+        navigation = [NAV_COMMANDS[index] for index in command.argmax(1).tolist()]
+        speeds = data["speed"].tolist()
+        self.current_data = data
+        self.current_paths = paths
+        self.current_navigation = navigation
+        # Only the executor thread touches the socket, preserving response order.
+        self.current_future = self.executor.submit(
+            self.client.generate_batch, paths, navigation, speeds,
+        )
+        return True
+
+    def result(self) -> list[dict]:
+        if self.current_future is None:
+            raise RuntimeError("No Qwen-Drive batch has been prefetched")
+        return self.current_future.result()
+
+    def close(self) -> None:
+        self.executor.shutdown(wait=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()

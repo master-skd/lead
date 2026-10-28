@@ -2,12 +2,16 @@
 
 import json
 import socket
-from threading import Thread
+from threading import Event, Thread
 from types import SimpleNamespace
 
 from PIL import Image
+import pytest
+import torch
 
-from lead.inference.qwendrive_intent_client import _receive_json, _send_json
+from lead.inference.qwendrive_intent_client import (
+    QwenDriveIntentPrefetcher, _receive_json, _send_json,
+)
 from lead.inference.qwendrive_intent_service import _views, serve
 from lead.tfv6.semantic_intent_slots import service_results_to_tensors
 
@@ -78,3 +82,57 @@ def test_views_rejects_outside_media_root(tmp_path):
         assert "outside" in str(exc)
     else:
         raise AssertionError("media root must be enforced")
+
+
+def test_p7_prefetch_overlaps_ordered_batches_and_preserves_metadata():
+    entered = Event()
+    release = Event()
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def generate_batch(self, paths, commands, speeds):
+            self.calls.append((paths, commands, speeds))
+            if len(self.calls) == 2:
+                entered.set()
+                assert release.wait(timeout=5)
+            return [{"raw_text": path, "error": None} for path in paths]
+
+    def batch(path, command_id, speed):
+        return {
+            "p7_image_path": [path],
+            "command": torch.nn.functional.one_hot(torch.tensor([command_id]), 6),
+            "speed": torch.tensor([speed]),
+        }
+
+    client = Client()
+    batches = iter([batch("a.jpg", 3, 4.0), batch("b.jpg", 0, 5.0)])
+    with QwenDriveIntentPrefetcher(client) as prefetch:
+        assert prefetch.advance(batches)
+        assert prefetch.current_navigation == ["follow_lane"]
+        assert prefetch.result()[0]["raw_text"] == "a.jpg"
+        assert prefetch.advance(batches)
+        assert prefetch.current_navigation == ["turn_left"]
+        assert entered.wait(timeout=5)  # Next VQA runs while the current batch trains.
+        release.set()
+        assert prefetch.result()[0]["raw_text"] == "b.jpg"
+        assert not prefetch.advance(batches)
+    assert client.calls == [
+        (["a.jpg"], ["follow_lane"], [4.0]),
+        (["b.jpg"], ["turn_left"], [5.0]),
+    ]
+
+
+def test_p7_prefetch_rejects_bad_command_before_request():
+    class Client:
+        def generate_batch(self, *_):
+            raise AssertionError("invalid command must never reach the service")
+
+    with QwenDriveIntentPrefetcher(Client()) as prefetch:
+        with pytest.raises(ValueError, match="six-way one-hot"):
+            prefetch.advance(iter([{
+                "p7_image_path": ["a.jpg"],
+                "command": torch.zeros(1, 6),
+                "speed": torch.tensor([0.0]),
+            }]))

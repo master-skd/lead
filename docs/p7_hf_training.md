@@ -34,6 +34,11 @@ P7_BATCH_SIZE=64 P7_EPOCHS=20 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 ```
 
 `P7_TRAIN_FRAMES` defaults to 0, meaning all bucket-selected CARLA frames.
+`P7_INTENT_PREFETCH` defaults to 1: while the planner trains on batch `t`, a
+single ordered background request generates Qwen-Drive intents for batch `t+1`.
+Set it to 0 for a synchronous timing comparison. The timing log separates
+`qwendrive_wait`, `qwendrive_parse`, and `next_batch_prefetch`; the first batch
+still waits for Qwen-Drive before training can begin.
 `P7_WORKERS` defaults to 4 per rank. The launcher starts one service per GPU,
 waits for its socket, and then runs torchrun. It sets the posttrain load file,
 10 route points, K=6, paired K speeds and the P7 semantic query gate. The
@@ -49,7 +54,8 @@ silently turn the experiment into LEAD-only training. Individual generation
 errors are logged in `qwendrive_rankN.log`; aggregate fallback counts are in
 the trainer log.
 
-This online HF path repeats VQA generation every epoch and is a correctness
-baseline, not a throughput optimization. No GPU end-to-end run has yet been
+This online HF path repeats VQA generation every epoch. One-batch lookahead
+overlaps generation with planner training, but the HF service still generates
+each sample sequentially within a batch. No GPU end-to-end run has yet been
 performed in this workspace. Before the full run, confirm the smoke batch
 reaches a checkpoint and inspect the fallback rate and route/speed losses.

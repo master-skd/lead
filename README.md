@@ -48,6 +48,7 @@
   - [1.2. Install dependencies](#12-install-dependencies)
   - [1.3. Download Qwen-Drive](#13-download-qwen-drive)
   - [1.4. Download CARLA training data](#14-download-carla-training-data)
+  - [1.5. Train P7 on eight GPUs](#15-train-p7-on-eight-gpus)
 
 ## Updates
 
@@ -180,6 +181,26 @@ bash /tmp/hfd.sh Qwen/Qwen-Drive-1.0-4B \
 
 The download includes the root VLM weights and the separately released planner heads. P7's HF intent service reads only the root VLM checkpoint; set `P7_QWEN_MODEL="$PWD/models/Qwen-Drive-1.0-4B"` when using the [P7 training script](scripts/p7/train_p7_hf_online.sh). See the [P7 training guide](docs/p7_hf_training.md) for the remaining data, environment, and posttrain checkpoint requirements.
 
+P7 also needs the separate [Qwen-Drive source repository](https://github.com/QwenLM/Qwen-Drive-1.0) for its `qwen_drive` Python module. Install it in a dedicated GPU environment; the `lead` environment above runs the planner and does not need these Qwen-Drive dependencies:
+
+```bash
+# From the LEAD project root, on the GPU training machine.
+git clone https://github.com/QwenLM/Qwen-Drive-1.0.git models/Qwen-Drive-1.0-code
+conda create -n qwendrive_official python=3.12 -y
+conda activate qwendrive_official
+cd models/Qwen-Drive-1.0-code
+python -m pip install -U pip setuptools wheel packaging ninja
+python -m pip install torch==2.8.0 torchvision==0.23.0 \
+  --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -r requirements.txt --no-build-isolation
+python -m pip install -e . --no-deps --no-build-isolation
+python -c 'import torch, qwen_drive; print(torch.__version__, torch.cuda.is_available())'
+cd ../..
+conda activate lead
+```
+
+The check must print `True` for CUDA availability. The pinned Qwen-Drive requirements target Python 3.12 and CUDA 12.8; compiling `flash-attn` and related packages needs a suitable CUDA toolkit on the machine. A CPU-only PyTorch installation cannot serve P7 training on GPUs.
+
 ### 1.4. Download CARLA training data
 
 From the LEAD project root, download the route archives and buckets from `master-skd/visual-intent-training-data`, then unpack the routes:
@@ -195,3 +216,21 @@ python scripts/unpack_carla_training_zips.py
 ```
 
 This restores the existing `data/carla_leaderboard2/data` and `data/carla_leaderboard2/buckets` layout. The old cache is not needed.
+
+### 1.5. Train P7 on eight GPUs
+
+Place the LEAD posttrain checkpoint and its `config.json` together under `outputs/local_training/posttrain/`. From the LEAD project root with the `lead` environment active, start the full-data, 20-epoch run:
+
+```bash
+CONDA_BASE=$(conda info --base)
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+P7_LEAD_PYTHON="$CONDA_BASE/envs/lead/bin/python" \
+P7_QWEN_PYTHON="$CONDA_BASE/envs/qwendrive_official/bin/python" \
+P7_QWEN_MODEL="$PWD/models/Qwen-Drive-1.0-4B" \
+P7_POSTTRAIN=outputs/local_training/posttrain/model_0030.pth \
+P7_LOGDIR=outputs/local_training/p7_hf_full \
+P7_BATCH_SIZE=64 P7_WORKERS=4 P7_EPOCHS=20 \
+  bash scripts/p7/train_p7_hf_online.sh
+```
+
+`P7_BATCH_SIZE` is the global batch size (64 means 8 samples per GPU). The launcher starts one frozen Qwen-Drive service and one LEAD training rank per GPU. Its one-batch intent prefetch is enabled by default: Qwen-Drive prepares the next batch while the planner trains on the current one. Set `P7_INTENT_PREFETCH=0` for a synchronous timing comparison. See the [P7 training guide](docs/p7_hf_training.md) for a small smoke run and log details.
