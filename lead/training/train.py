@@ -114,17 +114,28 @@ class Trainer:
             dataloader=self.dataloader,
             total_gradient_steps=self.total_gradient_steps,
         )
-        self.online_vlm_prefetch = os.environ.get("LEAD_QWEN_PREFETCH", "0") == "1"
         self.online_vlm_client = None
+        self.p7_intent_client = None
+        self.p7_empty_batches = 0
+        if self.config.use_semantic_intent_planner:
+            if self.config.online_joint_training or self.config.use_vlm_intent:
+                raise ValueError("P7 semantic training cannot use the P6 hidden-state service")
+            from lead.inference.qwendrive_intent_client import QwenDriveIntentClient
+
+            socket_path = Path(self.config.p7_intent_socket_dir) / (
+                f"rank{self.config.local_rank}.sock"
+            )
+            self.p7_intent_client = QwenDriveIntentClient(str(socket_path), timeout=1800)
+        self.online_vlm_prefetch = os.environ.get("LEAD_QWEN_PREFETCH", "0") == "1"
         if self.config.online_joint_training:
             from lead.inference.vlm_client import VLMServiceClient
 
             socket_path = Path(self.config.online_vlm_socket_dir) / (
                 f"rank{self.config.local_rank}.sock"
             )
+            self.online_vlm_client = VLMServiceClient(str(socket_path), timeout=600)
             if self.online_vlm_prefetch:
                 LOG.info("Online VLM one-batch lookahead enabled on rank %d", self.config.rank)
-            self.online_vlm_client = VLMServiceClient(str(socket_path), timeout=600)
         self.joint_val_loader = None
         self.best_joint_val = float("inf")
         if self.config.online_joint_training and self.config.joint_val_manifest:
@@ -302,6 +313,36 @@ class Trainer:
                     data["vlm_hidden"] = torch.from_numpy(hidden.copy()).to(
                         self.config.device, non_blocking=True,
                     )
+            if self.p7_intent_client is not None:
+                with timing.phase("qwendrive_intent"):
+                    from lead.inference.qwendrive_intent_client import NAV_COMMANDS
+                    from lead.tfv6.semantic_intent_slots import service_results_to_tensors
+
+                    paths = data.pop("p7_image_path")
+                    command = data["command"]
+                    if command.ndim != 2 or command.shape[1] != 6 or not (command.sum(1) == 1).all():
+                        raise ValueError("P7 requires six-way one-hot navigation commands")
+                    navigation = [NAV_COMMANDS[index] for index in command.argmax(1).tolist()]
+                    speeds = data["speed"].tolist()
+                    results = self.p7_intent_client.generate_batch(paths, navigation, speeds)
+                    semantic = service_results_to_tensors(
+                        results, navigation, capacity=self.config.multimodal_planner_k,
+                    )
+                    if bool(semantic["semantic_intent_fallback"].all()):
+                        self.p7_empty_batches += 1
+                        if self.p7_empty_batches >= 10:
+                            raise RuntimeError(
+                                "Qwen-Drive returned no usable intent for ten consecutive batches; "
+                                "stopping instead of training an unintended LEAD-only baseline"
+                            )
+                    else:
+                        self.p7_empty_batches = 0
+                    data.update(semantic)
+                    if self.config.rank == 0 and self.step % 50 == 0:
+                        LOG.info("P7 intent batch: valid=%d/%d, fallback=%d/%d",
+                                 int(semantic["semantic_intent_valid"].sum()),
+                                 len(paths) * self.config.multimodal_planner_k,
+                                 int(semantic["semantic_intent_fallback"].sum()), len(paths))
             loss = torch.zeros(
                 1,
                 dtype=self.config.torch_float_type,

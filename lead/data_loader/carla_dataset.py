@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import time
+from pathlib import Path
 
 import cv2
 import diskcache
@@ -103,6 +104,11 @@ class CARLAData(Dataset):
 
         start_loading_time = time.time()
         data = {}
+        if (getattr(self.config, "use_semantic_intent_planner", False)
+                and not self.build_cache and not self.build_buckets):
+            # The HF service reads the original JPEG used by the reviewed P7
+            # probe; LEAD's augmented RGB tensor is not a VQA input.
+            data["p7_image_path"] = str(Path(str(self.images[index], encoding="utf-8")).resolve())
 
         future_waypoint_indices = [self.config.waypoints_spacing]
         for _ in range(self.config.num_way_points_prediction - 1):

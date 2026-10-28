@@ -38,7 +38,13 @@ class PlanningDecoder(nn.Module):
         self.mm = self.config.multimodal_planner
         self.K = self.config.multimodal_planner_k if self.mm else 1
         self.mm_speed = self.config.multimodal_target_speed
-        if self.mm_speed and not (
+        self.semantic_intent_mode = bool(getattr(self.config, "use_semantic_intent_planner", False))
+        if self.semantic_intent_mode and not (
+            self.mm and self.mm_speed and self.config.predict_spatial_path
+            and self.config.predict_target_speed and not self.config.joint_scorer_replaces_conf
+        ):
+            raise ValueError("P7 semantic planner requires K routes, K speeds and confidence, without scorer")
+        if self.mm_speed and not self.semantic_intent_mode and not (
             self.mm and self.config.predict_spatial_path
             and self.config.predict_target_speed and self.config.joint_scorer_replaces_conf
             and not self.config.route_select_by_conf
@@ -78,9 +84,21 @@ class PlanningDecoder(nn.Module):
                 # B2: anchor embedding [sin a, cos a, reach/30, valid] -> D, added to each
                 # mode's route queries to break symmetry; per-mode confidence head.
                 D = self.config.transfuser_token_dim
-                self.anchor_embed = nn.Sequential(
-                    nn.Linear(4, D), nn.GELU(), nn.Linear(D, D),
-                )
+                if self.semantic_intent_mode:
+                    from lead.tfv6.semantic_intent_encoder import SemanticIntentEncoder
+
+                    self.semantic_intent_encoder = SemanticIntentEncoder(D)
+                    self.semantic_query_projector = nn.Linear(D, D)
+                    gate = float(self.config.semantic_intent_query_gate_init)
+                    if not 0.0 < gate < 1.0:
+                        raise ValueError("semantic_intent_query_gate_init must be in (0,1)")
+                    self.semantic_query_gate_logit = nn.Parameter(
+                        torch.tensor(math.log(gate / (1.0 - gate)))
+                    )
+                else:
+                    self.anchor_embed = nn.Sequential(
+                        nn.Linear(4, D), nn.GELU(), nn.Linear(D, D),
+                    )
                 if not self.config.joint_scorer_replaces_conf:
                     self.conf_decoder = nn.Linear(D, 1)
         if self.config.predict_temporal_spatial_waypoints:
@@ -160,15 +178,52 @@ class PlanningDecoder(nn.Module):
         query_in = self.query.repeat(bs, 1, 1)  # (B, K*route + wp + speed, D)
         if self.mm and self.config.predict_spatial_path:
             n_route = self.config.num_route_points_prediction
-            if anchor is None:
-                anchor = torch.zeros(bs, self.K, 4, device=query_in.device, dtype=query_in.dtype)
-            # anchor cols already [sin a, cos a, reach/30, valid] (packed in dataset)
-            a_embed = self.anchor_embed(anchor.to(query_in.device, query_in.dtype))  # (B, K, D)
+            if getattr(self, "semantic_intent_mode", False):
+                valid = data["semantic_intent_valid"].to(query_in.device, dtype=torch.bool)
+                if valid.shape != (bs, self.K):
+                    raise ValueError("semantic_intent_valid must have shape [B,K]")
+                if not valid.any(dim=1).all():
+                    if self.training:
+                        raise ValueError("P7 training requires at least one valid intent per sample")
+                    raise ValueError("P7 inference requires an explicit fallback for empty intent samples")
+                a_embed = self.semantic_intent_encoder(
+                    data["semantic_intent_maneuver_ids"].to(query_in.device),
+                    data["semantic_intent_obligations"].to(query_in.device),
+                    data["semantic_intent_scene_rules"].to(query_in.device),
+                    data["command"].to(query_in.device),
+                    valid,
+                )
+                gate = self.semantic_query_gate_logit.sigmoid()
+                a_embed = gate * self.semantic_query_projector(a_embed)
+                a_embed = a_embed * valid[..., None].to(a_embed.dtype)
+                fallback = data.get("semantic_intent_fallback")
+                if fallback is not None:
+                    if fallback.shape != (bs,):
+                        raise ValueError("semantic_intent_fallback must have shape [B]")
+                    a_embed = a_embed * (~fallback.to(query_in.device).bool())[:, None, None]
+            else:
+                if anchor is None:
+                    anchor = torch.zeros(bs, self.K, 4, device=query_in.device, dtype=query_in.dtype)
+                # anchor cols already [sin a, cos a, reach/30, valid] (packed in dataset)
+                a_embed = self.anchor_embed(anchor.to(query_in.device, query_in.dtype))
             # add each mode's embedding to its n_route query rows
             a_rep = a_embed.unsqueeze(2).expand(bs, self.K, n_route, -1).reshape(bs, self.K * n_route, -1)
             query_in[:, : self.K * n_route] = query_in[:, : self.K * n_route] + a_rep
 
-        queries = self.transformer_decoder(query_in, context_tokens)
+        padding_mask = None
+        if getattr(self, "semantic_intent_mode", False):
+            padding_mask = torch.zeros(
+                bs, query_in.shape[1], dtype=torch.bool, device=query_in.device,
+            )
+            padding_mask[:, :self.K * n_route] = (
+                ~valid[:, :, None].expand(-1, -1, n_route).reshape(bs, -1)
+            )
+        if padding_mask is None:
+            queries = self.transformer_decoder(query_in, context_tokens)
+        else:
+            queries = self.transformer_decoder(
+                query_in, context_tokens, tgt_key_padding_mask=padding_mask,
+            )
 
         # Split the queries flexibly based on what we're predicting
         query_idx = 0
@@ -201,6 +256,8 @@ class PlanningDecoder(nn.Module):
                 # Bypass via `data` (NOT `log`: logger scalar-reduces every log entry and
                 # would choke on these tensors). compute_loss reads them from data.
                 data["route_multimodal"] = route_all
+                if getattr(self, "semantic_intent_mode", False):
+                    data["route_valid"] = valid
                 if conf is not None:
                     data["route_conf"] = conf
                 if not self.training:
@@ -229,11 +286,12 @@ class PlanningDecoder(nn.Module):
                 # 0.989 against the real arms' 0.414, so a bare argmax steers down one. Use
                 # this with a checkpoint trained with term 6 (p5_stepB2_corridor).
                 if self.config.route_select_by_conf:
-                    valid = (
-                        anchor[..., 3] > 0.5
-                        if anchor is not None
-                        else torch.ones_like(conf, dtype=torch.bool)
-                    )  # (B,K)
+                    if getattr(self, "semantic_intent_mode", False):
+                        valid = data["semantic_intent_valid"].to(conf.device).bool()
+                    elif anchor is not None:
+                        valid = anchor[..., 3] > 0.5
+                    else:
+                        valid = torch.ones_like(conf, dtype=torch.bool)
                     # -inf on padding so argmax can never land there; all-padding rows (no
                     # anchor extracted at all) fall back to slot 0 rather than picking noise.
                     masked = conf.masked_fill(~valid, float("-inf"))
@@ -299,7 +357,13 @@ class PlanningDecoder(nn.Module):
     def _route_winner(self, route_label, data):
         """One masked geometric WTA assignment shared by route AND speed loss."""
         routes = data["route_multimodal"].float()
-        valid = data["anchor"].to(routes.device)[..., 3] > 0.5
+        valid = (
+            data["semantic_intent_valid"].to(routes.device).bool()
+            if getattr(self, "semantic_intent_mode", False)
+            else data["anchor"].to(routes.device)[..., 3] > 0.5
+        )
+        if getattr(self, "semantic_intent_mode", False) and not valid.any(dim=1).all():
+            raise ValueError("P7 WTA has a sample without a valid semantic intent")
         # Joint forward reserves valid slot 0 for empty-anchor frames. Legacy
         # callers retain their previous slot-0 fallback when every arm is padding.
         distance = torch.linalg.norm(routes - route_label.float()[:, None], dim=-1).mean(-1)
@@ -317,7 +381,11 @@ class PlanningDecoder(nn.Module):
         conf = data.get("route_conf")
         B, K, n, _ = route_all.shape
         gt = route_label.float()                     # (B,n,2)
-        valid = data["anchor"].to(self.device).float()[:, :, 3]  # (B,K)
+        valid = (
+            data["semantic_intent_valid"].to(self.device).float()
+            if getattr(self, "semantic_intent_mode", False)
+            else data["anchor"].to(self.device).float()[:, :, 3]
+        )  # (B,K)
 
         # per-arm mean-L2 to GT; invalid arms get +inf so they never win
         winner = self._route_winner(gt, data)
@@ -339,6 +407,30 @@ class PlanningDecoder(nn.Module):
             conf_tgt[torch.arange(B), winner] = 1.0
             bce = F.binary_cross_entropy_with_logits(conf, conf_tgt, reduction="none")
             loss["loss_route_conf"] = (bce * valid).sum() / valid.sum().clamp(min=1.0)
+
+        if getattr(self, "semantic_intent_mode", False):
+            # P7 has no geometric anchor target. Supervise the expert-matched
+            # arm and confidence only; optional scene collision applies to all
+            # active arms, while padding confidence is explicitly suppressed.
+            if self.config.use_collision_cost and "bev_semantic" in data:
+                from lead.tfv6.collision_cost import collision_cost_per_mode
+
+                per_mode = collision_cost_per_mode(
+                    route_all, data["bev_semantic"].to(self.device, non_blocking=True),
+                    self.config, sigma_m=self.config.collision_sigma_m,
+                )
+                loss["loss_route_collision"] = (
+                    per_mode * valid
+                ).sum() / valid.sum().clamp(min=1.0)
+            if self.config.route_pad_conf_loss_weight > 0:
+                pad = 1.0 - valid
+                pad_bce = F.binary_cross_entropy_with_logits(
+                    conf.float(), torch.zeros_like(conf.float()), reduction="none",
+                )
+                loss["loss_route_pad_conf"] = (
+                    pad_bce * pad
+                ).sum() / pad.sum().clamp(min=1.0)
+            return
 
         # B2 anti-collapse (term 3): push each NON-winner valid arm toward its OWN anchor
         # BRANCH, so the K arms diverge instead of collapsing onto the winner (pure WTA

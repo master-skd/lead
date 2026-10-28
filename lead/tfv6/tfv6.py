@@ -39,6 +39,12 @@ class TFv6(nn.Module):
         self.device = device
         self.config = config
         self.log = {}
+        self.semantic_intent_mode = bool(getattr(config, "use_semantic_intent_planner", False))
+        if self.semantic_intent_mode and (
+            config.joint_scorer_replaces_conf or config.use_vlm_intent
+            or config.use_intent_decoder or config.use_control_conditioning
+        ):
+            raise ValueError("P7 semantic intent mode must bypass P6 blob intent and joint scorer")
 
         self.backbone = TransfuserBackbone(self.device, self.config)
 
@@ -255,7 +261,7 @@ class TFv6(nn.Module):
             planner_intent = (
                 pred_visual_intent if self.config.use_control_conditioning else None
             )
-            if self.config.multimodal_planner:
+            if self.config.multimodal_planner and not getattr(self, "semantic_intent_mode", False):
                 planner_anchor = data.get("anchor")
                 if planner_anchor is None and pred_visual_intent is not None:
                     # Closed-loop: no cached anchor -> compute from the (frozen, hence
@@ -397,10 +403,26 @@ class TFv6(nn.Module):
                 if planner_anchor is not None and pred_route_conf is not None
                 else planner_anchor
             )
+            if getattr(self, "semantic_intent_mode", False) and pred_route_multimodal is not None:
+                if pred_route_conf is None:
+                    raise RuntimeError("P7 requires trained route confidence logits")
+                valid = data["semantic_intent_valid"].to(pred_route_conf.device).bool()
+                if not valid.any(dim=1).all():
+                    raise RuntimeError("P7 has no valid intent; caller must use its explicit fallback")
+                pred_route_selected_idx = highest_confidence_valid(pred_route_conf, valid)
+                from lead.tfv6.joint_online_training import select_route_speed_pair
+
+                pred_route, pred_target_speed_distribution, pred_target_speed_scalar = select_route_speed_pair(
+                    pred_route_multimodal,
+                    data["target_speed_multimodal_distribution"],
+                    data["target_speed_multimodal_scalar"],
+                    pred_route_selected_idx,
+                )
             # B2c late route resolution is only for models without a joint scorer.
             # It runs after BEV semantics so safety_rescore can inspect occupancy.
             if (
                 not self.config.joint_scorer_replaces_conf
+                and not getattr(self, "semantic_intent_mode", False)
                 and pred_route_multimodal is not None
                 and pred_route_conf is not None
             ):

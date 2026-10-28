@@ -103,6 +103,8 @@ def initialize_torch(config: TrainingConfig) -> int:
     if config.online_joint_training:
         # Online RGB/actor samples are much larger than ordinary LEAD samples.
         num_workers = max(1, min(num_workers, config.joint_dataloader_workers))
+    if config.use_semantic_intent_planner:
+        num_workers = max(1, min(num_workers, config.p7_dataloader_workers))
 
     if torch.cuda.device_count() > 1:
         torch.distributed.init_process_group(
@@ -242,10 +244,28 @@ def initialize_model(
         # route/waypoint/speed queries verbatim; only the newly-added far-range route
         # queries stay fresh. See planning_decoder query layout.
         loaded_state = _migrate_planner_query(loaded_state, model, config)
-        model.load_state_dict(
+        load_result = model.load_state_dict(
             loaded_state,
             strict=config.continue_failed_training,
         )
+        if getattr(config, "use_semantic_intent_planner", False):
+            current = model.state_dict()
+            for prefix in (
+                "backbone.", "planning_decoder.transformer_decoder.",
+                "planning_decoder.route_decoder.",
+                "planning_decoder.target_speed_decoder.",
+                "planning_decoder.wp_decoder.",
+            ):
+                keys = [key for key in current if key.startswith(prefix)]
+                matched = sum(
+                    key in loaded_state and loaded_state[key].shape == current[key].shape
+                    for key in keys
+                )
+                LOG.info("P7 checkpoint load %s: %d/%d tensors matched", prefix, matched, len(keys))
+            LOG.info(
+                "P7 checkpoint missing=%s unexpected=%s",
+                load_result.missing_keys, load_result.unexpected_keys,
+            )
         # B1: the frozen VLM intent head must stay whatever config.vlm_intent_ckpt says
         # (e.g. the P5a multimodal head), but load_file (e.g. a Step A checkpoint) carries
         # its OWN vlm_intent_decoder weights (the P4a single-mode head) and load_state_dict

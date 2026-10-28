@@ -984,13 +984,19 @@ class TrainingConfig(BaseConfig):
     multimodal_planner = False
     # When true, the scene-interacting multi-head scorer replaces route_conf.
     joint_scorer_replaces_conf = False
-    multimodal_planner_k = 6  # K_MAX, must match anchor_extraction.K_MAX
-    # B2: anchor cache dir (precomputed skeleton anchors, (K_MAX,5) per frame).
     # Eight 4 Hz states cover 2 s for long routes. A 10 m route uses four
     # states (1 s) so the scorer does not routinely extrapolate beyond it.
     joint_scorer_steps = 8
     # Route-conditioned K speed distributions; old checkpoints/configs keep one speed.
     multimodal_target_speed = False
+    multimodal_planner_k = 6  # K_MAX, must match anchor_extraction.K_MAX
+    # P7: one structured Qwen-Drive intent per route/speed arm. This bypasses
+    # the P6 anchor embedding, anchor losses and joint scorer.
+    use_semantic_intent_planner = False
+    semantic_intent_query_gate_init = 0.1
+    p7_intent_socket_dir = "/tmp/lead_p7_intent"
+    p7_dataloader_workers = 4
+    # B2: anchor cache dir (precomputed skeleton anchors, (K_MAX,5) per frame).
     anchor_cache_dir = "data/p6/anchor_cache"
     # P5+: if set, use_multimodal_intent reads the clean lane-graph corridor label from this
     # cache instead of the mushy flood-fill blob. None = old blob behaviour.
@@ -1222,7 +1228,8 @@ class TrainingConfig(BaseConfig):
         # (loose hinges, not endpoint L1) so the K arms diverge. Weight tunable; too high
         # overrides winner-vs-expert fidelity.
         weights["loss_route_anchor"] = (
-            self.route_anchor_loss_weight if self.multimodal_planner else 0.0
+            self.route_anchor_loss_weight
+            if self.multimodal_planner and not self.use_semantic_intent_planner else 0.0
         )
         # B2 term 4: collision cost over all valid arms (needs both flags).
         weights["loss_route_collision"] = (
@@ -1233,7 +1240,8 @@ class TrainingConfig(BaseConfig):
         # B2 term 5: off-corridor penalty over all valid arms (needs both flags).
         weights["loss_route_corridor"] = (
             self.route_corridor_loss_weight
-            if (self.multimodal_planner and self.use_route_corridor_loss)
+            if (self.multimodal_planner and self.use_route_corridor_loss
+                and not self.use_semantic_intent_planner)
             else 0.0
         )
         # B2 term 6: push padding arms' confidence to 0.
