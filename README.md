@@ -226,26 +226,57 @@ hf download master-skd/lead-posttrain posttrain.zip --local-dir .
 unzip posttrain.zip
 ```
 
-This restores `outputs/local_training/posttrain/model_0030.pth` and `config.json`. P7 now uses two stages. First, generate each training frame's structured intent JSON once with frozen Qwen-Drive. From the LEAD project root with the `lead` environment active:
+This restores `outputs/local_training/posttrain/model_0030.pth` and `config.json`. Run the following two stages from the LEAD project root.
+
+#### 1.5.1. Extract the Qwen-Drive intent cache
+
+Generate each training frame's structured intent JSON once using eight GPUs:
 
 ```bash
+conda activate lead
 CONDA_BASE=$(conda info --base)
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 P7_LEAD_PYTHON="$CONDA_BASE/envs/lead/bin/python" \
 P7_QWEN_PYTHON="$CONDA_BASE/envs/qwendrive_official/bin/python" \
 P7_QWEN_MODEL="$PWD/models/Qwen-Drive-1.0-4B" \
 P7_POSTTRAIN=outputs/local_training/posttrain/model_0030.pth \
+P7_MANIFEST=data/p7/intent_manifest.jsonl \
+P7_INTENT_DIR=data/p7/intent_cache \
   bash scripts/p7/generate_p7_intents.sh
 ```
 
-The launcher exports all posttrain bucket frames to `data/p7/intent_manifest.jsonl`, runs one generator per GPU, saves readable `shard-*.jsonl` files under `data/p7/intent_cache/`, and builds `intents.sqlite` for training. Re-run the same command with the same GPU count to resume. Keep the manifest, prompt and token settings fixed when resuming. `intents.summary.json` reports actual 0/1/2/3-branch counts before fallback and rejection reasons. Set `P7_RETRY_FAILED=1` to regenerate unsuccessful or empty frames.
+The launcher exports all posttrain bucket frames to the manifest, runs one generator per GPU, and saves results in this layout:
 
-Once generation finishes, train SemanticIntentEncoder and the planner for 20 epochs:
+```text
+data/p7/
+├── intent_manifest.jsonl          # Frame keys, image paths, navigation and speed
+└── intent_cache/
+    ├── shard-00000.jsonl          # Per-frame analysis and structured intent JSON
+    ├── ...
+    ├── shard-00007.jsonl
+    ├── generate_rank0.log         # One progress log per GPU
+    ├── ...
+    ├── generate_rank7.log
+    ├── intents.sqlite            # Indexed JSON records consumed by training
+    └── intents.summary.json      # Real branch counts, fallback and rejections
+```
+
+Watch progress with `tail -f data/p7/intent_cache/generate_rank0.log`. Re-run the same command with the same GPU count to resume; completed frames are skipped. Keep the manifest, model and prompt/token settings fixed when resuming. Set `P7_RETRY_FAILED=1` to regenerate unsuccessful or empty frames. A pre-existing manifest is reused; if it was created for a small smoke run, choose new manifest/cache paths for full generation.
+
+Wait until all generators finish and `intents.sqlite` is built successfully. Check `intents.summary.json` for the actual 0/1/2/3-branch distribution before fallback and for generation failures. The JSONL files are retained for inspection; the indexed SQLite cache supplies the same raw answers to the existing intent parser during training.
+
+#### 1.5.2. Train with the saved intent cache
+
+Train SemanticIntentEncoder and the planner on the cached manifest's frames for 20 epochs:
 
 ```bash
+conda activate lead
+CONDA_BASE=$(conda info --base)
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 P7_LEAD_PYTHON="$CONDA_BASE/envs/lead/bin/python" \
 P7_POSTTRAIN=outputs/local_training/posttrain/model_0030.pth \
+P7_MANIFEST=data/p7/intent_manifest.jsonl \
+P7_INTENT_CACHE=data/p7/intent_cache/intents.sqlite \
 P7_LOGDIR=outputs/local_training/p7_cached_full \
 P7_BATCH_SIZE=64 P7_WORKERS=4 P7_EPOCHS=20 \
   bash scripts/p7/train_p7_cached.sh
