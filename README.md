@@ -219,7 +219,14 @@ This restores the existing `data/carla_leaderboard2/data` and `data/carla_leader
 
 ### 1.5. Train P7 on eight GPUs
 
-Place the LEAD posttrain checkpoint and its `config.json` together under `outputs/local_training/posttrain/`. From the LEAD project root with the `lead` environment active, start the full-data, 20-epoch run:
+Download the LEAD posttrain checkpoint from its separate private repository (run `hf auth login` first):
+
+```bash
+hf download master-skd/lead-posttrain posttrain.zip --local-dir .
+unzip posttrain.zip
+```
+
+This restores `outputs/local_training/posttrain/model_0030.pth` and `config.json`. P7 now uses two stages. First, generate each training frame's structured intent JSON once with frozen Qwen-Drive. From the LEAD project root with the `lead` environment active:
 
 ```bash
 CONDA_BASE=$(conda info --base)
@@ -228,9 +235,20 @@ P7_LEAD_PYTHON="$CONDA_BASE/envs/lead/bin/python" \
 P7_QWEN_PYTHON="$CONDA_BASE/envs/qwendrive_official/bin/python" \
 P7_QWEN_MODEL="$PWD/models/Qwen-Drive-1.0-4B" \
 P7_POSTTRAIN=outputs/local_training/posttrain/model_0030.pth \
-P7_LOGDIR=outputs/local_training/p7_hf_full \
-P7_BATCH_SIZE=64 P7_WORKERS=4 P7_EPOCHS=20 \
-  bash scripts/p7/train_p7_hf_online.sh
+  bash scripts/p7/generate_p7_intents.sh
 ```
 
-`P7_BATCH_SIZE` is the global batch size (64 means 8 samples per GPU). The launcher starts one frozen Qwen-Drive service and one LEAD training rank per GPU. Its one-batch intent prefetch is enabled by default: Qwen-Drive prepares the next batch while the planner trains on the current one. Set `P7_INTENT_PREFETCH=0` for a synchronous timing comparison. See the [P7 training guide](docs/p7_hf_training.md) for a small smoke run and log details.
+The launcher exports all posttrain bucket frames to `data/p7/intent_manifest.jsonl`, runs one generator per GPU, saves readable `shard-*.jsonl` files under `data/p7/intent_cache/`, and builds `intents.sqlite` for training. Re-run the same command with the same GPU count to resume. Keep the manifest, prompt and token settings fixed when resuming. `intents.summary.json` reports actual 0/1/2/3-branch counts before fallback and rejection reasons. Set `P7_RETRY_FAILED=1` to regenerate unsuccessful or empty frames.
+
+Once generation finishes, train SemanticIntentEncoder and the planner for 20 epochs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+P7_LEAD_PYTHON="$CONDA_BASE/envs/lead/bin/python" \
+P7_POSTTRAIN=outputs/local_training/posttrain/model_0030.pth \
+P7_LOGDIR=outputs/local_training/p7_cached_full \
+P7_BATCH_SIZE=64 P7_WORKERS=4 P7_EPOCHS=20 \
+  bash scripts/p7/train_p7_cached.sh
+```
+
+`P7_BATCH_SIZE` is global (64 means 8 samples per GPU). Cached training loads no Qwen model or service and reuses the same JSON throughout all epochs. It still trains K paired routes/speeds with the same semantic encoder, masked WTA and confidence losses. Keep the manifest and SQLite cache together when moving machines; frame keys are independent of the original absolute paths. See the [P7 training guide](docs/p7_hf_training.md) for a small smoke run and the optional online baseline.

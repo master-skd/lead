@@ -6,6 +6,7 @@ import argparse
 import socket
 import sys
 from pathlib import Path
+from functools import lru_cache
 
 from PIL import Image
 
@@ -29,12 +30,45 @@ def _views(path: str, media_root: Path) -> list[Image.Image]:
             strip.crop((2 * width, 0, 3 * width, strip.height))]
 
 
-def serve(model, connection: socket.socket, media_root: Path, *, analysis_tokens: int,
-          answer_tokens: int) -> None:
+@lru_cache(maxsize=1)
+def intent_prompts():
     # The reviewed P7 prompt remains the single source of truth.
     probe_dir = Path(__file__).resolve().parents[2] / "scripts" / "p7"
     sys.path.insert(0, str(probe_dir))
     from probe_qwendrive_rule_intents_cpu import analysis_prompt, final_prompt
+    return analysis_prompt, final_prompt
+
+
+def generate_intent(model, image: str, command: str, speed: float, media_root: Path,
+                    *, analysis_tokens: int, answer_tokens: int) -> dict:
+    analysis_prompt, final_prompt = intent_prompts()
+    if command not in NAV_COMMANDS:
+        raise ValueError("invalid navigation command")
+    images = _views(image, media_root)
+    analysis = model.generate_text(
+        images, analysis_prompt(command, speed), max_new_tokens=analysis_tokens,
+    ).text
+    answer = model.generate_text(
+        images, final_prompt(command, speed, analysis), max_new_tokens=answer_tokens,
+    ).text
+    return {"raw_text": answer, "analysis": analysis, "error": None}
+
+
+def load_vqa_model(model_path: str, device: str):
+    import torch
+    from qwen_drive import QwenDriveForPlanning
+
+    model = QwenDriveForPlanning.from_pretrained(
+        model_path, dtype=torch.float32 if device == "cpu" else torch.bfloat16,
+        attn_implementation="sdpa", low_cpu_mem_usage=True,
+    ).eval()
+    # Only the VLM is used; the uninitialized Planning Expert stays on CPU.
+    model.vlm.to(device).eval()
+    return model
+
+
+def serve(model, connection: socket.socket, media_root: Path, *, analysis_tokens: int,
+          answer_tokens: int) -> None:
 
     while True:
         try:
@@ -47,20 +81,10 @@ def serve(model, connection: socket.socket, media_root: Path, *, analysis_tokens
         results = []
         for item in samples:
             try:
-                command = item["command"]
-                speed = float(item["speed"])
-                if command not in NAV_COMMANDS:
-                    raise ValueError("invalid navigation command")
-                images = _views(item["image"], media_root)
-                analysis = model.generate_text(
-                    images, analysis_prompt(command, speed),
-                    max_new_tokens=analysis_tokens,
-                ).text
-                answer = model.generate_text(
-                    images, final_prompt(command, speed, analysis),
-                    max_new_tokens=answer_tokens,
-                ).text
-                results.append({"raw_text": answer, "error": None})
+                results.append(generate_intent(
+                    model, item["image"], item["command"], float(item["speed"]),
+                    media_root, analysis_tokens=analysis_tokens, answer_tokens=answer_tokens,
+                ))
             except Exception as exc:
                 sample_path = item.get("image", "<unknown>") if isinstance(item, dict) else "<invalid>"
                 print(f"[qwendrive] sample={sample_path} "
@@ -82,16 +106,7 @@ def main() -> None:
         raise ValueError("generation token limits must be positive")
     media_root = Path(args.media_root).resolve(strict=True)
 
-    import torch
-    from qwen_drive import QwenDriveForPlanning
-
-    dtype = torch.float32 if args.device == "cpu" else torch.bfloat16
-    model = QwenDriveForPlanning.from_pretrained(
-        args.model, dtype=dtype, attn_implementation="sdpa", low_cpu_mem_usage=True,
-    ).eval()
-    # The root checkpoint contains VLM weights only. Leave the uninitialized
-    # Planning Expert on CPU; VQA calls model.vlm and model.device only.
-    model.vlm.to(args.device).eval()
+    model = load_vqa_model(args.model, args.device)
     path = Path(args.socket)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():

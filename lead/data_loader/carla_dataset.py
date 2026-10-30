@@ -1299,6 +1299,24 @@ class CARLAData(Dataset):
                     LOG.info("Online joint manifest selected %d / %d CARLA frames",
                              len(indices), len(self.images))
 
+            if (getattr(self.config, "use_semantic_intent_planner", False)
+                    and getattr(self.config, "p7_intent_cache", None)):
+                from lead.tfv6.semantic_intent_cache import image_key
+                if not self.config.p7_intent_manifest:
+                    raise ValueError("Offline P7 requires its generation manifest")
+                if not hasattr(self, "_p7_cached_keys"):
+                    import json
+                    with open(self.config.p7_intent_manifest) as stream:
+                        self._p7_cached_keys = {json.loads(line)["image_key"] for line in stream}
+                indices = np.array([
+                    i for i in indices if image_key(os.fsdecode(self.images[i])) in self._p7_cached_keys
+                ], dtype=indices.dtype)
+                if not len(indices):
+                    raise ValueError("P7 intent manifest selects no training frames")
+                if self.rank == 0:
+                    LOG.info("P7 offline manifest selected %d / %d CARLA frames",
+                             len(indices), len(self.images))
+
             if self.config.carla_num_samples > 0:
                 if self.config.carla_num_samples <= len(indices):
                     indices = indices[: self.config.carla_num_samples]

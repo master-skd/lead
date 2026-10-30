@@ -116,16 +116,25 @@ class Trainer:
         )
         self.online_vlm_client = None
         self.p7_intent_client = None
+        self.p7_intent_cache = None
         self.p7_empty_batches = 0
         if self.config.use_semantic_intent_planner:
             if self.config.online_joint_training or self.config.use_vlm_intent:
                 raise ValueError("P7 semantic training cannot use the P6 hidden-state service")
-            from lead.inference.qwendrive_intent_client import QwenDriveIntentClient
+            if self.config.p7_intent_cache:
+                from lead.tfv6.semantic_intent_cache import IntentCache
 
-            socket_path = Path(self.config.p7_intent_socket_dir) / (
-                f"rank{self.config.local_rank}.sock"
-            )
-            self.p7_intent_client = QwenDriveIntentClient(str(socket_path), timeout=1800)
+                self.p7_intent_cache = IntentCache(
+                    self.config.p7_intent_cache, self.config.p7_intent_manifest,
+                )
+                LOG.info("P7 reads offline intents from %s", self.config.p7_intent_cache)
+            else:
+                from lead.inference.qwendrive_intent_client import QwenDriveIntentClient
+
+                socket_path = Path(self.config.p7_intent_socket_dir) / (
+                    f"rank{self.config.local_rank}.sock"
+                )
+                self.p7_intent_client = QwenDriveIntentClient(str(socket_path), timeout=1800)
         self.online_vlm_prefetch = os.environ.get("LEAD_QWEN_PREFETCH", "0") == "1"
         self.p7_intent_prefetch = os.environ.get("P7_INTENT_PREFETCH", "0") == "1"
         if self.config.online_joint_training:
@@ -323,7 +332,7 @@ class Trainer:
                     data["vlm_hidden"] = torch.from_numpy(hidden.copy()).to(
                         self.config.device, non_blocking=True,
                     )
-            if self.p7_intent_client is not None:
+            if self.p7_intent_client is not None or self.p7_intent_cache is not None:
                 from lead.inference.qwendrive_intent_client import NAV_COMMANDS
                 from lead.tfv6.semantic_intent_slots import service_results_to_tensors
 
@@ -340,8 +349,9 @@ class Trainer:
                     if command.ndim != 2 or command.shape[1] != 6 or not (command.sum(1) == 1).all():
                         raise ValueError("P7 requires six-way one-hot navigation commands")
                     navigation = [NAV_COMMANDS[index] for index in command.argmax(1).tolist()]
-                    with timing.phase("qwendrive_intent"):
-                        results = self.p7_intent_client.generate_batch(
+                    source = self.p7_intent_cache or self.p7_intent_client
+                    with timing.phase("intent_cache_read" if self.p7_intent_cache else "qwendrive_intent"):
+                        results = source.generate_batch(
                             paths, navigation, data["speed"].tolist(),
                         )
                 with timing.phase("qwendrive_parse"):
@@ -352,17 +362,21 @@ class Trainer:
                         self.p7_empty_batches += 1
                         if self.p7_empty_batches >= 10:
                             raise RuntimeError(
-                                "Qwen-Drive returned no usable intent for ten consecutive batches; "
+                                "P7 received no usable intent for ten consecutive batches; "
                                 "stopping instead of training an unintended LEAD-only baseline"
                             )
                     else:
                         self.p7_empty_batches = 0
                     data.update(semantic)
                     if self.config.rank == 0 and self.step % 50 == 0:
+                        real_counts = semantic["semantic_intent_valid"].sum(1)
+                        real_counts[semantic["semantic_intent_fallback"]] = 0
                         LOG.info("P7 intent batch: valid=%d/%d, fallback=%d/%d",
                                  int(semantic["semantic_intent_valid"].sum()),
                                  len(paths) * self.config.multimodal_planner_k,
                                  int(semantic["semantic_intent_fallback"].sum()), len(paths))
+                        LOG.info("P7 real branch histogram (0..K, before fallback): %s",
+                                 torch.bincount(real_counts, minlength=self.config.multimodal_planner_k + 1).tolist())
             loss = torch.zeros(
                 1,
                 dtype=self.config.torch_float_type,

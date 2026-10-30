@@ -12,6 +12,7 @@ GPUS=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 BATCH_SIZE=${P7_BATCH_SIZE:-64}
 WORKERS=${P7_WORKERS:-4}
 EPOCHS=${P7_EPOCHS:-20}
+INTENT_CACHE=${P7_INTENT_CACHE:-}
 IFS=',' read -r -a DEVICES <<< "$GPUS"
 
 for value in "$BATCH_SIZE" "$WORKERS" "$EPOCHS"; do
@@ -20,11 +21,19 @@ done
 (( ${#DEVICES[@]} > 0 && BATCH_SIZE % ${#DEVICES[@]} == 0 )) || {
     echo "P7_BATCH_SIZE must be divisible by the GPU count" >&2; exit 1;
 }
-[[ -x "$LEAD_PYTHON" && -x "$QWEN_PYTHON" && -f "$QWEN_MODEL/model.safetensors" \
+[[ -x "$LEAD_PYTHON" \
    && -f "$POSTTRAIN" && -f "$(dirname "$POSTTRAIN")/config.json" \
    && -d data/carla_leaderboard2/data && -d data/carla_leaderboard2/buckets ]] || {
-    echo "P7 preflight failed: check both Python environments, model, posttrain and CARLA data" >&2; exit 1;
+    echo "P7 preflight failed: check LEAD Python, posttrain and CARLA data" >&2; exit 1;
 }
+if [[ -n "$INTENT_CACHE" ]]; then
+    [[ -f "$INTENT_CACHE" ]] || { echo "Missing P7 intent cache: $INTENT_CACHE" >&2; exit 1; }
+    [[ -f "${P7_MANIFEST:-}" ]] || { echo "Set P7_MANIFEST to the cache's generation manifest" >&2; exit 1; }
+else
+    [[ -x "$QWEN_PYTHON" && -f "$QWEN_MODEL/model.safetensors" ]] || {
+        echo "Missing Qwen environment or model" >&2; exit 1;
+    }
+fi
 mkdir -p "$LOGDIR"
 socket_dir=$(mktemp -d "${TMPDIR:-/tmp}/lead_p7_intent.XXXXXX")
 service_pids=()
@@ -39,6 +48,7 @@ trap cleanup EXIT INT TERM
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export P7_INTENT_PREFETCH=${P7_INTENT_PREFETCH:-1}
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+if [[ -z "$INTENT_CACHE" ]]; then
 for ((i=0; i<${#DEVICES[@]}; i++)); do
     CUDA_VISIBLE_DEVICES="${DEVICES[$i]}" "$QWEN_PYTHON" -u -m lead.inference.qwendrive_intent_service \
         --model "$QWEN_MODEL" --socket "$socket_dir/rank$i.sock" \
@@ -61,10 +71,13 @@ for ((attempt=0; attempt<600; attempt++)); do
     sleep 1
 done
 [[ "$ready" -eq "${#DEVICES[@]}" ]] || { echo "Qwen-Drive service startup timed out" >&2; exit 1; }
+fi
 
 export LEAD_TRAINING_CONFIG="logdir=$LOGDIR load_file=$POSTTRAIN \
 image_encoder_pretrained=false use_planning_decoder=true \
 use_semantic_intent_planner=true p7_intent_socket_dir=$socket_dir \
+p7_intent_cache=${INTENT_CACHE:-null} \
+p7_intent_manifest=${P7_MANIFEST:-null} \
 p7_dataloader_workers=$WORKERS use_vlm_intent=false use_intent_decoder=false \
 online_joint_training=false use_control_conditioning=false \
 multimodal_planner=true multimodal_planner_k=6 multimodal_target_speed=true \

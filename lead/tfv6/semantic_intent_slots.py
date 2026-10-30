@@ -166,6 +166,21 @@ def slots_to_tensors(packed_batch: list[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def parse_service_result(result: Mapping[str, Any]):
+    """Use the same text parser for online replies and offline JSON records."""
+    raw = result.get("raw_text", "")
+    if isinstance(raw, str) and not result.get("error"):
+        candidate = raw.strip()
+        fence = re.fullmatch(r"```(?:json)?\s*\n(.*?)\n```", candidate, flags=re.DOTALL)
+        if fence:
+            candidate = fence.group(1)
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
 def service_results_to_tensors(
     results: list[Mapping[str, Any]], navigation: list[str], *, capacity: int,
 ) -> dict[str, Any]:
@@ -182,17 +197,7 @@ def service_results_to_tensors(
     packed_batch = []
     fallback = []
     for result, command in zip(results, navigation, strict=True):
-        proposal = None
-        raw = result.get("raw_text", "")
-        if isinstance(raw, str) and not result.get("error"):
-            candidate = raw.strip()
-            fence = re.fullmatch(r"```(?:json)?\s*\n(.*?)\n```", candidate, flags=re.DOTALL)
-            if fence:
-                candidate = fence.group(1)
-            try:
-                proposal = json.loads(candidate)
-            except json.JSONDecodeError:
-                pass
+        proposal = parse_service_result(result)
         packed = prepare_planner_intents(proposal, command, capacity=capacity)
         empty = packed["fallback_required"]
         if empty:

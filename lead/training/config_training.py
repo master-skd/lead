@@ -995,6 +995,8 @@ class TrainingConfig(BaseConfig):
     use_semantic_intent_planner = False
     semantic_intent_query_gate_init = 0.1
     p7_intent_socket_dir = "/tmp/lead_p7_intent"
+    p7_intent_cache = None  # Offline indexed JSON cache; bypasses the Qwen service.
+    p7_intent_manifest = None  # Explicit frame set covered by the offline cache.
     p7_dataloader_workers = 4
     # B2: anchor cache dir (precomputed skeleton anchors, (K_MAX,5) per frame).
     anchor_cache_dir = "data/p6/anchor_cache"
