@@ -242,6 +242,7 @@ P7_QWEN_MODEL="$PWD/models/Qwen-Drive-1.0-4B" \
 P7_POSTTRAIN=outputs/local_training/posttrain/model_0030.pth \
 P7_MANIFEST=data/p7/intent_manifest.jsonl \
 P7_INTENT_DIR=data/p7/intent_cache \
+P7_GENERATION_BATCH_SIZE=8 P7_PREPROCESS_WORKERS=8 \
   bash scripts/p7/generate_p7_intents.sh
 ```
 
@@ -262,6 +263,26 @@ data/p7/
 ```
 
 Watch progress with `tail -f data/p7/intent_cache/generate_rank0.log`. Re-run the same command with the same GPU count to resume; completed frames are skipped. Keep the manifest, model and prompt/token settings fixed when resuming. Set `P7_RETRY_FAILED=1` to regenerate unsuccessful or empty frames. A pre-existing manifest is reused; if it was created for a small smoke run, choose new manifest/cache paths for full generation.
+
+`P7_GENERATION_BATCH_SIZE` is the inference batch **per GPU**, separate from the planner's `P7_BATCH_SIZE`. The default is 8 independent three-camera scenes, batched for analysis and then for JSON generation, with left padding for different prompt lengths. The example uses 8 CPU preprocessing workers per GPU (64 workers over eight GPUs); use 4 if fewer CPU cores are allocated. `P7_CPU_THREADS` defaults to 1 to limit nested CPU thread pools. GPU OOM halves the inference batch and retries the unwritten frames, logging the effective batch size. Progress logs include `batch_seconds`, `frames_per_second` and `peak_allocated_gib`. Existing serial JSONL shards can be resumed; batch/worker settings may change without discarding completed frames. Stop existing generators before restarting on the same shard files.
+
+To tune extraction, change these environment variables in the generation command above:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `P7_GENERATION_BATCH_SIZE` | `8` | Independent frames generated together on each GPU; each frame has three camera images. |
+| `P7_PREPROCESS_WORKERS` | `8` | CPU threads per GPU for image loading and official input preprocessing. |
+| `P7_CPU_THREADS` | `1` | Threads in each nested Torch/BLAS CPU pool. |
+
+For example, after measuring batch 8, try batch 16 with the same 8 workers per GPU:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+P7_GENERATION_BATCH_SIZE=16 P7_PREPROCESS_WORKERS=8 \
+  bash scripts/p7/generate_p7_intents.sh
+```
+
+This example assumes the Python/model path variables from the extraction command are exported in your shell; otherwise repeat them in the command. Compare `frames_per_second` and `peak_allocated_gib` in `generate_rankN.log` before increasing the batch again. If CPU allocation is limited, lower `P7_PREPROCESS_WORKERS` to 4. `P7_WORKERS` and `P7_BATCH_SIZE` below apply to planner training, not cache extraction.
 
 Wait until all generators finish and `intents.sqlite` is built successfully. Check `intents.summary.json` for the actual 0/1/2/3-branch distribution before fallback and for generation failures. The JSONL files are retained for inspection; the indexed SQLite cache supplies the same raw answers to the existing intent parser during training.
 

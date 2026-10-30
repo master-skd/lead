@@ -33,7 +33,9 @@ def signature(args):
 
 
 def generate(args):
-    if not 0 <= args.shard < args.num_shards or min(args.analysis_tokens, args.answer_tokens) < 1:
+    batch_size = getattr(args, 'batch_size', 1)
+    if (not 0 <= args.shard < args.num_shards
+            or min(args.analysis_tokens, args.answer_tokens, batch_size) < 1):
         raise ValueError('invalid shard or token settings')
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output = args.output_dir / f'shard-{args.shard:05d}.jsonl'
@@ -62,35 +64,81 @@ def generate(args):
         return
     media_root = args.data_root.resolve(strict=True)
     model = load_vqa_model(args.model, args.device)
+    import torch
+    batcher = None
+    if batch_size > 1:
+        from lead.inference.qwendrive_batch import BatchIntentGenerator
+        batcher = BatchIntentGenerator(
+            model, media_root, analysis_tokens=args.analysis_tokens,
+            answer_tokens=args.answer_tokens, workers=getattr(args, 'preprocess_workers', 8),
+        )
+    print(f'shard={args.shard}: target_batch_size={batch_size}', flush=True)
     histogram = Counter()
     with output.open('a') as stream:
         if not header_seen:
             stream.write(json.dumps({'type': 'metadata', 'signature': expected_signature,
                                      'model': str(Path(args.model).resolve())}) + '\n')
             stream.flush()
-        for index, entry in enumerate(pending, 1):
-            image = (media_root / entry['image_key']).resolve()
+        offset = 0
+        while offset < len(pending):
+            entries = pending[offset:offset + batch_size]
+            measure_cuda = str(args.device).startswith('cuda') and torch.cuda.is_available()
+            if measure_cuda:
+                torch.cuda.reset_peak_memory_stats(args.device)
             started = time.monotonic()
             try:
-                result = generate_intent(
-                    model, str(image), entry['navigation'], entry['speed'], media_root,
-                    analysis_tokens=args.analysis_tokens, answer_tokens=args.answer_tokens,
-                )
-            except Exception as exc:
-                result = {'raw_text': '', 'analysis': '', 'error': f'{type(exc).__name__}: {exc}'}
-            proposal = parse_service_result(result)
-            packed = prepare_planner_intents(proposal, entry['navigation'])
-            count = sum(packed['valid'])
-            histogram[count] += 1
-            row = {**entry, **result, 'image': str(image), 'parsed': proposal,
-                   'valid_branches': count, 'fallback_required': packed['fallback_required'],
-                   'rejected': packed['rejected'], 'seconds': time.monotonic() - started}
-            stream.write(json.dumps(row, ensure_ascii=False) + '\n')
+                if batcher is not None:
+                    results = batcher.generate(entries)
+                else:
+                    entry = entries[0]
+                    try:
+                        results = [generate_intent(
+                            model, str((media_root / entry['image_key']).resolve()),
+                            entry['navigation'], entry['speed'], media_root,
+                            analysis_tokens=args.analysis_tokens, answer_tokens=args.answer_tokens,
+                        )]
+                    except torch.cuda.OutOfMemoryError:
+                        raise
+                    except Exception as exc:
+                        results = [{'raw_text': '', 'analysis': '',
+                                    'error': f'{type(exc).__name__}: {exc}'}]
+            except torch.cuda.OutOfMemoryError as exc:
+                if batch_size <= 1:
+                    raise
+                import gc
+                import traceback
+                traceback.clear_frames(exc.__traceback__)
+                gc.collect()
+                torch.cuda.empty_cache()
+                batch_size = max(1, len(entries) // 2)
+                print(f'shard={args.shard}: CUDA OOM; reducing batch_size to {batch_size}; '
+                      'retrying unwritten frames', flush=True)
+                continue
+            elapsed = time.monotonic() - started
+            peak_gib = (torch.cuda.max_memory_allocated(args.device) / 1024**3
+                        if measure_cuda else None)
+            for entry, result in zip(entries, results, strict=True):
+                proposal = parse_service_result(result)
+                packed = prepare_planner_intents(proposal, entry['navigation'])
+                count = sum(packed['valid'])
+                histogram[count] += 1
+                row = {**entry, **result,
+                       'image': str((media_root / entry['image_key']).resolve()), 'parsed': proposal,
+                       'valid_branches': count, 'fallback_required': packed['fallback_required'],
+                       'rejected': packed['rejected'], 'seconds': elapsed / len(entries),
+                       'batch_seconds': elapsed, 'generation_batch_size': len(entries),
+                       'batch_peak_allocated_gib': peak_gib,
+                       'generation_backend': 'hf_batch' if batcher else 'hf_serial'}
+                stream.write(json.dumps(row, ensure_ascii=False) + '\n')
             stream.flush()
-            if index % 10 == 0 or index == len(pending):
-                os.fsync(stream.fileno())
-                print(f'shard={args.shard} {index}/{len(pending)} '
-                      f'valid_histogram={dict(histogram)} last={row["seconds"]:.1f}s', flush=True)
+            os.fsync(stream.fileno())
+            offset += len(entries)
+            print(f'shard={args.shard} {offset}/{len(pending)} batch={len(entries)} '
+                  f'batch_seconds={elapsed:.1f} frames_per_second={len(entries)/max(elapsed, 1e-9):.3f} '
+                  f'peak_allocated_gib={peak_gib} '
+                  f'valid_histogram={dict(histogram)}', flush=True)
+    if batcher is not None:
+        batcher.close()
 
 
 def main():
@@ -106,6 +154,8 @@ def main():
     gen.add_argument('--device', default='cuda:0')
     gen.add_argument('--analysis-tokens', type=int, default=512)
     gen.add_argument('--answer-tokens', type=int, default=384)
+    gen.add_argument('--batch-size', type=int, default=8)
+    gen.add_argument('--preprocess-workers', type=int, default=8)
     gen.add_argument('--retry-failed', action='store_true')
     idx = commands.add_parser('index')
     idx.add_argument('--manifest', type=Path, required=True)

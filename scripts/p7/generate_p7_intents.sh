@@ -12,6 +12,9 @@ GPUS=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 IFS=',' read -r -a DEVICES <<< "$GPUS"
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
+export OMP_NUM_THREADS=${P7_CPU_THREADS:-1}
+export MKL_NUM_THREADS=${P7_CPU_THREADS:-1}
+export OPENBLAS_NUM_THREADS=1
 mkdir -p "$OUT"
 if [[ ! -f "$MANIFEST" ]]; then
     "$LEAD_PYTHON" scripts/p7/export_p7_manifest.py \
@@ -33,6 +36,8 @@ for ((i=0; i<${#DEVICES[@]}; i++)); do
         --num-shards "${#DEVICES[@]}" --shard "$i" \
         --analysis-tokens "${P7_ANALYSIS_TOKENS:-512}" \
         --answer-tokens "${P7_ANSWER_TOKENS:-384}" "${retry[@]}" \
+        --batch-size "${P7_GENERATION_BATCH_SIZE:-8}" \
+        --preprocess-workers "${P7_PREPROCESS_WORKERS:-8}" \
         > "$OUT/generate_rank$i.log" 2>&1 &
     pids+=("$!")
 done

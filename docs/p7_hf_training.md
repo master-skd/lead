@@ -43,13 +43,27 @@ With the Python/model variables above set, run generation once:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+P7_GENERATION_BATCH_SIZE=8 P7_PREPROCESS_WORKERS=8 \
   bash scripts/p7/generate_p7_intents.sh
 ```
 
 Defaults are all posttrain bucket frames, analysis limit 512 tokens and answer
 limit 384 tokens. Generation exports `data/p7/intent_manifest.jsonl` using the
 same first navigation command and current speed as CARLAData, then launches
-one independent HF worker per GPU. Each worker writes an append-only
+one independent HF worker per GPU. Each process now makes two batched generate
+calls per group: up to 8 independent scenes for analysis, followed by their
+individual JSON prompts. Official per-scene preprocessing and decoding defaults
+are retained; left padding and attention masks handle different prompt lengths.
+`P7_GENERATION_BATCH_SIZE` sets the per-GPU inference batch (default 8), while
+`P7_PREPROCESS_WORKERS` sets CPU preprocessing threads per GPU (default 8). Eight workers per GPU need roughly 64 CPU workers across the job;
+use four on a smaller CPU allocation. `P7_CPU_THREADS=1` limits nested Torch/BLAS
+thread pools. An OOM reduces the batch by half and retries the unwritten scenes;
+OOM at batch one stops the worker. Logs report actual batch, batch wall time and
+frames per second. Records include effective batch size and token-limit flags.
+These CPU tests do not establish numerical or throughput parity on the real
+GPU model; measure the first batches on the target machine.
+
+Each worker writes an append-only
 `data/p7/intent_cache/shard-NNNNN.jsonl` and a `generate_rankN.log`. Records
 contain a portable scenario/route/rgb/frame key, an absolute image path for
 review, navigation, speed, analysis text, raw answer, parsed JSON, generation
@@ -63,6 +77,10 @@ new records; the latest record is used in the index. Use a new output directory
 when deliberately changing generation settings. Full generation still incurs
 HF autoregressive inference once per frame; this change eliminates repeated
 generation during subsequent epochs and experiments.
+
+Batch size and CPU worker count are execution settings, so they can change when
+resuming existing serial shards with the same semantic generation signature.
+Stop all old generators first; do not run two writers on a shard concurrently.
 
 After all workers finish, the launcher verifies full manifest coverage and
 atomically creates `intents.sqlite`. The JSONL remains available for review;
