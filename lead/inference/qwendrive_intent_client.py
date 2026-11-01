@@ -71,6 +71,30 @@ class QwenDriveIntentClient:
     def close(self) -> None:
         self.sock.close()
 
+    def generate_rgb(self, rgb, command: str, speed: float) -> list[dict]:
+        """Lossless in-memory transport of one already-preprocessed live RGB strip."""
+        import base64
+        from io import BytesIO
+        import numpy as np
+        from PIL import Image
+
+        if rgb.shape != (384, 1152, 3) or rgb.dtype != np.uint8:
+            raise ValueError("P7 live input must be a 384x1152 uint8 RGB strip")
+        if command not in NAV_COMMANDS:
+            raise ValueError("unknown navigation command")
+        stream = BytesIO()
+        Image.fromarray(rgb).save(stream, format="PNG")
+        _send_json(self.sock, {"samples": [{
+            "image_png": base64.b64encode(stream.getvalue()).decode("ascii"),
+            "command": command, "speed": float(speed),
+        }]})
+        response = _receive_json(self.sock)
+        self.requests += 1
+        if (not isinstance(response, dict) or not isinstance(response.get("samples"), list)
+                or len(response["samples"]) != 1 or not isinstance(response["samples"][0], dict)):
+            raise ValueError("malformed live Qwen-Drive response")
+        return response["samples"]
+
 
 class QwenDriveIntentPrefetcher:
     """Keep one ordered Qwen-Drive request in flight beside planner training."""

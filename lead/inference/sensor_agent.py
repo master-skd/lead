@@ -5,6 +5,7 @@ import shutil
 import typing
 from collections import deque
 from copy import deepcopy
+from pathlib import Path
 
 import carla
 import cv2
@@ -108,6 +109,22 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
 
             self.vlm_client = VLMServiceClient(
                 socket_path=self.training_config.vlm_service_socket
+            )
+
+        self.p7_intent = None
+        self.p7_intent_trace_file = None
+        self.p7_intent_trace_failed = False
+        if self.training_config.use_semantic_intent_planner:
+            if self.vlm_client is not None or len(self.closed_loop_inference.nets) != 1:
+                raise ValueError("P7 closed loop requires one semantic planner and no P6 VLM head")
+            from lead.inference.qwendrive_intent_client import QwenDriveIntentClient
+            from lead.inference.p7_closed_loop_intent import P7ClosedLoopIntent
+
+            self.p7_intent = P7ClosedLoopIntent(
+                QwenDriveIntentClient(self.config_closed_loop.p7_intent_socket,
+                                      timeout=self.config_closed_loop.p7_intent_timeout),
+                capacity=self.training_config.multimodal_planner_k,
+                jpeg_quality=self.config_closed_loop.vlm_jpeg_quality,
             )
 
         # Post-processing heuristics
@@ -748,6 +765,17 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 vlm_hidden.astype(np.float32)
             ).to(self.device)[None]
 
+        if self.p7_intent is not None:
+            semantic = self.p7_intent.prepare(
+                input_data["original_rgb"], input_data["command"],
+                float(np.asarray(input_data["speed"]).reshape(-1)[0]),
+            )
+            input_data_tensors.update({key: value.to(self.device) for key, value in semantic.items()})
+            if self.step % 50 == 0:
+                LOG.info("P7 live intent: branches=%d fallback=%s seconds=%.2f",
+                         self.p7_intent.last_trace["real_valid_branches"],
+                         self.p7_intent.last_trace["fallback"], self.p7_intent.last_trace["seconds"])
+
         # Save input log if need
         if (
             self.config_closed_loop.save_path is not None
@@ -769,6 +797,7 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         closed_loop_prediction: ClosedLoopPrediction = (
             self.closed_loop_inference.forward(data=input_data_tensors)
         )
+        self.save_p7_intent_trace(input_data_tensors)
         self.save_p6_intent_capture(
             cam_rgb if self.vlm_client is not None else None,
             input_data_tensors,
@@ -943,8 +972,37 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 json.dump(self.metric_info, outfile, indent=4)
         return self.control
 
+    def save_p7_intent_trace(self, data):
+        if self.p7_intent is None or self.p7_intent_trace_failed or self.config_closed_loop.save_path is None:
+            return
+        try:
+            if self.p7_intent_trace_file is None:
+                destination = Path(self.config_closed_loop.save_path) / "p7_intent_trace.jsonl"
+                self.p7_intent_trace_file = destination.open("w", encoding="utf-8", buffering=1)
+            prediction = self.closed_loop_inference.predictions[0]
+            record = {"step": self.step, **self.p7_intent.last_trace}
+            for key, value in (
+                ("selected_idx", prediction.pred_route_selected_idx),
+                ("route_conf_logits", prediction.pred_route_conf),
+                ("candidate_speeds", data.get("target_speed_multimodal_scalar")),
+                ("selected_speed", prediction.pred_target_speed_scalar),
+                ("selected_route", prediction.pred_route),
+            ):
+                record[key] = value.detach().cpu().tolist() if value is not None else None
+            self.p7_intent_trace_file.write(json.dumps(record, allow_nan=False) + "\n")
+        except Exception:
+            self.p7_intent_trace_failed = True
+            LOG.exception("Disabling P7 intent trace after a logging failure")
+
     def destroy(self, results=None):
         LOG.info(results)
+
+        if getattr(self, "p7_intent", None) is not None:
+            self.p7_intent.close()
+            self.p7_intent = None
+        if getattr(self, "p7_intent_trace_file", None) is not None:
+            self.p7_intent_trace_file.close()
+            self.p7_intent_trace_file = None
 
         diagnostics_file = getattr(self, "velocity_diagnostics_file", None)
         if diagnostics_file is not None:

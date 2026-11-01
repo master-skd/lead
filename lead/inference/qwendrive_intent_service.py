@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+from io import BytesIO
 import socket
 import sys
 from pathlib import Path
@@ -21,6 +23,10 @@ def _views(path: str, media_root: Path) -> list[Image.Image]:
         raise ValueError("image path lies outside the allowed CARLA data root")
     with Image.open(image) as source:
         strip = source.convert("RGB")
+    return split_views(strip)
+
+
+def split_views(strip: Image.Image) -> list[Image.Image]:
     if strip.size != (1152, 384):
         raise ValueError(f"expected 384x1152 three-camera strip, got {strip.size}")
     width = strip.width // 3
@@ -41,10 +47,17 @@ def intent_prompts():
 
 def generate_intent(model, image: str, command: str, speed: float, media_root: Path,
                     *, analysis_tokens: int, answer_tokens: int) -> dict:
+    return generate_intent_views(
+        model, _views(image, media_root), command, speed,
+        analysis_tokens=analysis_tokens, answer_tokens=answer_tokens,
+    )
+
+
+def generate_intent_views(model, images, command: str, speed: float,
+                          *, analysis_tokens: int, answer_tokens: int) -> dict:
     analysis_prompt, final_prompt = intent_prompts()
     if command not in NAV_COMMANDS:
         raise ValueError("invalid navigation command")
-    images = _views(image, media_root)
     analysis = model.generate_text(
         images, analysis_prompt(command, speed), max_new_tokens=analysis_tokens,
     ).text
@@ -67,7 +80,7 @@ def load_vqa_model(model_path: str, device: str):
     return model
 
 
-def serve(model, connection: socket.socket, media_root: Path, *, analysis_tokens: int,
+def serve(model, connection: socket.socket, media_root: Path | None, *, analysis_tokens: int,
           answer_tokens: int) -> None:
 
     while True:
@@ -81,10 +94,23 @@ def serve(model, connection: socket.socket, media_root: Path, *, analysis_tokens
         results = []
         for item in samples:
             try:
-                results.append(generate_intent(
-                    model, item["image"], item["command"], float(item["speed"]),
-                    media_root, analysis_tokens=analysis_tokens, answer_tokens=answer_tokens,
-                ))
+                if "image_png" in item:
+                    payload = base64.b64decode(item["image_png"], validate=True)
+                    with Image.open(BytesIO(payload)) as image:
+                        if image.format != "PNG" or image.size != (1152, 384):
+                            raise ValueError("live image must be a 1152x384 PNG RGB strip")
+                        views = split_views(image.convert("RGB"))
+                    results.append(generate_intent_views(
+                        model, views, item["command"], float(item["speed"]),
+                        analysis_tokens=analysis_tokens, answer_tokens=answer_tokens,
+                    ))
+                else:
+                    if media_root is None:
+                        raise ValueError("path requests require --media-root")
+                    results.append(generate_intent(
+                        model, item["image"], item["command"], float(item["speed"]),
+                        media_root, analysis_tokens=analysis_tokens, answer_tokens=answer_tokens,
+                    ))
             except Exception as exc:
                 sample_path = item.get("image", "<unknown>") if isinstance(item, dict) else "<invalid>"
                 print(f"[qwendrive] sample={sample_path} "
@@ -97,14 +123,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
     parser.add_argument("--socket", required=True)
-    parser.add_argument("--media-root", required=True)
+    parser.add_argument("--media-root", help="Allowed data root for offline path requests")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--analysis-tokens", type=int, default=512)
     parser.add_argument("--answer-tokens", type=int, default=384)
     args = parser.parse_args()
     if args.analysis_tokens < 1 or args.answer_tokens < 1:
         raise ValueError("generation token limits must be positive")
-    media_root = Path(args.media_root).resolve(strict=True)
+    media_root = Path(args.media_root).resolve(strict=True) if args.media_root else None
 
     model = load_vqa_model(args.model, args.device)
     path = Path(args.socket)

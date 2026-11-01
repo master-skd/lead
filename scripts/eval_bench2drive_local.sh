@@ -100,13 +100,18 @@ worker() {
     if [[ -n "${B2D_QWEN_SOCKET_DIR:-}" ]]; then
       training_config="${training_config} vlm_service_socket=${B2D_QWEN_SOCKET_DIR}/gpu${gpu}.sock"
     fi
+    local closed_loop_config="${LEAD_CLOSED_LOOP_CONFIG:-}"
+    if [[ -n "${B2D_P7_SOCKET_DIR:-}" ]]; then
+      closed_loop_config="${closed_loop_config} p7_intent_socket=${B2D_P7_SOCKET_DIR}/gpu${gpu}.sock"
+    fi
     if CUDA_VISIBLE_DEVICES=$gpu LEAD_TRAINING_CONFIG="$training_config" \
+      LEAD_CLOSED_LOOP_CONFIG="$closed_loop_config" \
       LD_LIBRARY_PATH="${B2D_LEAD_LIBRARY_PATH:-${LD_LIBRARY_PATH:-}}" \
       timeout "$ROUTE_TIMEOUT" "$LEAD_PYTHON" -m lead \
         --checkpoint "$CKPT" --routes "$xml" --bench2drive \
         --output-dir "$OUTROOT/$id" \
         --gpu "$gpu" \
-        --port $port --traffic-manager-port $tm \
+        --port $port --traffic-manager-port $tm --timeout "${B2D_AGENT_TIMEOUT:-180}" \
         >"$LOGDIR/route_${id}.log" 2>&1; then ok=$((ok+1))
     else
       # Distinguish "ran out of time" from "crashed": `timeout` exits 124 on SIGTERM, and a

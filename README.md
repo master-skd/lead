@@ -49,6 +49,7 @@
   - [1.3. Download Qwen-Drive](#13-download-qwen-drive)
   - [1.4. Download CARLA training data](#14-download-carla-training-data)
   - [1.5. Train P7 on eight GPUs](#15-train-p7-on-eight-gpus)
+  - [1.6. Evaluate P7 on Bench2Drive](#16-evaluate-p7-on-bench2drive)
 
 ## Updates
 
@@ -304,3 +305,25 @@ P7_BATCH_SIZE=64 P7_WORKERS=4 P7_EPOCHS=20 \
 ```
 
 `P7_BATCH_SIZE` is global (64 means 8 samples per GPU). Cached training loads no Qwen model or service and reuses the same JSON throughout all epochs. It still trains K paired routes/speeds with the same semantic encoder, masked WTA and confidence losses. Keep the manifest and SQLite cache together when moving machines; frame keys are independent of the original absolute paths. See the [P7 training guide](docs/p7_hf_training.md) for a small smoke run and the optional online baseline.
+
+### 1.6. Evaluate P7 on Bench2Drive
+
+On the evaluation machine, prepare CARLA 0.9.15, both Python environments, the Qwen-Drive 4B model, and the trained P7 checkpoint with its sibling `config.json`. From the LEAD project root:
+
+```bash
+export P7_B2D_LEAD_PYTHON=/path/to/miniconda3/envs/lead/bin/python
+export P7_B2D_QWEN_PYTHON=/path/to/miniconda3/envs/qwendrive_official/bin/python
+export P7_B2D_QWEN_MODEL="$PWD/models/Qwen-Drive-1.0-4B"
+export CARLA_ROOT=/path/to/CARLA_0915
+
+# Check one route first (replace the checkpoint with your actual completed epoch).
+B2D_ROUTE_IDS=3904 bash scripts/p7/eval_p7_b2d.sh \
+  outputs/local_training/p7_cached_tenth/model_0019.pth "0" p7_tenth_smoke
+
+# Full 220-route evaluation across eight GPUs.
+bash scripts/p7/eval_p7_b2d.sh \
+  outputs/local_training/p7_cached_tenth/model_0019.pth \
+  "0 1 2 3 4 5 6 7" p7_tenth_full
+```
+
+The agent obtains fresh Qwen-Drive JSON from live three-camera images and passes the same semantic tensors used in training to the planner. It selects the highest-confidence valid route and its paired speed. Training caches are not required on this machine. Per-route JSON traces record the intents, fallback and selected candidate. See the [closed-loop guide](docs/p7_hf_training.md#bench2drive-closed-loop-evaluation) for output paths, preflight and timeout settings.

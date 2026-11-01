@@ -128,3 +128,73 @@ next-batch generation with the current planner step; setting it to 0 runs
 synchronously. This mode repeats VQA every epoch. Its timing phases are
 `qwendrive_wait` (or synchronous `qwendrive_intent`), `qwendrive_parse` and
 `next_batch_prefetch`; errors are in `qwendrive_rankN.log`.
+
+## Bench2Drive closed-loop evaluation
+
+Copy the trained P7 `model_NNNN.pth` and its sibling `config.json` to the evaluation
+machine. Install the Qwen-Drive environment/source package and copy the root 4B
+model directory there too. Evaluation needs CARLA 0.9.15, Bench2Drive routes and
+the LEAD environment. It does not read the training JSON cache, manifest or the
+old P6 intent checkpoint. The same evaluator works for a full-data or sampled
+P7 checkpoint.
+
+From the LEAD project root, set the machine's actual paths. For example:
+
+```bash
+export P7_B2D_LEAD_PYTHON=/path/to/miniconda3/envs/lead/bin/python
+export P7_B2D_QWEN_PYTHON=/path/to/miniconda3/envs/qwendrive_official/bin/python
+export P7_B2D_QWEN_MODEL="$PWD/models/Qwen-Drive-1.0-4B"
+export CARLA_ROOT=/path/to/CARLA_0915
+```
+
+First check one route on GPU 0, using a new result tag:
+
+```bash
+B2D_ROUTE_IDS=3904 bash scripts/p7/eval_p7_b2d.sh \
+  outputs/local_training/p7_cached_tenth/model_0019.pth "0" p7_tenth_smoke
+```
+
+Then evaluate all 220 routes, distributed across eight GPUs:
+
+```bash
+bash scripts/p7/eval_p7_b2d.sh \
+  outputs/local_training/p7_cached_tenth/model_0019.pth \
+  "0 1 2 3 4 5 6 7" p7_tenth_full
+```
+
+Replace the checkpoint path with the actual completed epoch. Use
+`P7_B2D_PREFLIGHT_ONLY=1` to check the config/paths and prepare the isolated
+single-model checkpoint directory without starting CARLA or Qwen. The launcher
+starts one Qwen-Drive service per GPU, then the existing Bench2Drive route
+workers; each agent reconnects to its GPU's service for its route. It preserves
+confidence selection over valid semantic branches and gathers the paired speed.
+No scorer or fixed slot-zero selection is used for successful semantic requests.
+
+At each agent step, the live full BGR strip is JPEG-encoded at quality 30 and
+read back as RGB, matching saved CARLA training images. It is transported as
+lossless in-memory PNG, split into front/front-left/front-right and evaluated
+using the same analysis/JSON prompts as extraction. Returned malformed or empty
+answers get the same explicit nonsemantic query fallback as training. A broken
+socket stops the route rather than repeatedly pretending to have usable intent.
+
+Outputs:
+
+- Qwen service logs: `outputs/p7_b2d_eval_logs/TAG/qwen_gpuN.log`.
+- Route evaluator logs: `/tmp/b2d_TAG/route_ID.log`.
+- Route results and live intent traces:
+  `outputs/local_evaluation_TAG/ID/checkpoint_endpoint.json` and
+  `p7_intent_trace.jsonl` (raw/parsed JSON, fallback, confidence logits,
+  selected candidate, candidate speeds and selected route/speed).
+- Full-run aggregate: `outputs/b2d_TAG/merged.json`, after all 220 route result
+  files pass validation. Subset runs are not merged as a 220-route score.
+
+Generation defaults are analysis 512 / answer 384 tokens. Match the settings
+used for the training cache via `P7_B2D_ANALYSIS_TOKENS` and
+`P7_B2D_ANSWER_TOKENS` if they differed. `P7_B2D_AGENT_TIMEOUT` defaults to 600
+seconds for RPC/watchdog waits; `P7_B2D_ROUTE_TIMEOUT` defaults to 86400 seconds
+per route because per-frame autoregressive inference can greatly exceed the
+old planner-only wall time. No temporal reuse or skipped intent updates are
+introduced in this initial closed-loop baseline.
+
+CPU bridge and preflight tests are provided; actual CARLA/GPU closed-loop
+execution must still be checked on the evaluation machine.

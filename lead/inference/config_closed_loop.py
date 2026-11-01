@@ -28,6 +28,8 @@ class ClosedLoopConfig(OpenLoopConfig):
     # CARLA intent training reads the saved three-camera JPEGs (quality 30).
     # Keep this separate from the planner's legacy JPEG quality above.
     vlm_jpeg_quality = 30
+    p7_intent_socket = "/tmp/lead_p7_intent.sock"
+    p7_intent_timeout = 600.0
 
     # --- Control which output is used for controlling ---
     # Modality used for steering control
