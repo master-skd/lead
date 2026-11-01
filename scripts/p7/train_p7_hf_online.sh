@@ -12,6 +12,7 @@ GPUS=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 BATCH_SIZE=${P7_BATCH_SIZE:-64}
 WORKERS=${P7_WORKERS:-4}
 EPOCHS=${P7_EPOCHS:-20}
+CONTINUE_FAILED=${P7_CONTINUE_FAILED_TRAINING:-false}
 INTENT_CACHE=${P7_INTENT_CACHE:-}
 IFS=',' read -r -a DEVICES <<< "$GPUS"
 
@@ -80,6 +81,7 @@ p7_intent_cache=${INTENT_CACHE:-null} \
 p7_intent_manifest=${P7_MANIFEST:-null} \
 p7_dataloader_workers=$WORKERS use_vlm_intent=false use_intent_decoder=false \
 online_joint_training=false use_control_conditioning=false \
+continue_failed_training=$CONTINUE_FAILED \
 multimodal_planner=true multimodal_planner_k=6 multimodal_target_speed=true \
 joint_scorer_replaces_conf=false route_select_by_conf=true \
 num_route_points_prediction=10 num_route_points_smoothing=40 \
@@ -94,6 +96,6 @@ LEAD_LIBNVRTC_DIR=${P7_LEAD_LIBNVRTC_DIR:-$("$LEAD_PYTHON" -c 'import pathlib, s
 if [[ -f "$LEAD_LIBNVRTC_DIR/libnvrtc.so.12" ]]; then
     export LD_LIBRARY_PATH="$LEAD_LIBNVRTC_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
-CUDA_VISIBLE_DEVICES="$GPUS" "$(dirname "$LEAD_PYTHON")/torchrun" \
+CUDA_VISIBLE_DEVICES="$GPUS" "$LEAD_PYTHON" -m torch.distributed.run \
     --standalone --nnodes=1 --nproc_per_node="${#DEVICES[@]}" \
     --max_restarts=0 --no-python "$LEAD_PYTHON" lead/training/train.py

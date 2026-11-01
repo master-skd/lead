@@ -1,0 +1,3 @@
+GLIBC_2.32 {
+    global: __libc_single_threaded;
+};
