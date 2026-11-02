@@ -16,6 +16,10 @@ NAV_COMMANDS = (
 MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 
 
+class QwenDriveInputMismatchError(RuntimeError):
+    """Fatal backend input mismatch; it must never become an ordinary fallback."""
+
+
 def _receive_exact(sock: socket.socket, count: int) -> bytes:
     chunks = bytearray()
     while len(chunks) < count:

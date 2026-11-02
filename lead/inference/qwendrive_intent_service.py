@@ -7,13 +7,14 @@ import base64
 from io import BytesIO
 import socket
 import sys
+import time
 from pathlib import Path
 from functools import lru_cache
 
 from PIL import Image
 
 from lead.inference.qwendrive_intent_client import (
-    NAV_COMMANDS, _receive_json, _send_json,
+    NAV_COMMANDS, QwenDriveInputMismatchError, _receive_json, _send_json,
 )
 
 
@@ -58,13 +59,19 @@ def generate_intent_views(model, images, command: str, speed: float,
     analysis_prompt, final_prompt = intent_prompts()
     if command not in NAV_COMMANDS:
         raise ValueError("invalid navigation command")
+    start = time.monotonic()
     analysis = model.generate_text(
         images, analysis_prompt(command, speed), max_new_tokens=analysis_tokens,
     ).text
+    analysis_seconds = time.monotonic() - start
+    analysis_metrics = getattr(model, "last_metrics", None)
+    start = time.monotonic()
     answer = model.generate_text(
         images, final_prompt(command, speed, analysis), max_new_tokens=answer_tokens,
     ).text
-    return {"raw_text": answer, "analysis": analysis, "error": None}
+    return {"raw_text": answer, "analysis": analysis, "error": None,
+            "analysis_seconds": analysis_seconds, "answer_seconds": time.monotonic() - start,
+            "analysis_metrics": analysis_metrics, "answer_metrics": getattr(model, "last_metrics", None)}
 
 
 def load_vqa_model(model_path: str, device: str):
@@ -111,6 +118,8 @@ def serve(model, connection: socket.socket, media_root: Path | None, *, analysis
                         model, item["image"], item["command"], float(item["speed"]),
                         media_root, analysis_tokens=analysis_tokens, answer_tokens=answer_tokens,
                     ))
+            except QwenDriveInputMismatchError:
+                raise
             except Exception as exc:
                 sample_path = item.get("image", "<unknown>") if isinstance(item, dict) else "<invalid>"
                 print(f"[qwendrive] sample={sample_path} "
@@ -127,12 +136,21 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--analysis-tokens", type=int, default=512)
     parser.add_argument("--answer-tokens", type=int, default=384)
+    parser.add_argument("--backend", choices=("hf", "vllm"), default="hf")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
+    parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--enforce-eager", action="store_true")
     args = parser.parse_args()
     if args.analysis_tokens < 1 or args.answer_tokens < 1:
         raise ValueError("generation token limits must be positive")
     media_root = Path(args.media_root).resolve(strict=True) if args.media_root else None
 
-    model = load_vqa_model(args.model, args.device)
+    if args.backend == "vllm":
+        from lead.inference.qwendrive_vllm import VLLMQwenDrive
+        model = VLLMQwenDrive(args.model, gpu_memory_utilization=args.gpu_memory_utilization,
+                             max_model_len=args.max_model_len, enforce_eager=args.enforce_eager)
+    else:
+        model = load_vqa_model(args.model, args.device)
     path = Path(args.socket)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
@@ -140,7 +158,7 @@ def main() -> None:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
         server.bind(str(path))
         server.listen(1)
-        print(f"[qwendrive] ready on {path}; VQA only", flush=True)
+        print(f"[qwendrive] ready on {path}; VQA only; backend={args.backend}", flush=True)
         try:
             while True:
                 connection, _ = server.accept()

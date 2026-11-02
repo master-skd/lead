@@ -33,6 +33,10 @@ class P7ClosedLoopIntent:
             'seconds': time.monotonic() - started, 'jpeg_quality': self.jpeg_quality,
             'parsed': proposal, 'raw_text': results[0].get('raw_text'),
             'analysis': results[0].get('analysis'), 'error': results[0].get('error'),
+            'analysis_seconds': results[0].get('analysis_seconds'),
+            'answer_seconds': results[0].get('answer_seconds'),
+            'analysis_metrics': results[0].get('analysis_metrics'),
+            'answer_metrics': results[0].get('answer_metrics'),
             'real_valid_branches': sum(packed['valid']), 'rejected': packed['rejected'],
             'slots': packed['slots'], 'fallback': bool(tensors['semantic_intent_fallback'][0]),
         }

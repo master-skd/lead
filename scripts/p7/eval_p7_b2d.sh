@@ -12,6 +12,10 @@ cd "$REPO_ROOT"
 LEAD_PYTHON="${P7_B2D_LEAD_PYTHON:-/mmu_nlp_hdd/liuzihan08/miniconda3/envs/lead/bin/python}"
 QWEN_PYTHON="${P7_B2D_QWEN_PYTHON:-/mmu_nlp_hdd/liuzihan08/miniconda3/envs/qwendrive_official/bin/python}"
 QWEN_MODEL="${P7_B2D_QWEN_MODEL:-/mmu_nlp_hdd/liuzihan08/models/Qwen-Drive-1.0-4B}"
+QWEN_BACKEND="${P7_B2D_BACKEND:-hf}"
+[[ "$QWEN_BACKEND" == hf || "$QWEN_BACKEND" == vllm ]] || {
+    echo "P7_B2D_BACKEND must be hf or vllm" >&2; exit 1
+}
 [[ -x "$LEAD_PYTHON" && -x "$QWEN_PYTHON" && -d "$QWEN_MODEL" ]] || {
     echo "Set P7_B2D_LEAD_PYTHON, P7_B2D_QWEN_PYTHON and P7_B2D_QWEN_MODEL to existing paths" >&2
     exit 1
@@ -27,6 +31,11 @@ CONFIG_FILE="$(dirname "$CKPT_FILE")/config.json"
 [[ -f "$CKPT_FILE" && -f "$CONFIG_FILE" ]] || {
     echo "checkpoint and sibling config.json are both required" >&2; exit 1
 }
+if [[ "$QWEN_BACKEND" == vllm ]]; then
+    [[ -f "$QWEN_MODEL/p7_vllm_export.json" ]] || {
+        echo "Create a standalone VLM adapter with scripts/p7/prepare_qwendrive_vllm.py first" >&2; exit 1;
+    }
+fi
 
 "$LEAD_PYTHON" - "$CONFIG_FILE" <<'PY'
 import json
@@ -109,12 +118,19 @@ trap cleanup EXIT INT TERM
 
 LOG_DIR="$REPO_ROOT/outputs/p7_b2d_eval_logs/$TAG"
 mkdir -p "$LOG_DIR"
+engine_args=(--backend "$QWEN_BACKEND")
+if [[ "$QWEN_BACKEND" == vllm ]]; then
+    engine_args+=(--gpu-memory-utilization "${P7_B2D_VLLM_MEMORY:-0.5}"
+                 --max-model-len "${P7_B2D_VLLM_MAX_LEN:-4096}")
+    [[ "${P7_B2D_VLLM_EAGER:-0}" != 1 ]] || engine_args+=(--enforce-eager)
+fi
 for gpu in "${GPUS[@]}"; do
     CUDA_VISIBLE_DEVICES="$gpu" "$QWEN_PYTHON" -u -m lead.inference.qwendrive_intent_service \
         --model "$QWEN_MODEL" --socket "$SOCKET_DIR/gpu${gpu}.sock" \
         --device cuda:0 \
         --analysis-tokens "${P7_B2D_ANALYSIS_TOKENS:-512}" \
         --answer-tokens "${P7_B2D_ANSWER_TOKENS:-384}" \
+        "${engine_args[@]}" \
         > "$LOG_DIR/qwen_gpu${gpu}.log" 2>&1 &
     QWEN_PIDS+=("$!")
 done
