@@ -104,7 +104,8 @@ class CARLAData(Dataset):
 
         start_loading_time = time.time()
         data = {}
-        if (getattr(self.config, "use_semantic_intent_planner", False)
+        if ((getattr(self.config, "use_semantic_intent_planner", False)
+                 or getattr(self.config, "use_hidden_intent_planner", False))
                 and not self.build_cache and not self.build_buckets):
             # The HF service reads the original JPEG used by the reviewed P7
             # probe; LEAD's augmented RGB tensor is not a VQA input.
@@ -1196,13 +1197,19 @@ class CARLAData(Dataset):
         self.bucket_identity = []
         self.global_indices = []
 
-        mixture_ratios = self.bucket_collection.buckets_mixture_per_epoch(epoch)
+        # P8 uses the full active posttrain pool at epoch 0, then a fixed hash
+        # subset. Do not redraw a different tenth through bucket RNG each epoch.
+        hidden_subset = getattr(self.config, "use_hidden_intent_planner", False)
+        mixture_ratios = self.bucket_collection.buckets_mixture_per_epoch(0 if hidden_subset else epoch)
         for bucket_idx, bucket in enumerate(self.bucket_collection.buckets):
             if bucket_idx in mixture_ratios:
                 sampling_rate = mixture_ratios[bucket_idx]
-                samples_needed = int(len(bucket) * sampling_rate)
+                samples_needed = (len(bucket) if hidden_subset and sampling_rate > 0
+                                  else int(len(bucket) * sampling_rate))
                 if samples_needed > 0:
-                    if self.random:
+                    if hidden_subset:
+                        indices = np.arange(len(bucket))
+                    elif self.random:
                         if samples_needed > len(bucket):
                             indices = rng.choice(
                                 len(bucket),
@@ -1316,6 +1323,50 @@ class CARLAData(Dataset):
                 if self.rank == 0:
                     LOG.info("P7 offline manifest selected %d / %d CARLA frames",
                              len(indices), len(self.images))
+
+            if getattr(self.config, "use_hidden_intent_planner", False):
+                from lead.data_loader.frame_subset import select_frame_fraction
+                if getattr(self.config, "hidden_intent_cache", None):
+                    from lead.tfv6.semantic_intent_cache import image_key
+                    if not hasattr(self, "_p8_cache_keys"):
+                        from lead.tfv6.hidden_state_cache import HiddenStateCache
+                        source = HiddenStateCache(self.config.hidden_intent_cache)
+                        try:
+                            self._p8_cache_keys = source.keys()
+                        finally:
+                            source.close()
+                    indices = np.array([i for i in indices
+                                        if image_key(os.fsdecode(self.images[i])) in self._p8_cache_keys], dtype=indices.dtype)
+                    found = {image_key(os.fsdecode(self.images[i])) for i in indices}
+                    if found != self._p8_cache_keys:
+                        raise ValueError("P8 cached frames absent from active posttrain bucket pool")
+                else:
+                    indices = select_frame_fraction(
+                        self.images, indices, self.config.hidden_intent_frame_fraction,
+                        self.config.hidden_intent_sample_seed,
+                    )
+                if not len(indices):
+                    raise ValueError("P8 frame subset is empty")
+                if self.rank == 0:
+                    LOG.info("P8 fixed subset: %d / %d frames, fraction=%s seed=%s",
+                             len(indices), len(self.images), self.config.hidden_intent_frame_fraction,
+                             self.config.hidden_intent_sample_seed)
+                    if not getattr(self, "_p8_subset_recorded", False):
+                        import hashlib
+                        import json
+                        from lead.tfv6.semantic_intent_cache import image_key
+                        keys = sorted({image_key(os.fsdecode(self.images[i])) for i in indices})
+                        destination = Path(self.config.logdir)
+                        destination.mkdir(parents=True, exist_ok=True)
+                        text = "\n".join(keys) + "\n"
+                        (destination / "p8_train_frames.txt").write_text(text)
+                        (destination / "p8_subset.json").write_text(json.dumps({
+                            "fraction": self.config.hidden_intent_frame_fraction,
+                            "seed": self.config.hidden_intent_sample_seed,
+                            "unique_frames": len(keys), "entries": len(indices),
+                            "keys_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                        }, indent=2) + "\n")
+                        self._p8_subset_recorded = True
 
             if self.config.carla_num_samples > 0:
                 if self.config.carla_num_samples <= len(indices):

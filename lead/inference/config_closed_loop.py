@@ -30,6 +30,8 @@ class ClosedLoopConfig(OpenLoopConfig):
     vlm_jpeg_quality = 30
     p7_intent_socket = "/tmp/lead_p7_intent.sock"
     p7_intent_timeout = 600.0
+    p8_hidden_socket = "/tmp/lead_p8_hidden.sock"
+    p8_hidden_timeout = 600.0
 
     # --- Control which output is used for controlling ---
     # Modality used for steering control

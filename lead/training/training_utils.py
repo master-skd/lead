@@ -103,7 +103,7 @@ def initialize_torch(config: TrainingConfig) -> int:
     if config.online_joint_training:
         # Online RGB/actor samples are much larger than ordinary LEAD samples.
         num_workers = max(1, min(num_workers, config.joint_dataloader_workers))
-    if config.use_semantic_intent_planner:
+    if config.use_semantic_intent_planner or config.use_hidden_intent_planner:
         num_workers = max(1, min(num_workers, config.p7_dataloader_workers))
 
     if torch.cuda.device_count() > 1:
@@ -178,6 +178,8 @@ def _migrate_planner_query(
                 f"{n_route} x K={K}; wp+speed {n_wp + n_sp} inherited.",
             )
         else:
+            if getattr(config, "use_hidden_intent_planner", False):
+                raise ValueError(f"P8 requires matching posttrain route length: {old_route} != {n_route}")
             LOG.warning(
                 f"mm migrate: unexpected old_route={old_route} (expected {n_route}); "
                 f"keeping fresh init for route queries.",
@@ -248,7 +250,7 @@ def initialize_model(
             loaded_state,
             strict=config.continue_failed_training,
         )
-        if getattr(config, "use_semantic_intent_planner", False):
+        if getattr(config, "use_semantic_intent_planner", False) or getattr(config, "use_hidden_intent_planner", False):
             current = model.state_dict()
             for prefix in (
                 "backbone.", "planning_decoder.transformer_decoder.",

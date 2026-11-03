@@ -118,6 +118,19 @@ class Trainer:
         self.p7_intent_client = None
         self.p7_intent_cache = None
         self.p7_empty_batches = 0
+        self.p8_hidden_client = None
+        if self.config.use_hidden_intent_planner:
+            if (self.config.use_semantic_intent_planner or self.config.online_joint_training
+                    or self.config.use_vlm_intent):
+                raise ValueError("P8 hidden training must bypass P6 and P7 AR services")
+            if self.config.hidden_intent_cache:
+                from lead.tfv6.hidden_state_cache import HiddenStateCache
+                self.p8_hidden_client = HiddenStateCache(self.config.hidden_intent_cache)
+                LOG.info("P8 reads frozen Qwen tokens from cache: %s", self.config.hidden_intent_cache)
+            else:
+                from lead.inference.qwendrive_hidden_client import QwenDriveHiddenClient
+                socket_path = Path(self.config.hidden_intent_socket_dir) / f"rank{self.config.local_rank}.sock"
+                self.p8_hidden_client = QwenDriveHiddenClient(socket_path)
         if self.config.use_semantic_intent_planner:
             if self.config.online_joint_training or self.config.use_vlm_intent:
                 raise ValueError("P7 semantic training cannot use the P6 hidden-state service")
@@ -279,6 +292,11 @@ class Trainer:
 
             prefetch = OnlineVLMPrefetcher(self.online_vlm_client)
             prefetch.advance(batches)
+        p8_prefetch = None
+        if self.p8_hidden_client is not None and os.environ.get("P8_HIDDEN_PREFETCH", "0") == "1":
+            from lead.inference.qwendrive_intent_client import QwenDriveIntentPrefetcher
+            p8_prefetch = QwenDriveIntentPrefetcher(self.p8_hidden_client)
+            p8_prefetch.advance(batches)
         p7_prefetch = None
         if self.p7_intent_client is not None and self.p7_intent_prefetch:
             from lead.inference.qwendrive_intent_client import QwenDriveIntentPrefetcher
@@ -304,6 +322,8 @@ class Trainer:
             with timing.phase("data_wait"):
                 if prefetch is not None:
                     data = prefetch.current_data
+                elif p8_prefetch is not None:
+                    data = p8_prefetch.current_data
                 elif p7_prefetch is not None:
                     data = p7_prefetch.current_data
                 else:
@@ -332,6 +352,28 @@ class Trainer:
                     data["vlm_hidden"] = torch.from_numpy(hidden.copy()).to(
                         self.config.device, non_blocking=True,
                     )
+            if self.p8_hidden_client is not None:
+                from lead.inference.qwendrive_intent_client import NAV_COMMANDS
+                paths = data.pop("p7_image_path")
+                with timing.phase("hidden_cache_read" if self.config.hidden_intent_cache else "qwendrive_hidden_wait"):
+                    if p8_prefetch is not None:
+                        arrays = p8_prefetch.result()
+                    else:
+                        command = data["command"]
+                        if command.ndim != 2 or command.shape[1] != 6 or not (command.sum(1) == 1).all():
+                            raise ValueError("P8 requires six-way one-hot navigation")
+                        navigation = [NAV_COMMANDS[i] for i in command.argmax(1).tolist()]
+                        arrays = self.p8_hidden_client.generate_batch(paths, navigation, data["speed"].tolist())
+                if arrays["qwen_hidden"].shape[-1] != self.config.qwendrive_hidden_dim:
+                    raise ValueError("Qwen hidden dimension differs from configured adapter")
+                if self.config.rank == 0 and self.step % 50 == 0:
+                    LOG.info("P8 hidden source: %s", self.p8_hidden_client.last_metrics)
+                if p8_prefetch is not None:
+                    with timing.phase("next_batch_prefetch"):
+                        p8_prefetch.advance(batches)
+                with timing.phase("hidden_to_gpu", gpu=True):
+                    data.update({key: torch.from_numpy(value).to(self.config.device, non_blocking=True)
+                                 for key, value in arrays.items()})
             if self.p7_intent_client is not None or self.p7_intent_cache is not None:
                 from lead.inference.qwendrive_intent_client import NAV_COMMANDS
                 from lead.tfv6.semantic_intent_slots import service_results_to_tensors
@@ -411,6 +453,12 @@ class Trainer:
             with timing.phase("backward_ddp", gpu=True):
                 self.scaler.scale(loss).backward()
 
+            if self.p8_hidden_client is not None and self.config.rank == 0 and self.step % 50 == 0:
+                encoder = self.model.planning_decoder.hidden_intent_encoder
+                norms = [p.grad.detach().float().norm() / self.scaler.get_scale()
+                         for p in encoder.parameters() if p.grad is not None]
+                if norms:
+                    LOG.info("P8 adapter/intent gradient norm=%.6g", torch.stack(norms).norm().item())
             # Gradient step
             with timing.phase("optimizer_and_scheduler", gpu=True):
                 scale_before = self.scaler.get_scale()
@@ -443,6 +491,8 @@ class Trainer:
             timing.finish()
         if prefetch is not None:
             prefetch.close()
+        if p8_prefetch is not None:
+            p8_prefetch.close()
         if p7_prefetch is not None:
             p7_prefetch.close()
         self.optimizer.zero_grad(set_to_none=True)

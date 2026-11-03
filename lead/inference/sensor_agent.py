@@ -111,6 +111,17 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 socket_path=self.training_config.vlm_service_socket
             )
 
+        self.p8_hidden = None
+        if self.training_config.use_hidden_intent_planner:
+            if self.vlm_client is not None or len(self.closed_loop_inference.nets) != 1:
+                raise ValueError("P8 closed loop requires one hidden planner and no P6 VLM head")
+            from lead.inference.qwendrive_hidden_client import QwenDriveHiddenClient
+            from lead.inference.p8_closed_loop_intent import P8ClosedLoopIntent
+            self.p8_hidden = P8ClosedLoopIntent(
+                QwenDriveHiddenClient(self.config_closed_loop.p8_hidden_socket,
+                                      timeout=self.config_closed_loop.p8_hidden_timeout),
+                jpeg_quality=self.config_closed_loop.vlm_jpeg_quality,
+            )
         self.p7_intent = None
         self.p7_intent_trace_file = None
         self.p7_intent_trace_failed = False
@@ -687,7 +698,7 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
 
     @beartype
     @torch.inference_mode()
-    def run_step(self, input_data: dict, _, __=None) -> carla.VehicleControl:
+    def run_step(self, input_data: dict, timestamp, __=None) -> carla.VehicleControl:
         self.step += 1
 
         if not self.initialized:
@@ -765,6 +776,14 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 vlm_hidden.astype(np.float32)
             ).to(self.device)[None]
 
+        if self.p8_hidden is not None:
+            hidden = self.p8_hidden.prepare(
+                input_data["original_rgb"], input_data["command"],
+                float(np.asarray(input_data["speed"]).reshape(-1)[0]), frame_id=self.step, timestamp=timestamp,
+            )
+            input_data_tensors.update({key: value.to(self.device) for key, value in hidden.items()})
+            if self.step % 50 == 0:
+                LOG.info("P8 same-frame hidden: %s", self.p8_hidden.last_trace)
         if self.p7_intent is not None:
             semantic = self.p7_intent.prepare(
                 input_data["original_rgb"], input_data["command"],
@@ -797,6 +816,8 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         closed_loop_prediction: ClosedLoopPrediction = (
             self.closed_loop_inference.forward(data=input_data_tensors)
         )
+        if self.p8_hidden is not None:
+            self.p8_hidden.validate_prediction(self.closed_loop_inference.predictions[0])
         self.save_p7_intent_trace(input_data_tensors)
         self.save_p6_intent_capture(
             cam_rgb if self.vlm_client is not None else None,
@@ -973,18 +994,21 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
         return self.control
 
     def save_p7_intent_trace(self, data):
-        if self.p7_intent is None or self.p7_intent_trace_failed or self.config_closed_loop.save_path is None:
+        bridge = self.p7_intent or self.p8_hidden
+        if bridge is None or self.p7_intent_trace_failed or self.config_closed_loop.save_path is None:
             return
         try:
             if self.p7_intent_trace_file is None:
-                destination = Path(self.config_closed_loop.save_path) / "p7_intent_trace.jsonl"
+                destination = Path(self.config_closed_loop.save_path) / (
+                    "p8_hidden_trace.jsonl" if self.p8_hidden is not None else "p7_intent_trace.jsonl")
                 self.p7_intent_trace_file = destination.open("w", encoding="utf-8", buffering=1)
             prediction = self.closed_loop_inference.predictions[0]
-            record = {"step": self.step, **self.p7_intent.last_trace}
+            record = {"step": self.step, **bridge.last_trace}
             for key, value in (
                 ("selected_idx", prediction.pred_route_selected_idx),
                 ("route_conf_logits", prediction.pred_route_conf),
-                ("candidate_speeds", data.get("target_speed_multimodal_scalar")),
+                ("candidate_speeds", prediction.pred_target_speed_multimodal_scalar),
+                ("candidate_routes", prediction.pred_route_multimodal),
                 ("selected_speed", prediction.pred_target_speed_scalar),
                 ("selected_route", prediction.pred_route),
             ):
@@ -997,6 +1021,9 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
     def destroy(self, results=None):
         LOG.info(results)
 
+        if getattr(self, "p8_hidden", None) is not None:
+            self.p8_hidden.close()
+            self.p8_hidden = None
         if getattr(self, "p7_intent", None) is not None:
             self.p7_intent.close()
             self.p7_intent = None

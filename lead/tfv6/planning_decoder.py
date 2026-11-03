@@ -38,7 +38,10 @@ class PlanningDecoder(nn.Module):
         self.mm = self.config.multimodal_planner
         self.K = self.config.multimodal_planner_k if self.mm else 1
         self.mm_speed = self.config.multimodal_target_speed
-        self.semantic_intent_mode = bool(getattr(self.config, "use_semantic_intent_planner", False))
+        self.hidden_intent_mode = bool(getattr(self.config, "use_hidden_intent_planner", False))
+        if self.hidden_intent_mode and self.config.use_semantic_intent_planner:
+            raise ValueError("hidden and AR semantic intent modes are mutually exclusive")
+        self.semantic_intent_mode = self.hidden_intent_mode or bool(getattr(self.config, "use_semantic_intent_planner", False))
         if self.semantic_intent_mode and not (
             self.mm and self.mm_speed and self.config.predict_spatial_path
             and self.config.predict_target_speed and not self.config.joint_scorer_replaces_conf
@@ -87,7 +90,14 @@ class PlanningDecoder(nn.Module):
                 if self.semantic_intent_mode:
                     from lead.tfv6.semantic_intent_encoder import SemanticIntentEncoder
 
-                    self.semantic_intent_encoder = SemanticIntentEncoder(D)
+                    if self.hidden_intent_mode:
+                        from lead.tfv6.hidden_intent_encoder import HiddenIntentEncoder
+                        self.hidden_intent_encoder = HiddenIntentEncoder(
+                            self.config.qwendrive_hidden_dim, D, self.K,
+                            self.config.hidden_intent_attention_heads,
+                        )
+                    else:
+                        self.semantic_intent_encoder = SemanticIntentEncoder(D)
                     self.semantic_query_projector = nn.Linear(D, D)
                     gate = float(self.config.semantic_intent_query_gate_init)
                     if not 0.0 < gate < 1.0:
@@ -178,6 +188,9 @@ class PlanningDecoder(nn.Module):
         query_in = self.query.repeat(bs, 1, 1)  # (B, K*route + wp + speed, D)
         if self.mm and self.config.predict_spatial_path:
             n_route = self.config.num_route_points_prediction
+            if getattr(self, "hidden_intent_mode", False):
+                # All K latent modes compete; these are not validated road classes.
+                data["semantic_intent_valid"] = torch.ones(bs, self.K, dtype=torch.bool, device=query_in.device)
             if getattr(self, "semantic_intent_mode", False):
                 valid = data["semantic_intent_valid"].to(query_in.device, dtype=torch.bool)
                 if valid.shape != (bs, self.K):
@@ -186,17 +199,28 @@ class PlanningDecoder(nn.Module):
                     if self.training:
                         raise ValueError("P7 training requires at least one valid intent per sample")
                     raise ValueError("P7 inference requires an explicit fallback for empty intent samples")
-                a_embed = self.semantic_intent_encoder(
-                    data["semantic_intent_maneuver_ids"].to(query_in.device),
-                    data["semantic_intent_obligations"].to(query_in.device),
-                    data["semantic_intent_scene_rules"].to(query_in.device),
-                    data["command"].to(query_in.device),
-                    valid,
-                )
+                if getattr(self, "hidden_intent_mode", False):
+                    a_embed = self.hidden_intent_encoder(
+                        data["qwen_hidden"].to(query_in.device),
+                        data["qwen_token_mask"].to(query_in.device),
+                        data["qwen_view_ids"].to(query_in.device),
+                        data["command"].to(query_in.device), data["speed"].to(query_in.device),
+                    )
+                else:
+                    a_embed = self.semantic_intent_encoder(
+                        data["semantic_intent_maneuver_ids"].to(query_in.device),
+                        data["semantic_intent_obligations"].to(query_in.device),
+                        data["semantic_intent_scene_rules"].to(query_in.device),
+                        data["command"].to(query_in.device), valid,
+                    )
                 gate = self.semantic_query_gate_logit.sigmoid()
                 a_embed = gate * self.semantic_query_projector(a_embed)
                 a_embed = a_embed * valid[..., None].to(a_embed.dtype)
-                fallback = data.get("semantic_intent_fallback")
+                if getattr(self, "hidden_intent_mode", False):
+                    base_norm = query_in[:, :self.K*n_route].detach().float().norm(dim=-1).mean().clamp_min(1e-8)
+                    log["hidden_intent_gate"] = gate.detach()
+                    log["hidden_intent_residual_ratio"] = a_embed.detach().float().norm(dim=-1).mean() / base_norm
+                fallback = data.get("semantic_intent_fallback") if not getattr(self, "hidden_intent_mode", False) else None
                 if fallback is not None:
                     if fallback.shape != (bs,):
                         raise ValueError("semantic_intent_fallback must have shape [B]")
@@ -389,6 +413,13 @@ class PlanningDecoder(nn.Module):
 
         # per-arm mean-L2 to GT; invalid arms get +inf so they never win
         winner = self._route_winner(gt, data)
+        if getattr(self, "hidden_intent_mode", False) and K > 1:
+            pair = torch.triu_indices(K, K, offset=1, device=route_all.device)
+            distances = (route_all[:, pair[0]] - route_all[:, pair[1]]).norm(dim=-1).mean(-1)
+            log["hidden_route_pair_distance"] = distances.detach().mean()
+            log["hidden_route_duplicate_fraction"] = (distances.detach() < 0.1).float().mean()
+            for mode in range(K):
+                log[f"hidden_winner_fraction_{mode}"] = (winner == mode).float().mean()
 
         # near-weighted L1 on the winner arm
         near = self.config.route_near_points or n

@@ -101,6 +101,9 @@ worker() {
       training_config="${training_config} vlm_service_socket=${B2D_QWEN_SOCKET_DIR}/gpu${gpu}.sock"
     fi
     local closed_loop_config="${LEAD_CLOSED_LOOP_CONFIG:-}"
+    if [[ -n "${B2D_P8_SOCKET_DIR:-}" ]]; then
+      closed_loop_config="${closed_loop_config} p8_hidden_socket=${B2D_P8_SOCKET_DIR}/gpu${gpu}.sock"
+    fi
     if [[ -n "${B2D_P7_SOCKET_DIR:-}" ]]; then
       closed_loop_config="${closed_loop_config} p7_intent_socket=${B2D_P7_SOCKET_DIR}/gpu${gpu}.sock"
     fi

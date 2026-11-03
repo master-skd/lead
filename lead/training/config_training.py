@@ -998,6 +998,14 @@ class TrainingConfig(BaseConfig):
     p7_intent_cache = None  # Offline indexed JSON cache; bypasses the Qwen service.
     p7_intent_manifest = None  # Explicit frame set covered by the offline cache.
     p7_dataloader_workers = 4
+    # P8: frozen single-forward Qwen-Drive -> K continuous latent intents.
+    use_hidden_intent_planner = False
+    qwendrive_hidden_dim = 2560  # validated against the actual service output
+    hidden_intent_attention_heads = 4
+    hidden_intent_socket_dir = "/tmp/lead_p8_hidden"
+    hidden_intent_cache = None  # Packed FP16 token shards + complete SQLite index.
+    hidden_intent_frame_fraction = 0.1
+    hidden_intent_sample_seed = 2026
     # B2: anchor cache dir (precomputed skeleton anchors, (K_MAX,5) per frame).
     anchor_cache_dir = "data/p6/anchor_cache"
     # P5+: if set, use_multimodal_intent reads the clean lane-graph corridor label from this
@@ -1231,7 +1239,7 @@ class TrainingConfig(BaseConfig):
         # overrides winner-vs-expert fidelity.
         weights["loss_route_anchor"] = (
             self.route_anchor_loss_weight
-            if self.multimodal_planner and not self.use_semantic_intent_planner else 0.0
+            if self.multimodal_planner and not (self.use_semantic_intent_planner or self.use_hidden_intent_planner) else 0.0
         )
         # B2 term 4: collision cost over all valid arms (needs both flags).
         weights["loss_route_collision"] = (
@@ -1243,7 +1251,7 @@ class TrainingConfig(BaseConfig):
         weights["loss_route_corridor"] = (
             self.route_corridor_loss_weight
             if (self.multimodal_planner and self.use_route_corridor_loss
-                and not self.use_semantic_intent_planner)
+                and not (self.use_semantic_intent_planner or self.use_hidden_intent_planner))
             else 0.0
         )
         # B2 term 6: push padding arms' confidence to 0.

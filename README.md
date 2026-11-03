@@ -329,3 +329,21 @@ bash scripts/p7/eval_p7_b2d.sh \
 The agent obtains fresh Qwen-Drive JSON from live three-camera images and passes the same semantic tensors used in training to the planner. It selects the highest-confidence valid route and its paired speed. Training caches are not required on this machine. Per-route JSON traces record the intents, fallback and selected candidate. See the [closed-loop guide](docs/p7_hf_training.md#bench2drive-closed-loop-evaluation) for output paths, preflight and timeout settings.
 
 An experimental vLLM backend preserves per-frame intent generation and uses the official Qwen-Drive image processor. See the [single-3090 validation commands](docs/p7_vllm_evaluation.md) for environment setup, an adapter export that leaves the original checkpoint untouched, HF/vLLM image comparisons, and a one-route closed-loop test. GPU speed and semantic agreement must be checked on the evaluation machine before a full run.
+
+### 1.7. Train the continuous hidden-state intent baseline (P8)
+
+P8 replaces autoregressive JSON generation with one frozen Qwen-Drive forward per
+frame, K learned cross-attention intent queries and a gated residual into posttrain
+TFv6 route queries. It retains K routes + K paired speeds, WTA and confidence.
+The default training set is a fixed 1/10 of posttrain frames. The preferred workflow
+is to extract frozen FP16 hidden-token shards once, then train the adapter/planner
+from cache without loading Qwen. See the
+[P8 guide](docs/p8_hidden_intent_training.md) for the single-forward latency probe,
+eight-GPU cache extraction and training commands, sampling definition, resume and closed-loop smoke test.
+GPU performance and planning quality still require measurement.
+
+For P8 closed-loop evaluation, copy `model_0019.pth`, `config.json` and
+`p8_hidden_cache_signature.json`; training feature shards are not needed. See the
+[P8 B2D guide](docs/p8_b2d_evaluation.md) for a single-route smoke test and full
+220-route commands. Evaluation uses fresh forward-only Qwen tokens and confidence
+selection of a paired route/speed.
