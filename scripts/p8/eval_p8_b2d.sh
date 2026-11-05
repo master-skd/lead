@@ -34,7 +34,7 @@ from lead.inference.p8_evaluation import validate_config
 print(validate_config(json.load(open(sys.argv[1]))))
 PYCFG
 )
-echo "P8 checkpoint verified: K paired routes/speeds; selection=confidence; hidden_dim=$HIDDEN_DIM"
+echo "P8 checkpoint configuration verified; hidden_dim=$HIDDEN_DIM"
 TRAIN_SIGNATURE="${P8_B2D_SIGNATURE:-$(dirname "$CKPT_FILE")/p8_hidden_cache_signature.json}"
 if [[ -n "${P8_B2D_SIGNATURE:-}" && ! -f "$TRAIN_SIGNATURE" ]]; then
     echo "P8_B2D_SIGNATURE does not exist: $TRAIN_SIGNATURE" >&2; exit 1

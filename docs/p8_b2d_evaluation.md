@@ -14,6 +14,10 @@ corridor, anchor, AR semantic parser or DrivoR scorer participates. Temporal way
 remain the shared auxiliary output. Existing LEAD speed decoding/braking and PID
 controllers execute the selected pair.
 
+Single-route checkpoints (`hidden_intent_single_path=true`) use the same live
+feature service, original global speed head and direct route output. They have no
+confidence selection. See [the single-route ablation](p8_single_path_ablation.md).
+
 ## Files needed on the evaluation machine
 
 Copy these from `outputs/local_training/p8_hidden_cached_tenth/` into one directory:

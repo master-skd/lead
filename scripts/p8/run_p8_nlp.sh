@@ -9,5 +9,6 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 case "${1:-}" in
     extract) exec bash scripts/p8/extract_p8_hidden_cache.sh ;;
     train) exec bash scripts/p8/train_p8_cached.sh ;;
-    *) echo 'Usage: bash scripts/p8/run_p8_nlp.sh {extract|train}' >&2; exit 2 ;;
+    train-single) exec bash scripts/p8/train_p8_single_cached.sh ;;
+    *) echo 'Usage: bash scripts/p8/run_p8_nlp.sh {extract|train|train-single}' >&2; exit 2 ;;
 esac

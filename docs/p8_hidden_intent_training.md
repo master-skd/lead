@@ -67,6 +67,13 @@ Use multiple `--images` and `--microbatch 8` to measure batched extraction.
 `--check-batch-parity` additionally compares batched and single-sample features.
 Do this before a large run. A forward-only architecture still needs GPU benchmarking.
 
+## Original single-route planner ablation
+
+To retain original LEAD single route/speed heads and direct expert supervision,
+reuse the same cache with `bash scripts/p8/run_p8_nlp.sh train-single` on nlp_hdd.
+See the [single-route ablation guide](p8_single_path_ablation.md). The default
+`train` entry remains the K-route/K-speed experiment.
+
 ## Existing nlp_hdd checkout
 
 For the prepared copy at `/mmu_nlp_hdd/liuzihan08/lead`, use:

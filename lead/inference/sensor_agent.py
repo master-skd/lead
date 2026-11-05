@@ -121,6 +121,7 @@ class SensorAgent(BaseAgent, autonomous_agent.AutonomousAgent):
                 QwenDriveHiddenClient(self.config_closed_loop.p8_hidden_socket,
                                       timeout=self.config_closed_loop.p8_hidden_timeout),
                 jpeg_quality=self.config_closed_loop.vlm_jpeg_quality,
+                single_path=self.training_config.hidden_intent_single_path,
             )
         self.p7_intent = None
         self.p7_intent_trace_file = None

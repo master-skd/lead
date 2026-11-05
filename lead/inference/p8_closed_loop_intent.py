@@ -7,8 +7,9 @@ from lead.inference.vlm_image_preprocess import carla_bgr_to_vlm_rgb
 
 
 class P8ClosedLoopIntent:
-    def __init__(self, client, jpeg_quality=30):
+    def __init__(self, client, jpeg_quality=30, single_path=False):
         self.client = client
+        self.single_path = single_path
         self.jpeg_quality = jpeg_quality
         self.last_trace = None
 
@@ -25,6 +26,17 @@ class P8ClosedLoopIntent:
 
     def validate_prediction(self, prediction):
         """Fail explicitly if a future selector unpairs a route and its speed."""
+        if self.single_path:
+            if any(getattr(prediction,key,None) is not None for key in (
+                'pred_route_multimodal','pred_target_speed_multimodal_scalar',
+                'pred_target_speed_multimodal_distribution','pred_route_conf','pred_route_selected_idx')):
+                raise RuntimeError('P8 single-path model returned multimodal candidates')
+            for name,value in (('route',prediction.pred_route),('speed',prediction.pred_target_speed_scalar),
+                               ('speed logits',prediction.pred_target_speed_distribution)):
+                if value is None or value.shape[0]!=1 or not torch.isfinite(value).all():
+                    raise RuntimeError(f'P8 single-path model returned invalid {name}')
+            self.last_trace.update(selection='single_route',selected_idx=None,single_path=True)
+            return
         routes=prediction.pred_route_multimodal
         speeds=prediction.pred_target_speed_multimodal_scalar
         logits=prediction.pred_target_speed_multimodal_distribution

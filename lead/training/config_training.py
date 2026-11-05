@@ -1000,6 +1000,7 @@ class TrainingConfig(BaseConfig):
     p7_dataloader_workers = 4
     # P8: frozen single-forward Qwen-Drive -> K continuous latent intents.
     use_hidden_intent_planner = False
+    hidden_intent_single_path = False  # Original LEAD query layout, heads and direct expert losses.
     qwendrive_hidden_dim = 2560  # validated against the actual service output
     hidden_intent_attention_heads = 4
     hidden_intent_socket_dir = "/tmp/lead_p8_hidden"

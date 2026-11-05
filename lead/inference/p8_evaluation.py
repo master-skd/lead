@@ -5,8 +5,11 @@ from pathlib import Path
 
 
 def validate_config(config):
+    single=config.get('hidden_intent_single_path',False)
+    if not isinstance(single,bool):
+        raise ValueError('hidden_intent_single_path must be boolean')
     required={'use_hidden_intent_planner':True,'use_semantic_intent_planner':False,
-              'multimodal_planner':True,'multimodal_target_speed':True,
+              'multimodal_planner':not single,'multimodal_target_speed':not single,
               'joint_scorer_replaces_conf':False,'use_vlm_intent':False,
               'use_intent_decoder':False,'use_control_conditioning':False,
               'route_speed_safety_gate':False,'route_future_safety_gate':False,
@@ -14,10 +17,12 @@ def validate_config(config):
     bad={key:(config.get(key,False),value) for key,value in required.items()
          if config.get(key,False) is not value}
     if bad:
-        raise ValueError(f'This evaluator requires a P8 hidden K-route/K-speed checkpoint: {bad}')
+        raise ValueError(f'This evaluator requires a P8 hidden planner checkpoint with compatible heads: {bad}')
     dimension=config.get('qwendrive_hidden_dim')
     if not isinstance(dimension,int) or dimension<1 or config.get('multimodal_planner_k',0)<1:
         raise ValueError('P8 checkpoint requires valid hidden dimension and mode count')
+    if single and config.get('multimodal_planner_k')!=1:
+        raise ValueError('P8 single-path checkpoint must declare one mode')
     return dimension
 
 

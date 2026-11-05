@@ -12,6 +12,12 @@ BATCH_SIZE=${P8_BATCH_SIZE:-64}
 WORKERS=${P8_WORKERS:-8}
 EPOCHS=${P8_EPOCHS:-20}
 CACHE_DIR=${P8_HIDDEN_CACHE:-}
+SINGLE_PATH=${P8_SINGLE_PATH:-false}
+case "$SINGLE_PATH" in
+    true) MULTIMODAL=false; MODES=1; SELECT_CONF=false ;;
+    false) MULTIMODAL=true; MODES=6; SELECT_CONF=true ;;
+    *) echo 'P8_SINGLE_PATH must be true or false' >&2; exit 1 ;;
+esac
 IFS=',' read -r -a DEVICES <<< "$GPUS"
 for value in "$BATCH_SIZE" "$WORKERS" "$EPOCHS" "${P8_QWEN_MICROBATCH:-8}"; do
     [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo "batch/workers/epochs/microbatch must be positive integers" >&2; exit 1; }
@@ -47,7 +53,7 @@ PYMETA
     SAMPLE_SEED=${P8_SAMPLE_SEED:-2026}
 fi
 if [[ "${P8_PREFLIGHT_ONLY:-0}" == 1 ]]; then
-    echo "P8 preflight OK: cache=${CACHE_DIR:-online} hidden_dim=$HIDDEN_DIM fraction=$FRAME_FRACTION seed=$SAMPLE_SEED"
+    echo "P8 preflight OK: cache=${CACHE_DIR:-online} hidden_dim=$HIDDEN_DIM fraction=$FRAME_FRACTION seed=$SAMPLE_SEED single_path=$SINGLE_PATH"
     exit 0
 fi
 mkdir -p "$LOGDIR"
@@ -89,13 +95,13 @@ fi
 export LEAD_TRAINING_CONFIG="logdir=$LOGDIR load_file=$POSTTRAIN \
 continue_failed_training=${P8_RESUME:-false} \
 image_encoder_pretrained=false use_planning_decoder=true freeze_backbone=false \
-use_hidden_intent_planner=true use_semantic_intent_planner=false \
+use_hidden_intent_planner=true hidden_intent_single_path=$SINGLE_PATH use_semantic_intent_planner=false \
 hidden_intent_socket_dir=$socket_dir qwendrive_hidden_dim=$HIDDEN_DIM hidden_intent_cache=${CACHE_DIR:-null} \
 hidden_intent_frame_fraction=$FRAME_FRACTION hidden_intent_sample_seed=$SAMPLE_SEED \
 p7_dataloader_workers=$WORKERS p7_intent_cache=null \
 use_vlm_intent=false use_intent_decoder=false online_joint_training=false use_control_conditioning=false \
-multimodal_planner=true multimodal_planner_k=6 multimodal_target_speed=true \
-joint_scorer_replaces_conf=false route_select_by_conf=true \
+multimodal_planner=$MULTIMODAL multimodal_planner_k=$MODES multimodal_target_speed=$MULTIMODAL \
+joint_scorer_replaces_conf=false route_select_by_conf=$SELECT_CONF \
 num_route_points_prediction=10 num_route_points_smoothing=40 \
 use_route_corridor_loss=false use_collision_cost=false \
 use_sensor_perburtation=false use_color_aug_prob=0 \

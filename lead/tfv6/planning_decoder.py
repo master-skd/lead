@@ -41,7 +41,15 @@ class PlanningDecoder(nn.Module):
         self.hidden_intent_mode = bool(getattr(self.config, "use_hidden_intent_planner", False))
         if self.hidden_intent_mode and self.config.use_semantic_intent_planner:
             raise ValueError("hidden and AR semantic intent modes are mutually exclusive")
-        self.semantic_intent_mode = self.hidden_intent_mode or bool(getattr(self.config, "use_semantic_intent_planner", False))
+        self.hidden_single_path = bool(getattr(self.config, "hidden_intent_single_path", False))
+        if self.hidden_single_path and not (
+            self.hidden_intent_mode and not self.mm and not self.mm_speed
+            and self.config.predict_spatial_path and self.config.predict_target_speed
+            and not self.config.joint_scorer_replaces_conf
+        ):
+            raise ValueError("Single-path hidden intent requires original single route/speed heads without scorer")
+        self.semantic_intent_mode = (self.hidden_intent_mode and not self.hidden_single_path) or bool(
+            getattr(self.config, "use_semantic_intent_planner", False))
         if self.semantic_intent_mode and not (
             self.mm and self.mm_speed and self.config.predict_spatial_path
             and self.config.predict_target_speed and not self.config.joint_scorer_replaces_conf
@@ -83,6 +91,18 @@ class PlanningDecoder(nn.Module):
         # Only create decoders if needed
         if self.config.predict_spatial_path:
             self.route_decoder = nn.Linear(config.transfuser_token_dim, 2)
+            if self.hidden_single_path:
+                from lead.tfv6.hidden_intent_encoder import HiddenIntentEncoder
+                D = self.config.transfuser_token_dim
+                self.hidden_intent_encoder = HiddenIntentEncoder(
+                    self.config.qwendrive_hidden_dim, D, modes=1,
+                    heads=self.config.hidden_intent_attention_heads,
+                )
+                self.semantic_query_projector = nn.Linear(D, D)
+                gate = float(self.config.semantic_intent_query_gate_init)
+                if not 0.0 < gate < 1.0:
+                    raise ValueError("semantic_intent_query_gate_init must be in (0,1)")
+                self.semantic_query_gate_logit = nn.Parameter(torch.tensor(math.log(gate / (1.0 - gate))))
             if self.mm:
                 # B2: anchor embedding [sin a, cos a, reach/30, valid] -> D, added to each
                 # mode's route queries to break symmetry; per-mode confidence head.
@@ -186,6 +206,22 @@ class PlanningDecoder(nn.Module):
         # symmetry between the K route arms. The global waypoint/speed queries
         # stay unchanged; paired speed decoding also consumes each route arm token.
         query_in = self.query.repeat(bs, 1, 1)  # (B, K*route + wp + speed, D)
+        if self.hidden_single_path:
+            # Same P8 feature adapter, now one continuous condition. Preserve the
+            # original LEAD route|temporal waypoint|global speed query layout.
+            latent = self.hidden_intent_encoder(
+                data["qwen_hidden"].to(query_in.device), data["qwen_token_mask"].to(query_in.device),
+                data["qwen_view_ids"].to(query_in.device), data["command"].to(query_in.device),
+                data["speed"].to(query_in.device),
+            )
+            gate = self.semantic_query_gate_logit.sigmoid()
+            residual = gate * self.semantic_query_projector(latent)
+            n_route = self.config.num_route_points_prediction
+            base = query_in[:, :n_route]
+            log["hidden_intent_gate"] = gate.detach()
+            log["hidden_intent_residual_ratio"] = residual.detach().float().norm(dim=-1).mean() / (
+                base.detach().float().norm(dim=-1).mean().clamp_min(1e-8))
+            query_in = torch.cat((base + residual, query_in[:, n_route:]), dim=1)
         if self.mm and self.config.predict_spatial_path:
             n_route = self.config.num_route_points_prediction
             if getattr(self, "hidden_intent_mode", False):

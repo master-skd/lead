@@ -39,9 +39,10 @@ class TFv6(nn.Module):
         self.device = device
         self.config = config
         self.log = {}
-        self.semantic_intent_mode = bool(getattr(config, "use_semantic_intent_planner", False)
-                                         or getattr(config, "use_hidden_intent_planner", False))
-        if self.semantic_intent_mode and (
+        hidden_mode = bool(getattr(config, "use_hidden_intent_planner", False))
+        self.semantic_intent_mode = bool(getattr(config, "use_semantic_intent_planner", False) or (
+            hidden_mode and not getattr(config, "hidden_intent_single_path", False)))
+        if (self.semantic_intent_mode or hidden_mode) and (
             config.joint_scorer_replaces_conf or config.use_vlm_intent
             or config.use_intent_decoder or config.use_control_conditioning
         ):
