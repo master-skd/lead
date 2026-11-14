@@ -1000,11 +1000,14 @@ class TrainingConfig(BaseConfig):
     p7_dataloader_workers = 4
     # P8: frozen single-forward Qwen-Drive -> K continuous latent intents.
     use_hidden_intent_planner = False
+    planner_frame_manifest = None  # Fixed image-key subset for a planner-only control experiment.
     hidden_intent_single_path = False  # Original LEAD query layout, heads and direct expert losses.
     qwendrive_hidden_dim = 2560  # validated against the actual service output
     hidden_intent_attention_heads = 4
     hidden_intent_socket_dir = "/tmp/lead_p8_hidden"
     hidden_intent_cache = None  # Packed FP16 token shards + complete SQLite index.
+    # Cache of rgb_perturbated frames; required when sensor perturbation is enabled with a hidden cache.
+    hidden_intent_cache_perturbated = None
     hidden_intent_frame_fraction = 0.1
     hidden_intent_sample_seed = 2026
     # B2: anchor cache dir (precomputed skeleton anchors, (K_MAX,5) per frame).

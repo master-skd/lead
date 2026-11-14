@@ -103,7 +103,8 @@ def initialize_torch(config: TrainingConfig) -> int:
     if config.online_joint_training:
         # Online RGB/actor samples are much larger than ordinary LEAD samples.
         num_workers = max(1, min(num_workers, config.joint_dataloader_workers))
-    if config.use_semantic_intent_planner or config.use_hidden_intent_planner:
+    if (config.use_semantic_intent_planner or config.use_hidden_intent_planner
+            or getattr(config, "planner_frame_manifest", None)):
         num_workers = max(1, min(num_workers, config.p7_dataloader_workers))
 
     if torch.cuda.device_count() > 1:

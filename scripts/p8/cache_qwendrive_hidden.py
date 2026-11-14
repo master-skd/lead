@@ -41,11 +41,15 @@ def generate(args):
         batch_size=args.batch_size
         offset=0
         print(f'shard={args.shard} batch_size={batch_size} workers={args.workers}',flush=True)
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        # Overlap JPEG loading of the next batch and writing of the previous batch with the GPU forward.
+        with ThreadPoolExecutor(max_workers=args.workers) as pool, ThreadPoolExecutor(max_workers=1) as io:
+            loading=[pool.submit(load,row) for row in entries[offset:offset+batch_size]]
+            pending_write=None
             while offset<len(entries):
-                batch=entries[offset:offset+batch_size]
                 start=time.monotonic()
-                images=list(pool.map(load,batch))
+                batch=entries[offset:offset+len(loading)]
+                images=[future.result() for future in loading]
+                loading=[pool.submit(load,row) for row in entries[offset+len(batch):offset+len(batch)+batch_size]]
                 try:
                     arrays,metrics=extractor.extract(images,[row['navigation'] for row in batch],[row['speed'] for row in batch])
                 except torch.cuda.OutOfMemoryError as exc:
@@ -59,18 +63,24 @@ def generate(args):
                     torch.cuda.empty_cache()
                     print(f'shard={args.shard} CUDA OOM: reducing batch to {batch_size}; '
                           'retrying the same unwritten frames',flush=True)
+                    loading=[pool.submit(load,row) for row in entries[offset:offset+batch_size]]
                     continue
                 payloads=[]
                 for i,row in enumerate(batch):
                     valid=arrays['qwen_token_mask'][i]
                     payloads.append((row,arrays['qwen_hidden'][i,valid],arrays['qwen_view_ids'][i,valid]))
-                writer.append_batch(payloads)
+                # At most one batch in flight; result() re-raises write errors before more work is queued.
+                if pending_write is not None:
+                    pending_write.result()
+                pending_write=io.submit(writer.append_batch,payloads)
                 elapsed=time.monotonic()-start
                 print(json.dumps(dict(shard=args.shard,done=offset+len(batch),pending_total=len(entries),
                                       extraction_batch_size=len(batch),batch_seconds=elapsed,
                                       frames_per_second=len(batch)/elapsed,**metrics)),flush=True)
                 offset+=len(batch)
                 del arrays,payloads,images
+            if pending_write is not None:
+                pending_write.result()
     finally:
         writer.close()
 

@@ -125,8 +125,12 @@ class Trainer:
                 raise ValueError("P8 hidden training must bypass P6 and P7 AR services")
             if self.config.hidden_intent_cache:
                 from lead.tfv6.hidden_state_cache import HiddenStateCache
-                self.p8_hidden_client = HiddenStateCache(self.config.hidden_intent_cache)
-                LOG.info("P8 reads frozen Qwen tokens from cache: %s", self.config.hidden_intent_cache)
+                if self.config.use_sensor_perburtation and not self.config.hidden_intent_cache_perturbated:
+                    raise ValueError("Sensor perturbation with a P8 hidden cache requires hidden_intent_cache_perturbated")
+                self.p8_hidden_client = HiddenStateCache(self.config.hidden_intent_cache,
+                                                         self.config.hidden_intent_cache_perturbated)
+                LOG.info("P8 reads frozen Qwen tokens from cache: %s (perturbated: %s)",
+                         self.config.hidden_intent_cache, self.config.hidden_intent_cache_perturbated)
             else:
                 from lead.inference.qwendrive_hidden_client import QwenDriveHiddenClient
                 socket_path = Path(self.config.hidden_intent_socket_dir) / f"rank{self.config.local_rank}.sock"

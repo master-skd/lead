@@ -181,3 +181,26 @@ def test_extraction_oom_halves_batch_and_preserves_every_unwritten_frame(tmp_pat
     assert list(map(len,attempts))==[32,16,16,2]
     assert [speed for batch in attempts[1:] for speed in batch]==[row['speed'] for row in entries]
     assert build_cache_index(root)['frames']==34
+
+
+def test_perturbated_frames_read_from_perturbated_cache(tmp_path):
+    root,_,model,entries,signature=prepare(tmp_path)
+    writer=CacheShardWriter(root,0,signature)
+    writer.append_batch([(entries[0],*tokens(3)),(entries[1],*tokens(5))]);writer.close()
+    build_cache_index(root)
+    perturbated=[dict(row,image_key=row['image_key'].replace('/rgb/','/rgb_perturbated/')) for row in entries]
+    manifest=tmp_path/'perturbated.jsonl'
+    manifest.write_text(''.join(json.dumps(row)+'\n' for row in perturbated))
+    manifest.with_suffix('.meta.json').write_text(json.dumps(dict(fraction=.1,seed=2026,frames=2,perturbated=True)))
+    proot=tmp_path/'cache_perturbated'
+    psignature=initialize_cache(proot,manifest,model,1)
+    writer=CacheShardWriter(proot,0,psignature)
+    writer.append_batch([(perturbated[0],*tokens(2)),(perturbated[1],*tokens(4))]);writer.close()
+    build_cache_index(proot)
+    cache=HiddenStateCache(root,proot)
+    result=cache.generate_batch(['/disk/'+entries[0]['image_key'],'/disk/'+perturbated[1]['image_key']],
+                                ['follow_lane']*2,[3.,4.])
+    assert result['qwen_token_mask'].sum(1).tolist()==[3,4]
+    cache.close()
+    with pytest.raises(KeyError,match='no perturbated hidden cache'):
+        HiddenStateCache(root).generate_batch([perturbated[0]['image_key']],['follow_lane'],[3.])

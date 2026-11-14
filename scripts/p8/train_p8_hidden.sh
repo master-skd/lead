@@ -12,12 +12,25 @@ BATCH_SIZE=${P8_BATCH_SIZE:-64}
 WORKERS=${P8_WORKERS:-8}
 EPOCHS=${P8_EPOCHS:-20}
 CACHE_DIR=${P8_HIDDEN_CACHE:-}
+BASELINE=${P8_PLANNER_BASELINE:-false}
+USE_HIDDEN=true
+FRAME_MANIFEST=null
+if [[ "$BASELINE" == true ]]; then
+    USE_HIDDEN=false
+    FRAME_MANIFEST=${P8_FRAME_MANIFEST:?baseline requires the completed P8 p8_train_frames.txt}
+    [[ -s "$FRAME_MANIFEST" ]] || { echo 'Frame manifest missing' >&2; exit 1; }
+elif [[ "$BASELINE" != false ]]; then
+    echo 'P8_PLANNER_BASELINE must be true or false' >&2; exit 1
+fi
 SINGLE_PATH=${P8_SINGLE_PATH:-false}
 case "$SINGLE_PATH" in
     true) MULTIMODAL=false; MODES=1; SELECT_CONF=false ;;
     false) MULTIMODAL=true; MODES=6; SELECT_CONF=true ;;
     *) echo 'P8_SINGLE_PATH must be true or false' >&2; exit 1 ;;
 esac
+if [[ "$BASELINE" == true ]]; then
+    SINGLE_PATH=false; MULTIMODAL=false; MODES=1; SELECT_CONF=false
+fi
 IFS=',' read -r -a DEVICES <<< "$GPUS"
 for value in "$BATCH_SIZE" "$WORKERS" "$EPOCHS" "${P8_QWEN_MICROBATCH:-8}"; do
     [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo "batch/workers/epochs/microbatch must be positive integers" >&2; exit 1; }
@@ -28,7 +41,12 @@ done
    && -d data/carla_leaderboard2/data && -d data/carla_leaderboard2/buckets ]] || {
     echo 'Check Python environments, Qwen model, posttrain and CARLA data paths' >&2; exit 1;
 }
-if [[ -n "$CACHE_DIR" ]]; then
+if [[ "$BASELINE" == true ]]; then
+    CACHE_DIR=""
+    HIDDEN_DIM=2560
+    FRAME_FRACTION=${P8_FRAME_FRACTION:-0.1}
+    SAMPLE_SEED=${P8_SAMPLE_SEED:-2026}
+elif [[ -n "$CACHE_DIR" ]]; then
     read -r HIDDEN_DIM FRAME_FRACTION SAMPLE_SEED < <("$LEAD_PYTHON" - "$CACHE_DIR" <<'PYMETA'
 import os, sys
 from lead.tfv6.hidden_state_cache import HiddenStateCache
@@ -53,7 +71,9 @@ PYMETA
     SAMPLE_SEED=${P8_SAMPLE_SEED:-2026}
 fi
 if [[ "${P8_PREFLIGHT_ONLY:-0}" == 1 ]]; then
-    echo "P8 preflight OK: cache=${CACHE_DIR:-online} hidden_dim=$HIDDEN_DIM fraction=$FRAME_FRACTION seed=$SAMPLE_SEED single_path=$SINGLE_PATH"
+    SOURCE=${CACHE_DIR:-online}
+    [[ "$BASELINE" == false ]] || SOURCE=disabled
+    echo "P8 preflight OK: cache=$SOURCE hidden_dim=$HIDDEN_DIM fraction=$FRAME_FRACTION seed=$SAMPLE_SEED single_path=$SINGLE_PATH baseline=$BASELINE manifest=$FRAME_MANIFEST"
     exit 0
 fi
 mkdir -p "$LOGDIR"
@@ -71,7 +91,7 @@ export LEAD_PROJECT_ROOT="$PWD"
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 # Start synchronously for the first experiment. Optional ordered one-batch overlap.
 export P8_HIDDEN_PREFETCH=${P8_HIDDEN_PREFETCH:-0}
-if [[ -z "$CACHE_DIR" ]]; then
+if [[ -z "$CACHE_DIR" && "$BASELINE" == false ]]; then
 for ((i=0; i<${#DEVICES[@]}; i++)); do
     CUDA_VISIBLE_DEVICES="${DEVICES[$i]}" "$QWEN_PYTHON" -u -m lead.inference.qwendrive_hidden_service \
         --model "$QWEN_MODEL" --socket "$socket_dir/rank$i.sock" \
@@ -89,22 +109,24 @@ for ((attempt=0; attempt<600; attempt++)); do
     sleep 1
 done
 [[ "$ready" -eq "${#DEVICES[@]}" ]] || { echo 'hidden service startup timeout' >&2; exit 1; }
-else
+elif [[ -n "$CACHE_DIR" ]]; then
     cp "$CACHE_DIR/metadata.json" "$LOGDIR/p8_hidden_cache_signature.json"
 fi
 export LEAD_TRAINING_CONFIG="logdir=$LOGDIR load_file=$POSTTRAIN \
 continue_failed_training=${P8_RESUME:-false} \
 image_encoder_pretrained=false use_planning_decoder=true freeze_backbone=false \
-use_hidden_intent_planner=true hidden_intent_single_path=$SINGLE_PATH use_semantic_intent_planner=false \
+planner_frame_manifest=$FRAME_MANIFEST \
+use_hidden_intent_planner=$USE_HIDDEN hidden_intent_single_path=$SINGLE_PATH use_semantic_intent_planner=false \
 hidden_intent_socket_dir=$socket_dir qwendrive_hidden_dim=$HIDDEN_DIM hidden_intent_cache=${CACHE_DIR:-null} \
+hidden_intent_cache_perturbated=${P8_HIDDEN_CACHE_PERTURBATED:-null} \
 hidden_intent_frame_fraction=$FRAME_FRACTION hidden_intent_sample_seed=$SAMPLE_SEED \
 p7_dataloader_workers=$WORKERS p7_intent_cache=null \
 use_vlm_intent=false use_intent_decoder=false online_joint_training=false use_control_conditioning=false \
 multimodal_planner=$MULTIMODAL multimodal_planner_k=$MODES multimodal_target_speed=$MULTIMODAL \
 joint_scorer_replaces_conf=false route_select_by_conf=$SELECT_CONF \
-num_route_points_prediction=10 num_route_points_smoothing=40 \
+num_route_points_prediction=10 num_route_points_smoothing=${P8_ROUTE_SMOOTHING:-40} \
 use_route_corridor_loss=false use_collision_cost=false \
-use_sensor_perburtation=false use_color_aug_prob=0 \
+use_sensor_perburtation=${P8_SENSOR_PERTURBATION:-false} use_color_aug_prob=0 \
 use_discrete_command=true use_velocity=true use_rgb=true \
 use_persistent_cache=false use_training_session_cache=false \
 carla_num_samples=0 schedule_carla_num_samples=false batch_size=$BATCH_SIZE lr=${P8_LR:-0.0003} epochs=$EPOCHS"

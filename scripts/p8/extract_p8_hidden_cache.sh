@@ -17,7 +17,8 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4} MKL_NUM_THREADS=${MKL_NUM_THREADS:-4}
 "$LEAD_PYTHON" scripts/p8/export_hidden_manifest.py \
     --posttrain-config "$(dirname "$POSTTRAIN")/config.json" --output "$MANIFEST" \
-    --fraction "${P8_FRAME_FRACTION:-0.1}" --seed "${P8_SAMPLE_SEED:-2026}"
+    --fraction "${P8_FRAME_FRACTION:-0.1}" --seed "${P8_SAMPLE_SEED:-2026}" \
+    $([[ "${P8_PERTURBATED:-false}" == true ]] && echo --perturbated)
 "$QWEN_PYTHON" scripts/p8/cache_qwendrive_hidden.py prepare \
     --cache-dir "$CACHE_DIR" --manifest "$MANIFEST" --model "$QWEN_MODEL" --shards "${#DEVICES[@]}"
 pids=()

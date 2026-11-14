@@ -231,7 +231,15 @@ def build_cache_index(root):
 
 
 class HiddenStateCache:
-    def __init__(self, root):
+    def __init__(self, root: str | Path, perturbated_root: str | Path | None = None) -> None:
+        """Open a complete cache.
+
+        Args:
+            root: Cache of the normal rgb/ frames.
+            perturbated_root: Optional cache of the rgb_perturbated/ frames. Keys whose image
+                directory is rgb_perturbated are read from it.
+        """
+        self.perturbated = HiddenStateCache(perturbated_root) if perturbated_root else None
         self.root = Path(root)
         self.signature = cache_metadata(self.root)
         self.hidden_dim = self.signature['hidden_dim']
@@ -263,21 +271,14 @@ class HiddenStateCache:
         rows, view_rows = [], []
         for path, command, speed in zip(paths,commands,speeds,strict=True):
             key = image_key(str(path))
-            found = self.db.execute('SELECT shard,payload FROM frames WHERE image_key=?',(key,)).fetchone()
-            if found is None:
-                raise KeyError(f'hidden cache missing frame {key}')
-            shard, entry = found[0], json.loads(found[1])
-            if command != entry['navigation'] or not math.isclose(float(speed),entry['speed'],abs_tol=1e-4,rel_tol=1e-5):
-                raise ValueError(f'cached navigation/speed mismatch: {key}')
-            if shard not in self.handles:
-                self.handles[shard] = os.open(self.root/f'shard-{shard:05d}.bin',os.O_RDONLY)
-            body = os.pread(self.handles[shard],entry['nbytes'],entry['offset'])
-            if len(body)!=entry['nbytes'] or hashlib.sha256(body).hexdigest()!=entry['sha256']:
-                raise ValueError(f'truncated/corrupt hidden features: {key}')
-            n = entry['tokens']
-            boundary = n*self.hidden_dim*2
-            rows.append(np.frombuffer(body[:boundary],dtype='<f2').reshape(n,self.hidden_dim))
-            view_rows.append(np.frombuffer(body[boundary:],dtype=np.int8))
+            source = self
+            if key.split('/')[-2] == 'rgb_perturbated':
+                if self.perturbated is None:
+                    raise KeyError(f'perturbated frame requested but no perturbated hidden cache is configured: {key}')
+                source = self.perturbated
+            hidden, views = source._read(key, command, speed)
+            rows.append(hidden)
+            view_rows.append(views)
         max_length = max(map(len,rows))
         hidden = np.zeros((len(rows),max_length,self.hidden_dim),np.float16)
         mask = np.zeros((len(rows),max_length),bool)
@@ -289,7 +290,31 @@ class HiddenStateCache:
         self.requests += 1
         return dict(qwen_hidden=hidden,qwen_token_mask=mask,qwen_view_ids=views)
 
+    def _read(self, key: str, command: str, speed: float) -> tuple[np.ndarray, np.ndarray]:
+        """Read and verify one frame's tokens.
+
+        Returns:
+            FP16 hidden tokens [N, D] and int8 view ids [N].
+        """
+        found = self.db.execute('SELECT shard,payload FROM frames WHERE image_key=?',(key,)).fetchone()
+        if found is None:
+            raise KeyError(f'hidden cache missing frame {key}')
+        shard, entry = found[0], json.loads(found[1])
+        if command != entry['navigation'] or not math.isclose(float(speed),entry['speed'],abs_tol=1e-4,rel_tol=1e-5):
+            raise ValueError(f'cached navigation/speed mismatch: {key}')
+        if shard not in self.handles:
+            self.handles[shard] = os.open(self.root/f'shard-{shard:05d}.bin',os.O_RDONLY)
+        body = os.pread(self.handles[shard],entry['nbytes'],entry['offset'])
+        if len(body)!=entry['nbytes'] or hashlib.sha256(body).hexdigest()!=entry['sha256']:
+            raise ValueError(f'truncated/corrupt hidden features: {key}')
+        n = entry['tokens']
+        boundary = n*self.hidden_dim*2
+        return (np.frombuffer(body[:boundary],dtype='<f2').reshape(n,self.hidden_dim),
+                np.frombuffer(body[boundary:],dtype=np.int8))
+
     def close(self):
+        if self.perturbated is not None:
+            self.perturbated.close()
         self.db.close()
         for fd in self.handles.values():
             os.close(fd)

@@ -1,5 +1,6 @@
 """Export the same fixed tenth of posttrain frames used by online P8 training."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -13,6 +14,8 @@ def main():
     ap.add_argument('--output',type=Path,default=Path('data/p8/hidden_manifest.jsonl'))
     ap.add_argument('--fraction',type=float,default=.1)
     ap.add_argument('--seed',type=int,default=2026)
+    ap.add_argument('--workers',type=int,default=64)
+    ap.add_argument('--perturbated',action='store_true',help='key rows by the rgb_perturbated image of each frame')
     args=ap.parse_args()
     from lead.training.config_training import TrainingConfig
     from lead.data_loader.carla_dataset import CARLAData
@@ -34,18 +37,25 @@ def main():
         selected.setdefault(key,i)
     args.output.parent.mkdir(parents=True,exist_ok=True)
     temporary=args.output.with_suffix('.tmp')
-    with temporary.open('w') as stream:
-        for count,key in enumerate(sorted(selected),1):
-            i=selected[key]
-            meta=read_pickle(os.fsdecode(dataset.metas[i]))
-            suffix='_gps' if config.use_noisy_tp else ''
-            commands=meta[f'next{suffix}_commands_{config.tp_pop_distance}']
-            command=NAV_COMMANDS[int(command_to_one_hot(commands[0]).argmax())]
-            stream.write(json.dumps(dict(image_key=key,navigation=command,speed=float(meta['speed'])))+'\n')
+    suffix='_gps' if config.use_noisy_tp else ''
+
+    def row(key):
+        meta=read_pickle(os.fsdecode(dataset.metas[selected[key]]))
+        commands=meta[f'next{suffix}_commands_{config.tp_pop_distance}']
+        command=NAV_COMMANDS[int(command_to_one_hot(commands[0]).argmax())]
+        if args.perturbated:
+            key=image_key(os.fsdecode(dataset.images_perturbated[selected[key]]))
+        return json.dumps(dict(image_key=key,navigation=command,speed=float(meta['speed'])))+'\n'
+
+    # Per-frame metadata reads are NFS-latency bound; read them concurrently, write in sorted order.
+    with temporary.open('w') as stream, ThreadPoolExecutor(max_workers=args.workers) as pool:
+        for count,line in enumerate(pool.map(row,sorted(selected)),1):
+            stream.write(line)
             if count%10000==0:
                 print(f'exported {count}/{len(selected)} selected frames',flush=True)
     os.replace(temporary,args.output)
     args.output.with_suffix('.meta.json').write_text(json.dumps(dict(fraction=args.fraction,seed=args.seed,
+        **({'perturbated':True} if args.perturbated else {}),
         frames=len(selected),posttrain_config_sha256=hashlib.sha256(Path(args.posttrain_config).read_bytes()).hexdigest()),indent=2)+'\n')
     print(f'Exported {len(selected)}/{len(dataset.images)} frames -> {args.output}')
 

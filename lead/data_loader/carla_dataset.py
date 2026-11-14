@@ -145,6 +145,9 @@ class CARLAData(Dataset):
             perturbate_sensor = True
             perturbation_rotation = meta["perturbation_rotation"]
             perturbation_translation = meta["perturbation_translation"]
+            if "p7_image_path" in data and getattr(self.config, "use_hidden_intent_planner", False):
+                # P8 reads Qwen tokens extracted from the same perturbated camera view.
+                data["p7_image_path"] = str(Path(str(self.images_perturbated[index], encoding="utf-8")).resolve())
         else:
             perturbate_sensor = False
             perturbation_rotation = 0.0
@@ -1199,7 +1202,8 @@ class CARLAData(Dataset):
 
         # P8 uses the full active posttrain pool at epoch 0, then a fixed hash
         # subset. Do not redraw a different tenth through bucket RNG each epoch.
-        hidden_subset = getattr(self.config, "use_hidden_intent_planner", False)
+        hidden_subset = (getattr(self.config, "use_hidden_intent_planner", False)
+                         or bool(getattr(self.config, "planner_frame_manifest", None)))
         mixture_ratios = self.bucket_collection.buckets_mixture_per_epoch(0 if hidden_subset else epoch)
         for bucket_idx, bucket in enumerate(self.bucket_collection.buckets):
             if bucket_idx in mixture_ratios:
@@ -1324,9 +1328,13 @@ class CARLAData(Dataset):
                     LOG.info("P7 offline manifest selected %d / %d CARLA frames",
                              len(indices), len(self.images))
 
-            if getattr(self.config, "use_hidden_intent_planner", False):
+            if (getattr(self.config, "use_hidden_intent_planner", False)
+                    or getattr(self.config, "planner_frame_manifest", None)):
                 from lead.data_loader.frame_subset import select_frame_fraction
-                if getattr(self.config, "hidden_intent_cache", None):
+                if getattr(self.config, "planner_frame_manifest", None):
+                    from lead.data_loader.frame_subset import select_frame_manifest
+                    indices = select_frame_manifest(self.images, indices, self.config.planner_frame_manifest)
+                elif getattr(self.config, "hidden_intent_cache", None):
                     from lead.tfv6.semantic_intent_cache import image_key
                     if not hasattr(self, "_p8_cache_keys"):
                         from lead.tfv6.hidden_state_cache import HiddenStateCache

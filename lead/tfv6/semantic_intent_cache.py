@@ -9,9 +9,9 @@ from pathlib import Path
 
 
 def image_key(path: str) -> str:
-    """Ignore machine-specific prefixes; retain scenario/route/rgb/frame.jpg."""
+    """Ignore machine-specific prefixes; retain scenario/route/{rgb,rgb_perturbated}/frame.jpg."""
     parts = Path(path).parts
-    if len(parts) < 4 or parts[-2] != 'rgb' or '..' in parts[-4:]:
+    if len(parts) < 4 or parts[-2] not in ('rgb', 'rgb_perturbated') or '..' in parts[-4:]:
         raise ValueError(f'not a CARLA RGB frame path: {path}')
     return '/'.join(parts[-4:])
 

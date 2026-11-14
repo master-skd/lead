@@ -62,3 +62,37 @@ Use the environment/CARLA settings in [the P8 evaluation guide](p8_b2d_evaluatio
 Per-frame traces mark `selection=single_route`. Drop `B2D_ROUTE_IDS` and use a new
 tag for the full 220 routes after the smoke test. Improved scores remain an
 experimental question.
+
+## Matched planner-only control
+
+The original `scripts/posttrain_ddp.sh` starts from pretrain and uses its bucket
+sampling schedule. For comparison with the completed P8 single-route run, use:
+
+```bash
+cd /mmu_nlp_hdd/liuzihan08/lead
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+P8_POSTTRAIN=outputs/local_training/posttrain/model_0030.pth \
+P8_BATCH_SIZE=64 P8_WORKERS=8 P8_EPOCHS=20 \
+bash scripts/p8/run_p8_nlp.sh train-baseline
+```
+
+This reuses the P8 launcher settings (including LR 0.0003, 10 route points,
+augmentation settings, trainable backbone, original heads and losses), but disables
+hidden/semantic/corridor intent, multimodal routes/speeds and scorer. It starts from
+posttrain, not the P8 checkpoint. No Qwen model, feature service or hidden cache is
+loaded. Frames come from the completed experiment's `p8_train_frames.txt`, not a
+new random tenth. Override `P8_FRAME_MANIFEST` to relocate that small file.
+
+Default output: `outputs/local_training/p8_planner_only_tenth`. Compare its
+`p8_subset.json` `keys_sha256` and frame count with the P8 single-route run; they
+must match (96,871 unique frames for the prepared dataset). Ordinary per-epoch
+shuffle remains enabled. `P8_PREFLIGHT_ONLY=1` checks launcher paths without
+starting training; dataset loading verifies every requested frame is present.
+
+This control is an ordinary LEAD checkpoint; it must use the standard LEAD/B2D
+inference entry, not the P8 evaluator that requires hidden conditioning.
+
+Note: `use_color_aug_prob` is currently a read-only computed property (0.2 for
+CARLA), so the historical launcher's `use_color_aug_prob=0` does not disable it.
+This control preserves that actual behavior to match the completed P8 run; fixing
+augmentation policy would be a separate experiment.
