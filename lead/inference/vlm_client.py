@@ -10,8 +10,9 @@ See vlm_service.py for the wire protocol.
 from __future__ import annotations
 
 import socket
-from concurrent.futures import ThreadPoolExecutor
 import struct
+from concurrent.futures import ThreadPoolExecutor
+from typing import Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -71,6 +72,25 @@ class VLMServiceClient:
         data = self._recv_exact(returned * fh * fw * fd * 2)
         return np.frombuffer(data, dtype=np.float16).reshape(returned, fh, fw, fd)
 
+    def extract_paths(self, paths: Sequence[str]) -> npt.NDArray:
+        """Speed-only vLLM request using CARLA JPG paths; response matches extract_batch."""
+        if not (1 <= len(paths) <= 256):
+            raise ValueError("path batch must contain 1..256 images")
+        payload = bytearray(struct.pack("<IIII", 0, len(paths), 0, 1))
+        for path in paths:
+            encoded = path.encode("utf-8")
+            if not encoded or len(encoded) > 65535:
+                raise ValueError("invalid image path length")
+            payload.extend(struct.pack("<I", len(encoded)))
+            payload.extend(encoded)
+        self.batch_requests += 1
+        self.sock.sendall(payload)
+        returned, fh, fw, fd = struct.unpack("<IIII", self._recv_exact(16))
+        if returned != len(paths):
+            raise ValueError(f"VLM service returned {returned} features for {len(paths)} paths")
+        data = self._recv_exact(returned * fh * fw * fd * 2)
+        return np.frombuffer(data, dtype=np.float16).reshape(returned, fh, fw, fd)
+
     def close(self) -> None:
         try:
             self.sock.close()
@@ -85,14 +105,17 @@ class OnlineVLMPrefetcher:
     Only the next DataLoader batch is retained; no epoch-wide feature cache is made.
     """
 
-    def __init__(self, client: VLMServiceClient):
+    def __init__(self, client: VLMServiceClient, *, use_paths: bool = False):
         self.client = client
+        self.use_paths = use_paths
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vlm-prefetch")
         self.current_data = None
         self.current_future = None
         self.current_request_index = None
 
     def _extract(self, data):
+        if self.use_paths:
+            return self.client.extract_paths(data["vlm_path"])
         return self.client.extract_batch(data["vlm_rgb"].numpy())
 
     def advance(self, batches):

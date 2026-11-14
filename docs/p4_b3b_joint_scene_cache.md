@@ -1,6 +1,6 @@
 # B3b joint scorer：第一阶段同次前向缓存
 
-目标是为后续 DrivoR 式的轨迹–场景交互、多维度 joint scorer 准备**同次前向**数据，而不是现在就训练或闭环评测。冻结 `p5_stepB2_corridor/model_0019.pth`，关闭所有后加的速度/安全 gate，保持原有 confidence 路径选择。一次模型前向内同时保存：规划器的压缩 scene tokens、六条原始 Path、当前 confidence winner 的四条平滑局部偏移 Path（-1.5/-0.75/+0.75/+1.5 m）、原始 route confidence、当前车速、原始目标速度、专家 Path 与命令。每个分片带 checkpoint 路径/文件元数据、manifest 路径、索引范围和 schema 版本；分片先写临时文件，校验后原子重命名。
+目标是为后续 DrivoR 式的轨迹–场景交互、多维度 joint scorer 准备**同次前向**数据，而不是现在就训练或闭环评测。冻结 `p5_stepB2_corridor/model_0019.pth`，关闭所有后加的速度/安全 gate，保持原有 confidence 路径选择。一次模型前向内同时保存：规划器的压缩 scene tokens、六条原始 Path、当前 confidence winner 的四条平滑局部偏移 Path（-1.5/-0.75/+0.75/+1.5 m）、原始 route confidence、当前车速、原始目标速度、导航参考 Path 与命令。历史字段名 `expert_route` 实际对应 `data["route"]`，不是 GT ego 未来；后续模仿标签须另读原始 meta 的 `future_positions`。每个分片带 checkpoint 路径/文件元数据、manifest 路径、索引范围和 schema 版本；分片先写临时文件，校验后原子重命名。
 
 本阶段**没有**构造 GT 碰撞/道路/模仿标签，也**没有**训练 scorer。下一阶段应直接基于这些分片生成可执行的 Path×目标速度时空候选，结合 future-actor cache、GT HD-map 制作多维标签。不要把旧 B3a scene 缓存和独立 B3b oracle 按帧 key 拼接。
 

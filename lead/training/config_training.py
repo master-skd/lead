@@ -946,6 +946,8 @@ class TrainingConfig(BaseConfig):
     online_joint_training = False
     online_joint_validation = False
     online_vlm_socket_dir = "/tmp/lead_joint_vlm"
+    # vLLM speed pilot: send existing CARLA JPG paths instead of RGB/PNG copies.
+    online_vlm_use_paths = False
     joint_val_manifest = None
     joint_val_max_frames = 5000
     joint_dataloader_workers = 2

@@ -497,12 +497,15 @@ class CARLAData(Dataset):
                 # This is the exact unperturbed 3-camera strip used by P6 intent
                 # training. The lead-env trainer asks a live Qwen service for its
                 # hidden states; no VLM feature .npy is read or written.
-                from PIL import Image
+                if getattr(self.config, "online_vlm_use_paths", False):
+                    data["vlm_path"] = str(Path(str(self.images[index], encoding="utf-8")).resolve())
+                else:
+                    from PIL import Image
 
-                with Image.open(str(self.images[index], encoding="utf-8")) as source:
-                    data["vlm_rgb"] = np.asarray(source.convert("RGB")).copy()
-                if data["vlm_rgb"].shape != (384, 1152, 3):
-                    raise ValueError("online joint Qwen input must be the full 3-cam strip")
+                    with Image.open(str(self.images[index], encoding="utf-8")) as source:
+                        data["vlm_rgb"] = np.asarray(source.convert("RGB")).copy()
+                    if data["vlm_rgb"].shape != (384, 1152, 3):
+                        raise ValueError("online joint Qwen input must be the full 3-cam strip")
                 from lead.data_loader.future_actor_cache import (
                     pack_future_actor_frames, parse_future_actor_frame,
                 )

@@ -71,9 +71,11 @@ def pack_batch(prediction, data: dict, keys: list[str], offsets: tuple[float, ..
     ).cpu().numpy()
     speed = data["speed"].float().reshape(-1).cpu().numpy()
     target = prediction.pred_target_speed_scalar.float().reshape(-1).cpu().numpy()
-    expert = data["route"].float().cpu().numpy()
-    if expert.shape != (batch, points, 2):
-        raise ValueError(f"expert route shape mismatch: {expert.shape}")
+    # Historical cache key `expert_route` actually stores navigation guidance,
+    # not the ego's GT future. Preserve the key so existing shards stay valid.
+    nav_route = data["route"].float().cpu().numpy()
+    if nav_route.shape != (batch, points, 2):
+        raise ValueError(f"navigation route shape mismatch: {nav_route.shape}")
     if not (np.isfinite(scene).all() and np.isfinite(routes).all()
             and np.isfinite(speed).all() and np.isfinite(target).all()):
         raise ValueError("non-finite scene, path or speed")
@@ -86,7 +88,7 @@ def pack_batch(prediction, data: dict, keys: list[str], offsets: tuple[float, ..
         "winner": winner.astype(np.int8),
         "current_speed": speed.astype(np.float16),
         "raw_target_speed": target.astype(np.float16),
-        "expert_route": expert.astype(np.float16),
+        "expert_route": nav_route.astype(np.float16),
         "command": data["command"].cpu().numpy().astype(np.int8),
         "anchor_fallback": anchor_fallback,
     }

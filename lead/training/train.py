@@ -254,8 +254,13 @@ class Trainer:
         total = count = 0.0
         with torch.inference_mode():
             for data in islice(self.joint_val_loader, max_batches):
-                rgb = data.pop("vlm_rgb")
-                hidden = self.online_vlm_client.extract_batch(rgb.numpy())
+                if self.config.online_vlm_use_paths:
+                    batch_size = len(data["vlm_path"])
+                    hidden = self.online_vlm_client.extract_paths(data.pop("vlm_path"))
+                else:
+                    rgb = data.pop("vlm_rgb")
+                    batch_size = len(rgb)
+                    hidden = self.online_vlm_client.extract_batch(rgb.numpy())
                 data["vlm_hidden"] = torch.from_numpy(hidden.copy()).to(self.config.device)
                 with torch.amp.autocast(
                     device_type="cuda", dtype=self.config.torch_float_type,
@@ -264,8 +269,8 @@ class Trainer:
                     prediction = self.model(data=data)
                     losses, _ = self.model.compute_loss(prediction, data)
                 metric = losses["loss_joint_scorer"] + losses["loss_spatial_route"]
-                total += float(metric.item()) * len(rgb)
-                count += len(rgb)
+                total += float(metric.item()) * batch_size
+                count += batch_size
         sums = torch.tensor([total, count], device=self.config.device, dtype=torch.float64)
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(sums)
@@ -294,7 +299,9 @@ class Trainer:
         if self.online_vlm_client is not None and self.online_vlm_prefetch:
             from lead.inference.vlm_client import OnlineVLMPrefetcher
 
-            prefetch = OnlineVLMPrefetcher(self.online_vlm_client)
+            prefetch = OnlineVLMPrefetcher(
+                self.online_vlm_client, use_paths=self.config.online_vlm_use_paths,
+            )
             prefetch.advance(batches)
         p8_prefetch = None
         if self.p8_hidden_client is not None and os.environ.get("P8_HIDDEN_PREFETCH", "0") == "1":
@@ -342,11 +349,13 @@ class Trainer:
                 with timing.phase("qwen_wait" if prefetch is not None else "qwen_request"):
                     if prefetch is not None:
                         hidden = prefetch.result()
+                    elif self.config.online_vlm_use_paths:
+                        hidden = self.online_vlm_client.extract_paths(data.pop("vlm_path"))
                     else:
                         rgb = data.pop("vlm_rgb")
                         hidden = self.online_vlm_client.extract_batch(rgb.numpy())
                 if prefetch is not None:
-                    data.pop("vlm_rgb")
+                    data.pop("vlm_path" if self.config.online_vlm_use_paths else "vlm_rgb")
                     # Qwen starts on batch t+1 while the planner trains on batch t.
                     with timing.phase("next_batch_prefetch"):
                         prefetch.advance(batches)

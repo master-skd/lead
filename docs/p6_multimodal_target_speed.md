@@ -2,8 +2,10 @@
 
 The optional `multimodal_target_speed=true` configuration changes the joint
 planner from K routes sharing one target speed to K paired route/speed candidates.
-It requires `multimodal_planner=true`, spatial route and target-speed prediction,
-`joint_scorer_replaces_conf=true`, and `route_select_by_conf=false`.
+In the P6 joint-scorer experiment it requires `multimodal_planner=true`, spatial
+route and target-speed prediction, `joint_scorer_replaces_conf=true`, and
+`route_select_by_conf=false`. P7 also uses this paired head, but selects with
+route confidence instead of the scorer; see the P7 design document.
 
 For each route arm, mean-pool its decoded route queries (already conditioned on
 the arm anchor and planner scene). Add the decoded global speed query as shared

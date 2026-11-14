@@ -62,7 +62,8 @@ def print_rank_table(rows):
     for row in rows:
         if row["event"] == "train_step":
             ranks[row["rank"]].append(row)
-    stages = ("data_wait", "qwen_request", "loss_and_labels", "backward_ddp")
+    stages = ("data_wait", "qwen_request", "qwen_wait", "next_batch_prefetch",
+              "loss_and_labels", "backward_ddp")
     print("\nPer-rank means in seconds (backward includes DDP waiting):")
     print(f"{'rank':>4s} {'n':>6s} {'total':>10s} " + " ".join(f"{stage:>16s}" for stage in stages))
     for rank, samples in sorted(ranks.items()):
@@ -84,7 +85,8 @@ def main():
     if not rows:
         parser.error("no records selected; check run ID or use --skip-first 0")
     print(f"run_id={run_id}; excluded first {args.skip_first} steps/epoch")
-    print("Qwen stages are INSIDE qwen_request, not additional training time.")
+    print("With lookahead, qwen_wait is only the residual wait; Qwen service work can overlap the prior train step.")
+    print("Without lookahead, Qwen stages are inside qwen_request, not additional training time.")
     if all(row.get("cuda_synchronized", False) for row in rows):
         print("Sampled synchronized wall times include CPU work and device waits; no new DDP barriers are added.")
     else:

@@ -1,5 +1,11 @@
 # P6: online Qwen intent + joint planner/scorer (first implementation)
 
+Historical configuration: this page describes the initial K-route, shared-speed
+run. The later paired-speed variant is documented in
+[`p6_multimodal_target_speed.md`](p6_multimodal_target_speed.md). The P7
+semantic-intent planner has a different input contract and no scorer; see
+[`P7_QwenDrive_AR_Intent_TFv6_Design.md`](../P7_QwenDrive_AR_Intent_TFv6_Design.md).
+
 This run starts from `outputs/local_training/pretrain/model_0030.pth` (encoder and
 perception weights, **not** the B2 corridor planner). It freezes the full-data
 `vlm_intent_p6_online_full_b32_w4/model_best.pth` decoder. Eight Qwen services,
@@ -39,7 +45,32 @@ Start with a single-GPU or small
 subset smoke test on the target machine; no full-GPU CARLA forward test was
 available in the source workspace.
 
+For transfer to a machine that already has the RGB, lane-graph labels, Qwen
+model, and route split, run `bash scripts/p4/package_p6_joint_train_assets.sh
+--jobs 8`. It creates `outputs/transfer/p6_joint_train_assets/static.tar.gz`
+and one `scenario_*.tar.gz` per CARLA scenario. Each archive keeps repository-
+relative paths, so extract them at the target repository root. The package
+omits `rgb` and all `*_perturbated` sensor folders because this run sets
+`use_sensor_perburtation=false`; it retains normal LiDAR, radar, semantic,
+depth, HD-map, boxes, metadata, and bucket data. The script writes temporary
+files and SHA-256 sidecars, verifies completed archives on rerun, and resumes
+by skipping verified shards. Do not transfer `.part` files.
+
 ## Training stage timing
+
+The optional `P6_JOINT_QWEN_PREFETCH=1` enables one-batch lookahead for online
+Qwen features. After receiving batch *t*'s hidden states, the training rank
+submits batch *t+1* to its existing Qwen service before running the planner on
+batch *t*. One request at a time uses the same socket and model weights; no
+hidden-state files or additional Qwen processes are created. The default is
+`0`, so existing launches keep their original synchronous behavior. Because
+Qwen and planner share a GPU, concurrent forward work may also cause
+contention: compare identical short runs with `0` and `1` on the target
+machine before adopting it for a full run. A running process will not switch
+modes when this file or the launch script changes; use a new launch/logdir.
+With lookahead, `qwen_wait` measures only the residual wait for the prefetched
+request and `next_batch_prefetch` includes loading/submitting the following
+batch. Compare total step and epoch time, not the Qwen wait alone.
 
 Add `P6_JOINT_TIMING=1 P6_JOINT_TIMING_EVERY=20` to the existing launch
 environment. Timing is disabled by default. Each rank writes its own
