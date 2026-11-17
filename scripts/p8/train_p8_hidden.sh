@@ -129,7 +129,8 @@ use_route_corridor_loss=false use_collision_cost=false \
 use_sensor_perburtation=${P8_SENSOR_PERTURBATION:-false} use_color_aug_prob=0 \
 use_discrete_command=true use_velocity=true use_rgb=true \
 use_persistent_cache=false use_training_session_cache=false \
-carla_num_samples=0 schedule_carla_num_samples=false batch_size=$BATCH_SIZE lr=${P8_LR:-0.0003} epochs=$EPOCHS"
+carla_num_samples=0 schedule_carla_num_samples=false batch_size=$BATCH_SIZE lr=${P8_LR:-0.0003} epochs=$EPOCHS \
+${P8_EXTRA_TRAINING_CONFIG:-}"
 LEAD_LIBNVRTC_DIR=${P8_LEAD_LIBNVRTC_DIR:-$("$LEAD_PYTHON" -c 'import pathlib, sysconfig; print(pathlib.Path(sysconfig.get_paths()["purelib"]) / "nvidia/cuda_nvrtc/lib")')}
 if [[ -f "$LEAD_LIBNVRTC_DIR/libnvrtc.so.12" ]]; then
     export LD_LIBRARY_PATH="$LEAD_LIBNVRTC_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
